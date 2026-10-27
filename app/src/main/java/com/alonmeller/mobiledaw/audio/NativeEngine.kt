@@ -16,7 +16,7 @@ object NativeEngine {
     external fun position(): Long
 
     external fun startRecording(): Boolean
-    external fun stopRecording(): Int
+    external fun stopRecording(targetId: Int): Int
     external fun isRecording(): Boolean
     external fun recordedFrames(): Long
     external fun recordStartFrame(): Long

@@ -125,7 +125,7 @@ bool AudioEngine::startRecording() {
     return true;
 }
 
-int AudioEngine::stopRecording() {
+int AudioEngine::stopRecording(int targetId) {
     if (!recording_.load()) return -1;
     recording_.store(false);
     draining_.store(false);
@@ -155,13 +155,19 @@ int AudioEngine::stopRecording() {
     }
     if (skip >= recordBuffer_.size()) return -1;
 
-    auto track = std::make_unique<Track>();
-    track->samples.assign(recordBuffer_.begin() + static_cast<std::ptrdiff_t>(skip), recordBuffer_.end());
-    track->startFrame = start;
+    std::vector<float> take(recordBuffer_.begin() + static_cast<std::ptrdiff_t>(skip), recordBuffer_.end());
     recordBuffer_.clear();
     recordBuffer_.shrink_to_fit();
 
     std::lock_guard<std::mutex> lock(tracksMutex_);
+    if (auto *target = findTrack(targetId); target && target->samples.empty()) {
+        target->samples = std::move(take);
+        target->startFrame = start;
+        return targetId;
+    }
+    auto track = std::make_unique<Track>();
+    track->samples = std::move(take);
+    track->startFrame = start;
     track->id = nextTrackId_++;
     int id = track->id;
     tracks_.push_back(std::move(track));

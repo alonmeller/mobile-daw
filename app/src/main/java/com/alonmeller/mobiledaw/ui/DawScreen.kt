@@ -58,7 +58,7 @@ import com.alonmeller.mobiledaw.TrackState
 import kotlin.math.floor
 import kotlin.math.max
 
-private val HeaderWidth = 176.dp
+private val HeaderWidth = 204.dp
 private val TrackHeight = 88.dp
 private val RulerHeight = 30.dp
 
@@ -87,12 +87,18 @@ fun DawScreen(vm: DawViewModel, onRecordPressed: () -> Unit) {
                     .background(DawColors.Panel),
                 contentAlignment = Alignment.CenterStart,
             ) {
-                Text(
-                    "${vm.tracks.size} tracks",
-                    color = DawColors.TextSecondary,
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(start = 12.dp),
-                )
+                Row(
+                    Modifier
+                        .padding(start = 8.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(DawColors.PanelRaised)
+                        .clickable(enabled = !vm.recording, onClick = vm::addEmptyTrack)
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("+", color = DawColors.TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("  Track", color = DawColors.TextPrimary, fontSize = 13.sp)
+                }
             }
             Ruler(vm, Modifier.weight(1f).fillMaxHeight())
         }
@@ -101,7 +107,7 @@ fun DawScreen(vm: DawViewModel, onRecordPressed: () -> Unit) {
                 vm.tracks.forEachIndexed { index, track ->
                     TrackRow(vm, track, index)
                 }
-                if (vm.recording) RecordingRow(vm, vm.tracks.size)
+                if (vm.recording && vm.tracks.none { vm.isRecordingInto(it) }) RecordingRow(vm, vm.tracks.size)
                 if (vm.tracks.isEmpty() && !vm.recording && !vm.loading) EmptyHint()
             }
         }
@@ -380,6 +386,8 @@ private fun TrackHeader(vm: DawViewModel, track: TrackState) {
                     maxLines = 1,
                     modifier = Modifier.weight(1f),
                 )
+                ToggleChip("R", vm.armedId == track.engineId, DawColors.Record) { vm.toggleArm(track.engineId) }
+                Spacer(Modifier.width(4.dp))
                 ToggleChip("M", track.mute, DawColors.Mute) { vm.toggleMute(track.engineId) }
                 Spacer(Modifier.width(4.dp))
                 ToggleChip("S", track.solo, DawColors.Solo) { vm.toggleSolo(track.engineId) }
@@ -459,7 +467,11 @@ private fun TrackLane(vm: DawViewModel, track: TrackState, index: Int, modifier:
             .pointerInput(Unit) { detectTapGestures { latestVm.seekToScreenX(it.x) } }
     ) {
         drawGrid(vm)
-        drawRegion(vm, track.startFrame, track.lengthFrames, track.peaks, color, track.name, dim = track.mute)
+        if (vm.isRecordingInto(track)) {
+            drawRegion(vm, vm.recordStart, vm.recordedFrames, null, DawColors.Record, "Rec", dim = false)
+        } else {
+            drawRegion(vm, track.startFrame, track.lengthFrames, track.peaks, color, track.name, dim = track.mute)
+        }
         drawPlayhead(vm)
     }
 }

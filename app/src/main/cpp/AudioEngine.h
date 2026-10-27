@@ -43,7 +43,9 @@ public:
 
     // Recording
     bool startRecording();
-    int stopRecording();  // returns new track id, or -1 when nothing was recorded
+    // Puts the take into targetId when that track is empty, otherwise into a new
+    // track. Returns the track id, or -1 when nothing was recorded.
+    int stopRecording(int targetId = -1);
     bool isRecording() const { return recording_.load(); }
     int64_t recordedFrames() const { return recordedFrames_.load(); }
     int64_t recordStartFrame() const { return recordStartFrame_; }

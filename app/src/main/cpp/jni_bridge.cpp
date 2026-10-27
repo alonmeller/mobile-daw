@@ -37,7 +37,9 @@ JNIEXPORT jlong JNICALL JNI_FN(position)(JNIEnv *, jobject) { return engine().po
 
 JNIEXPORT jboolean JNICALL JNI_FN(startRecording)(JNIEnv *, jobject) { return engine().startRecording(); }
 
-JNIEXPORT jint JNICALL JNI_FN(stopRecording)(JNIEnv *, jobject) { return engine().stopRecording(); }
+JNIEXPORT jint JNICALL JNI_FN(stopRecording)(JNIEnv *, jobject, jint targetId) {
+    return engine().stopRecording(targetId);
+}
 
 JNIEXPORT jboolean JNICALL JNI_FN(isRecording)(JNIEnv *, jobject) { return engine().isRecording(); }
 

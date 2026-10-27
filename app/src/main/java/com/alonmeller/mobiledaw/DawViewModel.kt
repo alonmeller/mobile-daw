@@ -3,6 +3,7 @@ package com.alonmeller.mobiledaw
 import android.app.Application
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -64,6 +65,10 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var loading by mutableStateOf(true)
         private set
+
+    /** Track that the next recording goes into (REAPER's record arm), or -1 for a new track. */
+    var armedId by mutableIntStateOf(-1)
+        private set
     var message by mutableStateOf<String?>(if (engineStarted) null else "Audio engine failed to start")
 
     /** Timeline zoom in dp per second, and horizontal scroll in px. */
@@ -87,8 +92,13 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             NativeEngine.setMetronome(metronome)
             val loaded = withContext(Dispatchers.IO) {
                 project.tracks.mapNotNull { saved ->
-                    val audio = WavFile.read(store.audioFile(saved.fileName)) ?: return@mapNotNull null
-                    val samples = WavFile.resample(audio.samples, audio.sampleRate, sampleRate)
+                    val file = store.audioFile(saved.fileName)
+                    val samples = if (file.exists()) {
+                        val audio = WavFile.read(file) ?: return@mapNotNull null
+                        WavFile.resample(audio.samples, audio.sampleRate, sampleRate)
+                    } else {
+                        FloatArray(0) // empty track waiting for a recording
+                    }
                     val start = saved.startFrame * sampleRate / project.sampleRate
                     val id = NativeEngine.addTrack(samples, start)
                     NativeEngine.setTrackGain(id, saved.gain)
@@ -221,22 +231,65 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         playing = true
     }
 
-    private fun stopRecording() {
-        val id = NativeEngine.stopRecording()
-        recording = false
-        inputLevel = 0f
-        if (id < 0) return
+    private fun newTrack(id: Int): TrackState {
         val number = nextTrackNumber++
-        val track = TrackState(
+        return TrackState(
             engineId = id,
             fileName = "take_${UUID.randomUUID()}.wav",
             name = "Audio $number",
             colorIndex = number - 1,
-            startFrame = NativeEngine.trackStart(id),
-            lengthFrames = NativeEngine.trackLength(id),
-            peaks = NativeEngine.trackPeaks(id, PEAK_BUCKET),
+            startFrame = 0,
+            lengthFrames = 0,
+            peaks = FloatArray(0),
         )
-        tracks = tracks + track
+    }
+
+    /** Adds an empty track and arms it, so the next recording lands there. */
+    fun addEmptyTrack() {
+        val id = NativeEngine.addTrack(FloatArray(0), 0)
+        tracks = tracks + newTrack(id)
+        armedId = id
+        saveProject()
+    }
+
+    fun toggleArm(id: Int) {
+        if (recording) return
+        armedId = if (armedId == id) -1 else id
+    }
+
+    /** True while a take is being recorded straight into this (empty) track. */
+    fun isRecordingInto(track: TrackState) =
+        recording && track.engineId == armedId && track.lengthFrames == 0L
+
+    private fun stopRecording() {
+        val target = armedId
+        val id = NativeEngine.stopRecording(target)
+        recording = false
+        inputLevel = 0f
+        if (id < 0) return
+        val filled = { t: TrackState ->
+            t.copy(
+                startFrame = NativeEngine.trackStart(id),
+                lengthFrames = NativeEngine.trackLength(id),
+                peaks = NativeEngine.trackPeaks(id, PEAK_BUCKET),
+            )
+        }
+        val track: TrackState
+        if (id == target) {
+            track = filled(tracks.first { it.engineId == id })
+            tracks = tracks.map { if (it.engineId == id) track else it }
+        } else {
+            // The armed track already had audio (or none was armed): put the
+            // take on a new track right below it so nothing is overwritten.
+            track = filled(newTrack(id))
+            val at = tracks.indexOfFirst { it.engineId == target }
+            tracks = if (at >= 0) {
+                tracks.toMutableList().apply { add(at + 1, track) }
+            } else {
+                tracks + track
+            }
+            if (target >= 0) armedId = id
+        }
         viewModelScope.launch(Dispatchers.IO) {
             WavFile.writeFloatMono(store.audioFile(track.fileName), NativeEngine.trackSamples(id), sampleRate)
             withContext(Dispatchers.Main) { saveProject() }
@@ -295,6 +348,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val t = tracks.find { it.engineId == id } ?: return
         NativeEngine.removeTrack(id)
         tracks = tracks.filterNot { it.engineId == id }
+        if (armedId == id) armedId = -1
         viewModelScope.launch(Dispatchers.IO) { store.audioFile(t.fileName).delete() }
         saveProject()
     }
