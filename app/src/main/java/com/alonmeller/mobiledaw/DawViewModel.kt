@@ -1502,9 +1502,9 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     fun deleteSong(id: String) {
         if (id == songId) {
             switchSong {
-                val next = library.list().firstOrNull { it.id != id }?.id ?: library.create(ProjectLibrary.DEFAULT_NAME)
+                // Deleted first, so a new song made to replace the last one is plain "My Song".
                 library.delete(id)
-                next
+                library.list().firstOrNull()?.id ?: library.create(ProjectLibrary.DEFAULT_NAME)
             }
         } else {
             viewModelScope.launch {
