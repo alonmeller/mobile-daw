@@ -12,9 +12,8 @@
 #include <vector>
 
 #include "Effects.h"
+#include "Instruments.h"
 #include "RingBuffer.h"
-
-using Samples = std::vector<float>;
 
 // A media item: a window [offset, offset + length) of a source placed at
 // `position` on the timeline, with fades and its own gain (REAPER-style).
@@ -46,9 +45,50 @@ struct TrackMix {
     std::vector<std::shared_ptr<Effect>> fx;  // pre-fader insert chain, as in REAPER
     std::vector<EnvPoint> volumeEnv;          // multiplies the fader gain
     std::vector<EnvPoint> panEnv;             // replaces the pan knob when present
+    // Instrument tracks: the instrument (shared with older snapshots so its
+    // voices survive edits), its pads and the MIDI notes, sorted by start.
+    std::shared_ptr<Instrument> instrument;
+    int64_t instrumentId = -1;
+    std::vector<PadConfig> pads;
+    std::vector<MidiNote> notes;
     // Scratch buffers, allocated with the snapshot on the UI thread.
     std::vector<float> left = std::vector<float>(kBlock);
     std::vector<float> right = std::vector<float>(kBlock);
+};
+
+// A note played live from the UI (pads, keyboard); velocity 0 is a note off.
+struct LiveNote {
+    int64_t instrumentId = -1;
+    int pitch = 0;
+    float velocity = 0.0f;
+};
+
+// Hands live notes from the UI thread to the audio thread without locks:
+// one producer, one consumer.
+class LiveNoteQueue {
+public:
+    bool push(const LiveNote &note) {
+        const uint32_t head = head_.load(std::memory_order_relaxed);
+        const uint32_t next = (head + 1) & (kSize - 1);
+        if (next == tail_.load(std::memory_order_acquire)) return false;
+        buffer_[head] = note;
+        head_.store(next, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(LiveNote &note) {
+        const uint32_t tail = tail_.load(std::memory_order_relaxed);
+        if (tail == head_.load(std::memory_order_acquire)) return false;
+        note = buffer_[tail];
+        tail_.store((tail + 1) & (kSize - 1), std::memory_order_release);
+        return true;
+    }
+
+private:
+    static constexpr uint32_t kSize = 256;
+    std::array<LiveNote, kSize> buffer_{};
+    std::atomic<uint32_t> head_{0};
+    std::atomic<uint32_t> tail_{0};
 };
 
 // Snapshot of everything the audio thread needs to render. The UI builds a
@@ -83,8 +123,12 @@ public:
     void setLoop(int64_t start, int64_t end, bool enabled);
 
     // Recording
-    bool startRecording();
+    // With `withTransport` false the timeline stays put: the input is only
+    // captured, as when sampling the microphone into a drum pad.
+    bool startRecording(bool withTransport = true);
     int stopRecording();  // returns the new source id, or -1 when nothing was recorded
+    // How far behind the render position the speaker is, in frames.
+    int64_t outputLatencyFrames();
     bool isRecording() const { return recording_.load(); }
     int64_t recordedFrames() const { return recordedFrames_.load(); }
     int64_t recordStartFrame() const { return recordStartFrame_; }
@@ -107,6 +151,16 @@ public:
     void setEffectParam(int64_t id, int index, float value);
     void setEffectBypass(int64_t id, bool bypass);
     std::shared_ptr<Effect> effect(int64_t id);
+
+    // Instruments live in a registry keyed by the UI's instrument id; drum
+    // pads are kept here on the UI side and copied into each snapshot.
+    bool createInstrument(int64_t id, int kind, const float *params, int numParams);
+    void setInstrumentParam(int64_t id, int index, float value);
+    void setDrumPads(int64_t id, std::vector<PadConfig> pads);
+    std::shared_ptr<Instrument> instrument(int64_t id);
+    std::vector<PadConfig> drumPads(int64_t id);
+    // Plays a note now, transport running or not.
+    void liveNote(int64_t instrumentId, int pitch, float velocity);
 
     // Metronome
     void setMetronome(bool enabled) { metronomeOn_.store(enabled); }
@@ -136,6 +190,7 @@ private:
     void renderSegment(float *out, int32_t numFrames, int64_t pos, bool playing);
     void renderBlock(float *out, int numFrames, int64_t pos, bool playing);
     void renderMetronome(float *out, int32_t numFrames, int64_t pos);
+    void applyLiveNotes();
 
     std::shared_ptr<oboe::AudioStream> output_;
     std::shared_ptr<oboe::AudioStream> input_;
@@ -149,6 +204,11 @@ private:
     std::mutex effectsMutex_;
     std::unordered_map<int64_t, std::shared_ptr<Effect>> effects_;
 
+    std::mutex instrumentsMutex_;
+    std::unordered_map<int64_t, std::shared_ptr<Instrument>> instruments_;
+    std::unordered_map<int64_t, std::vector<PadConfig>> drumPads_;
+    LiveNoteQueue liveNotes_;
+
     std::mutex arrangementMutex_;
     std::unique_ptr<Arrangement> arrangement_ = std::make_unique<Arrangement>();
     std::array<std::atomic<float>, kMaxMeters> trackPeaks_{};
@@ -157,7 +217,11 @@ private:
     std::array<float, kBlock> masterR_{};
 
     std::atomic<bool> playing_{false};
-    int64_t tailFrames_ = 0;  // audio thread only
+    // Audio thread only: how long to keep rendering after stop (FX tails and
+    // live notes), and where the next block should start if nothing jumped.
+    int64_t tailFrames_ = 0;
+    int64_t nextBlockPos_ = -1;
+    bool instrumentsActive_ = false;
     std::atomic<int64_t> position_{0};
     std::atomic<float> masterPeak_{0.0f};
     std::atomic<int64_t> loopStart_{0};
@@ -171,6 +235,7 @@ private:
     std::atomic<int64_t> recordedFrames_{0};
     std::atomic<float> inputPeak_{0.0f};
     int64_t recordStartFrame_ = 0;
+    bool sampling_ = false;
     int64_t lastTakeStart_ = 0;
     RingBuffer ring_{1 << 18};
     std::vector<float> recordBuffer_;

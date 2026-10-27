@@ -35,6 +35,8 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -67,10 +69,17 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.alonmeller.mobiledaw.DawViewModel
+import com.alonmeller.mobiledaw.MainView
 import com.alonmeller.mobiledaw.PEAK_BUCKET
 import com.alonmeller.mobiledaw.SourceInfo
+import com.alonmeller.mobiledaw.TrackKind
+import com.alonmeller.mobiledaw.data.ImportedAudio
 import com.alonmeller.mobiledaw.model.EnvKind
+import com.alonmeller.mobiledaw.model.FIRST_PAD_NOTE
+import com.alonmeller.mobiledaw.model.InstrumentType
 import com.alonmeller.mobiledaw.model.Item
+import com.alonmeller.mobiledaw.model.Midi
+import com.alonmeller.mobiledaw.model.PAD_COUNT
 import com.alonmeller.mobiledaw.model.Scales
 import com.alonmeller.mobiledaw.model.Track
 import kotlin.math.floor
@@ -80,8 +89,12 @@ private val HeaderWidth = 204.dp
 private val TrackHeight = 92.dp
 private val RulerHeight = 34.dp
 
+/**
+ * The whole app. [withMic] runs an action once the microphone may be used,
+ * and [pickAudio] lets the user choose an audio file to import.
+ */
 @Composable
-fun DawScreen(vm: DawViewModel, onRecordPressed: () -> Unit) {
+fun DawScreen(vm: DawViewModel, withMic: (() -> Unit) -> Unit, pickAudio: ((ImportedAudio) -> Unit) -> Unit) {
     val density = LocalDensity.current.density
     LaunchedEffect(density) { vm.setDensity(density) }
     LaunchedEffect(Unit) {
@@ -98,14 +111,18 @@ fun DawScreen(vm: DawViewModel, onRecordPressed: () -> Unit) {
             .fillMaxSize()
             .background(DawColors.Background)
     ) {
-        TransportBar(vm, onRecordPressed)
-        if (vm.showMixer) {
-            MixerView(vm, Modifier.fillMaxSize())
-        } else {
-            ArrangeView(vm, trackScroll)
+        TransportBar(vm) {
+            // Recording notes needs no microphone.
+            if (vm.recording || vm.recordingMidi || vm.recordsMidi) vm.toggleRecord() else withMic(vm::toggleRecord)
+        }
+        when (vm.view) {
+            MainView.Mixer -> MixerView(vm, Modifier.fillMaxSize())
+            MainView.Play -> PlayView(vm, withMic, pickAudio, Modifier.fillMaxSize())
+            MainView.Arrange -> ArrangeView(vm, trackScroll, pickAudio)
         }
     }
     vm.fxTarget?.let { FxDialog(vm, it) }
+    vm.noteEditorItemId?.let { NoteEditor(vm, it) }
     vm.message?.let { msg ->
         LaunchedEffect(msg) {
             kotlinx.coroutines.delay(2500)
@@ -116,7 +133,7 @@ fun DawScreen(vm: DawViewModel, onRecordPressed: () -> Unit) {
 
 /** The timeline: edit tools, ruler and track lanes. */
 @Composable
-private fun ArrangeView(vm: DawViewModel, trackScroll: ScrollState) {
+private fun ArrangeView(vm: DawViewModel, trackScroll: ScrollState, pickAudio: ((ImportedAudio) -> Unit) -> Unit) {
     Column(Modifier.fillMaxSize()) {
         EditBar(vm)
         Row(Modifier.fillMaxWidth().height(RulerHeight)) {
@@ -127,18 +144,7 @@ private fun ArrangeView(vm: DawViewModel, trackScroll: ScrollState) {
                     .background(DawColors.Panel),
                 contentAlignment = Alignment.CenterStart,
             ) {
-                Row(
-                    Modifier
-                        .padding(start = 8.dp)
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(DawColors.PanelRaised)
-                        .clickable(enabled = !vm.recording, onClick = vm::addTrack)
-                        .padding(horizontal = 10.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("+", color = DawColors.TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    Text("  Track", color = DawColors.TextPrimary, fontSize = 13.sp)
-                }
+                AddTrackButton(vm, pickAudio)
             }
             Ruler(vm, Modifier.weight(1f).fillMaxHeight())
         }
@@ -156,11 +162,44 @@ private fun ArrangeView(vm: DawViewModel, trackScroll: ScrollState) {
     }
 }
 
+/** "+ Track" with a choice of track, like GarageBand's instrument browser. */
+@Composable
+private fun AddTrackButton(vm: DawViewModel, pickAudio: ((ImportedAudio) -> Unit) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        Row(
+            Modifier
+                .padding(start = 8.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .background(DawColors.PanelRaised)
+                .clickable(enabled = !vm.recording && !vm.recordingMidi) { open = true }
+                .padding(horizontal = 10.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("+", color = DawColors.TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Text("  Track", color = DawColors.TextPrimary, fontSize = 13.sp)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            val add = { kind: TrackKind ->
+                open = false
+                vm.addTrack(kind)
+            }
+            MenuItem("🎤  Audio (voice, guitar)") { add(TrackKind.Audio) }
+            MenuItem("🥁  Drum pads") { add(TrackKind.Drums) }
+            MenuItem("🎹  Synth keyboard") { add(TrackKind.Synth) }
+            MenuItem("📂  Import audio file (MP3, WAV…)") {
+                open = false
+                pickAudio(vm::importAudio)
+            }
+        }
+    }
+}
+
 @Composable
 private fun EmptyHint() {
     Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) {
         Text(
-            "לחץ על כפתור ההקלטה האדום כדי להקליט את הערוץ הראשון",
+            "לחץ על כפתור ההקלטה האדום כדי להקליט קול,\nאו על \"+ Track\" כדי להוסיף תופים או סינתיסייזר",
             color = DawColors.TextSecondary,
             fontSize = 16.sp,
             textAlign = TextAlign.Center,
@@ -172,6 +211,7 @@ private fun EmptyHint() {
 
 @Composable
 private fun TransportBar(vm: DawViewModel, onRecordPressed: () -> Unit) {
+    val recordingAny = vm.recording || vm.recordingMidi
     Row(
         Modifier
             .fillMaxWidth()
@@ -183,11 +223,11 @@ private fun TransportBar(vm: DawViewModel, onRecordPressed: () -> Unit) {
     ) {
         RoundButton(onClick = vm::rewind) { GlyphIcon(Glyph.Rewind, DawColors.TextPrimary, size = 18.dp) }
         RoundButton(onClick = vm::stop) { GlyphIcon(Glyph.Stop, DawColors.TextPrimary, size = 20.dp) }
-        RoundButton(onClick = vm::togglePlay, active = vm.playing && !vm.recording, activeColor = DawColors.MeterGreen) {
+        RoundButton(onClick = vm::togglePlay, active = vm.playing && !recordingAny, activeColor = DawColors.MeterGreen) {
             GlyphIcon(if (vm.playing) Glyph.Pause else Glyph.Play, DawColors.TextPrimary)
         }
-        RoundButton(onClick = onRecordPressed, active = vm.recording, activeColor = DawColors.Record) {
-            GlyphIcon(Glyph.Record, if (vm.recording) Color.White else DawColors.Record)
+        RoundButton(onClick = onRecordPressed, active = recordingAny, activeColor = DawColors.Record) {
+            GlyphIcon(Glyph.Record, if (recordingAny) Color.White else DawColors.Record)
         }
         RoundButton(onClick = vm::toggleLoop, active = vm.project.loopOn, activeColor = DawColors.Loop) {
             Text("⟳", color = DawColors.TextPrimary, fontSize = 20.sp)
@@ -197,16 +237,20 @@ private fun TransportBar(vm: DawViewModel, onRecordPressed: () -> Unit) {
         RoundButton(onClick = vm::toggleMetronome, active = vm.settings.metronome, activeColor = DawColors.Accent) {
             GlyphIcon(Glyph.Metronome, DawColors.TextPrimary, size = 20.dp)
         }
-        // Switches between the timeline and the mixer, like REAPER's View > Mixer.
-        RoundButton(onClick = vm::toggleMixer, active = vm.showMixer, activeColor = DawColors.Accent) {
+        // Switches between the timeline and the mixer, like REAPER's View > Mixer,
+        // or the pads and keys of an instrument.
+        RoundButton(onClick = { vm.showView(MainView.Mixer) }, active = vm.view == MainView.Mixer, activeColor = DawColors.Accent) {
             Text("MIX", color = DawColors.TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+        RoundButton(onClick = { vm.showView(MainView.Play) }, active = vm.view == MainView.Play, activeColor = DawColors.Accent) {
+            GlyphIcon(Glyph.Pads, DawColors.TextPrimary, size = 20.dp)
         }
 
         Spacer(Modifier.weight(1f))
 
         vm.message?.let { Text(it, color = DawColors.Solo, fontSize = 12.sp, maxLines = 1) }
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (vm.recording) LevelMeter(vm.inputLevel, Modifier.width(70.dp).height(8.dp), label = "IN")
+            if (vm.recording || vm.samplingPad != null) LevelMeter(vm.inputLevel, Modifier.width(70.dp).height(8.dp), label = "IN")
             LevelMeter(vm.masterLevel, Modifier.width(70.dp).height(8.dp), label = "OUT")
         }
     }
@@ -238,6 +282,11 @@ private fun EditBar(vm: DawViewModel) {
         EditButton("Normalize", enabled = hasSelection, onClick = vm::normalizeSelected)
         EditButton("↑ Track", enabled = hasSelection) { vm.moveSelectedToTrack(-1) }
         EditButton("↓ Track", enabled = hasSelection) { vm.moveSelectedToTrack(1) }
+        Divider()
+        // MIDI: a new pattern on an instrument track, and the piano roll for the selected one.
+        val midiItem = vm.selectedMidiItem
+        EditButton("+ Pattern", enabled = vm.project.tracks.any { it.id == vm.selectedTrackId && it.instrument != null }, onClick = vm::addPattern)
+        EditButton("✎ Notes", enabled = midiItem != null) { midiItem?.let { vm.openNoteEditor(it.id) } }
         Divider()
         EditButton("Snap", active = vm.settings.snap, onClick = vm::toggleSnap)
         EditButton("Grid " + gridLabel(vm.settings.gridDivision), onClick = vm::cycleGrid)
@@ -330,6 +379,7 @@ private fun TimeDisplay(vm: DawViewModel) {
 
 @Composable
 private fun TempoControl(vm: DawViewModel) {
+    var typing by remember { mutableStateOf(false) }
     Row(
         Modifier
             .clip(RoundedCornerShape(8.dp))
@@ -337,11 +387,37 @@ private fun TempoControl(vm: DawViewModel) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         SmallTextButton("−") { vm.changeTempo(-1.0) }
-        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(52.dp)) {
+        // Tap the number to type a tempo.
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.width(52.dp).clickable { typing = true },
+        ) {
             Text("${vm.project.tempo.toInt()}", color = DawColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
             Text("BPM", color = DawColors.TextSecondary, fontSize = 9.sp)
         }
         SmallTextButton("+") { vm.changeTempo(1.0) }
+    }
+    if (typing) {
+        var text by remember { mutableStateOf(vm.project.tempo.toInt().toString()) }
+        AlertDialog(
+            onDismissRequest = { typing = false },
+            title = { Text("Tempo (BPM)") },
+            text = {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.filter(Char::isDigit).take(3) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    typing = false
+                    text.toIntOrNull()?.let { vm.setTempo(it.toDouble()) }
+                }) { Text("OK") }
+            },
+            dismissButton = { TextButton(onClick = { typing = false }) { Text("Cancel") } },
+        )
     }
 }
 
@@ -357,7 +433,7 @@ private fun SmallTextButton(text: String, onClick: () -> Unit) {
 
 /** Horizontal peak meter on the faders' dB scale. */
 @Composable
-private fun LevelMeter(level: Float, modifier: Modifier, label: String? = null) {
+internal fun LevelMeter(level: Float, modifier: Modifier, label: String? = null) {
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
         if (label != null) {
             Text(label, color = DawColors.TextSecondary, fontSize = 9.sp, modifier = Modifier.width(22.dp))
@@ -521,7 +597,7 @@ internal fun textPaint(textSize: Float, color: Int, bold: Boolean): android.grap
 private fun DrawScope.drawPlayhead(vm: DawViewModel, triangle: Boolean = false) {
     val x = vm.screenX(vm.position)
     if (x < 0 || x > size.width) return
-    val color = if (vm.recording) DawColors.Record else DawColors.Playhead
+    val color = if (vm.recording || vm.recordingMidi) DawColors.Record else DawColors.Playhead
     drawLine(color, Offset(x, 0f), Offset(x, size.height), 1.5.dp.toPx())
     if (triangle) {
         val s = 6.dp.toPx()
@@ -645,6 +721,13 @@ private fun TrackHeader(vm: DawViewModel, track: Track) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 LevelMeter(vm.trackLevels[track.id] ?: 0f, Modifier.weight(1f).height(6.dp))
                 Spacer(Modifier.width(6.dp))
+                track.instrument?.let { inst ->
+                    // Opens the instrument's pads or keys.
+                    LabelChip(if (inst.type == InstrumentType.DRUMS) "PADS" else "KEYS", true, color, Modifier.width(40.dp)) {
+                        vm.openPlay(track.id)
+                    }
+                    Spacer(Modifier.width(4.dp))
+                }
                 LabelChip("FX", track.fx.isNotEmpty(), DawColors.Accent, Modifier.width(32.dp)) { vm.openFx(track.id) }
                 Spacer(Modifier.width(4.dp))
                 // Automation: off, then the volume envelope, then the pan envelope.
@@ -675,7 +758,7 @@ private fun TrackHeader(vm: DawViewModel, track: Track) {
 }
 
 @Composable
-private fun MenuItem(label: String, onClick: () -> Unit) {
+internal fun MenuItem(label: String, onClick: () -> Unit) {
     DropdownMenuItem(text = { Text(label) }, onClick = onClick)
 }
 
@@ -692,7 +775,7 @@ private fun RenameDialog(initial: String, onDismiss: () -> Unit, onRename: (Stri
 }
 
 @Composable
-private fun LabelChip(label: String, on: Boolean, onColor: Color, modifier: Modifier, onClick: () -> Unit) {
+internal fun LabelChip(label: String, on: Boolean, onColor: Color, modifier: Modifier, onClick: () -> Unit) {
     Box(
         modifier
             .height(24.dp)
@@ -762,7 +845,12 @@ private fun TrackLane(vm: DawViewModel, track: Track, index: Int, modifier: Modi
                         } else {
                             val hit = latestVm.hitTest(latestTrack, pos.x, pos.y, h)
                             if (hit != null) {
-                                latestVm.selectItem(hit.first.id, latestTrack.id)
+                                // Tapping a selected MIDI item again opens its notes.
+                                if (hit.first.isMidi && hit.first.id in latestVm.selectedItems) {
+                                    latestVm.openNoteEditor(hit.first.id)
+                                } else {
+                                    latestVm.selectItem(hit.first.id, latestTrack.id)
+                                }
                             } else {
                                 latestVm.selectItem(null, latestTrack.id)
                                 latestVm.seekToScreenX(pos.x)
@@ -778,9 +866,15 @@ private fun TrackLane(vm: DawViewModel, track: Track, index: Int, modifier: Modi
     ) {
         drawGrid(vm)
         track.items.forEach { item ->
-            drawItem(vm, item, vm.sources[item.sourceId], color, item.id in vm.selectedItems, track.mute)
+            if (item.isMidi) {
+                drawMidiItem(vm, item, track, color, item.id in vm.selectedItems)
+            } else {
+                drawItem(vm, item, vm.sources[item.sourceId], color, item.id in vm.selectedItems, track.mute)
+            }
         }
-        if (vm.isRecordingInto(track)) drawRecording(vm)
+        if (vm.isRecordingInto(track)) {
+            if (vm.recordingMidi) drawMidiRecording(vm) else drawRecording(vm)
+        }
         if (envKind != null) drawEnvelope(vm, track, envKind)
         drawPlayhead(vm)
     }
@@ -865,6 +959,86 @@ private fun DrawScope.drawRecording(vm: DawViewModel) {
         DawColors.Record.copy(alpha = 0.45f), Offset(x0, pad), Size(w, size.height - pad * 2),
         CornerRadius(6.dp.toPx()),
     )
+}
+
+/** While notes are recorded: a red band over what this pass has covered. */
+private fun DrawScope.drawMidiRecording(vm: DawViewModel) {
+    val p = vm.project
+    val (from, to) = if (vm.position >= vm.recordStart) vm.recordStart to vm.position else p.loopStart to p.loopEnd
+    val x0 = vm.screenX(from)
+    val w = vm.screenX(to) - x0
+    if (w <= 0f) return
+    drawRect(DawColors.Record.copy(alpha = 0.18f), Offset(x0, 0f), Size(w, size.height))
+}
+
+/**
+ * A MIDI item: its notes as small bars, a line at each repeat of its
+ * pattern (REAPER draws the same notches on looped items), and its name.
+ */
+private fun DrawScope.drawMidiItem(vm: DawViewModel, item: Item, track: Track, color: Color, selected: Boolean) {
+    val x0 = vm.screenX(item.position)
+    val width = vm.framesToPx(item.length)
+    if (x0 > size.width || x0 + width < 0 || width <= 0f) return
+    val pad = 4.dp.toPx()
+    val top = pad
+    val height = size.height - pad * 2
+    val radius = CornerRadius(6.dp.toPx())
+    val alpha = if (item.mute || track.mute) 0.3f else 1f
+    val titleH = 14.dp.toPx()
+
+    drawRoundRect(color.copy(alpha = 0.3f * alpha), Offset(x0, top), Size(width, height), radius)
+    drawRoundRect(color.copy(alpha = 0.9f * alpha), Offset(x0, top), Size(width, titleH), radius)
+    drawRect(color.copy(alpha = 0.9f * alpha), Offset(x0, top + titleH / 2), Size(width, titleH / 2))
+    if (width > 40.dp.toPx()) {
+        val label = if (item.mute) "muted" else if (item.notes.isNullOrEmpty()) "empty · tap again" else ""
+        val name = if (track.instrument?.type == InstrumentType.DRUMS) "Pattern" else "MIDI"
+        drawContext.canvas.nativeCanvas.drawText(
+            "$name  $label".trim(), max(x0, 0f) + 6.dp.toPx(), top + titleH * 0.78f,
+            textPaint(10.dp.toPx(), android.graphics.Color.WHITE, bold = true),
+        )
+    }
+
+    // Repeats of the pattern.
+    val loop = item.loopLength
+    if (loop > 0) {
+        var k = Math.floorDiv(item.offset, loop) + 1
+        while (true) {
+            val f = item.position + k * loop - item.offset
+            if (f >= item.end) break
+            val x = vm.screenX(f)
+            if (x > size.width) break
+            if (x >= 0f) drawLine(Color.Black.copy(alpha = 0.35f), Offset(x, top + titleH), Offset(x, top + height), 1.dp.toPx())
+            k++
+        }
+    }
+
+    // Notes: drum pads get a row each; other notes fill the item's pitch range.
+    val notes = vm.timelineNotes(item)
+    if (notes.isNotEmpty()) {
+        val drums = track.instrument?.type == InstrumentType.DRUMS
+        val low = if (drums) FIRST_PAD_NOTE else notes.minOf { it.pitch } - 2
+        val high = if (drums) FIRST_PAD_NOTE + PAD_COUNT - 1 else notes.maxOf { it.pitch } + 2
+        val areaTop = top + titleH + 2.dp.toPx()
+        val areaH = height - titleH - 4.dp.toPx()
+        val rowH = areaH / (high - low + 1)
+        val noteH = rowH.coerceIn(1.5f, 6.dp.toPx())
+        val noteColor = Color.Black.copy(alpha = 0.6f * alpha + 0.1f)
+        for (n in notes) {
+            val nx = vm.screenX(n.start)
+            if (nx > size.width) break
+            val nw = vm.framesToPx(n.length).coerceAtLeast(2.dp.toPx())
+            if (nx + nw < 0f) continue
+            val y = areaTop + (high - n.pitch) * rowH + (rowH - noteH) / 2
+            drawRect(noteColor, Offset(nx, y), Size(nw, noteH))
+        }
+    }
+
+    if (selected) {
+        drawRoundRect(Color.White, Offset(x0, top), Size(width, height), radius, style = Stroke(2.dp.toPx()))
+        val edge = 3.dp.toPx()
+        drawRect(Color.White.copy(alpha = 0.7f), Offset(x0, top + height * 0.35f), Size(edge, height * 0.3f))
+        drawRect(Color.White.copy(alpha = 0.7f), Offset(x0 + width - edge, top + height * 0.35f), Size(edge, height * 0.3f))
+    }
 }
 
 private fun DrawScope.drawItem(

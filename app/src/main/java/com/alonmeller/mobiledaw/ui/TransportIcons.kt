@@ -14,7 +14,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 /** Transport glyphs drawn directly, so the app needs no icon library. */
-enum class Glyph { Play, Pause, Stop, Record, Rewind, Metronome, ZoomIn, ZoomOut }
+enum class Glyph { Play, Pause, Stop, Record, Rewind, Metronome, ZoomIn, ZoomOut, Pads }
 
 @Composable
 fun GlyphIcon(glyph: Glyph, color: Color, modifier: Modifier = Modifier, size: Dp = 22.dp) {
@@ -59,6 +59,17 @@ fun GlyphIcon(glyph: Glyph, color: Color, modifier: Modifier = Modifier, size: D
                 }
                 drawPath(body, color, style = Stroke(width = w * 0.08f))
                 drawLine(color, Offset(w * 0.5f, h * 0.72f), Offset(w * 0.78f, h * 0.22f), strokeWidth = w * 0.08f)
+            }
+            Glyph.Pads -> {
+                // A 3x3 grid of pads, as on a drum machine.
+                val cell = w * 0.26f
+                val gap = (w - cell * 3) / 4
+                for (row in 0..2) for (col in 0..2) {
+                    drawRoundRect(
+                        color, Offset(gap + col * (cell + gap), gap + row * (cell + gap)), Size(cell, cell),
+                        CornerRadius(w * 0.05f),
+                    )
+                }
             }
             Glyph.ZoomIn, Glyph.ZoomOut -> {
                 drawLine(color, Offset(w * 0.2f, h * 0.5f), Offset(w * 0.8f, h * 0.5f), strokeWidth = w * 0.1f)

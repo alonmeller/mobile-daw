@@ -9,9 +9,11 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.alonmeller.mobiledaw.audio.NativeEngine
+import com.alonmeller.mobiledaw.data.ImportedAudio
 import com.alonmeller.mobiledaw.data.ProjectSettings
 import com.alonmeller.mobiledaw.data.ProjectStore
 import com.alonmeller.mobiledaw.data.WavFile
+import com.alonmeller.mobiledaw.model.DrumKit
 import com.alonmeller.mobiledaw.model.Edits
 import com.alonmeller.mobiledaw.model.Effect
 import com.alonmeller.mobiledaw.model.EffectType
@@ -20,9 +22,15 @@ import com.alonmeller.mobiledaw.model.EnvPoint
 import com.alonmeller.mobiledaw.model.Envelopes
 import com.alonmeller.mobiledaw.model.History
 import com.alonmeller.mobiledaw.model.Ids
+import com.alonmeller.mobiledaw.model.Instrument
+import com.alonmeller.mobiledaw.model.InstrumentType
 import com.alonmeller.mobiledaw.model.Item
 import com.alonmeller.mobiledaw.model.MASTER
 import com.alonmeller.mobiledaw.model.Marker
+import com.alonmeller.mobiledaw.model.Midi
+import com.alonmeller.mobiledaw.model.Note
+import com.alonmeller.mobiledaw.model.PAD_COUNT
+import com.alonmeller.mobiledaw.model.Pad
 import com.alonmeller.mobiledaw.model.Project
 import com.alonmeller.mobiledaw.model.Scales
 import com.alonmeller.mobiledaw.model.Track
@@ -31,10 +39,12 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.IdentityHashMap
 import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.pow
+import kotlin.math.roundToLong
 
 /** Frames per waveform bucket; fine enough for the deepest zoom level. */
 const val PEAK_BUCKET = 256
@@ -47,6 +57,12 @@ enum class DragMode { Move, TrimLeft, TrimRight, FadeIn, FadeOut }
 
 /** Grid choices: notes per bar. */
 val GRID_DIVISIONS = listOf(1, 2, 4, 8, 16)
+
+/** What fills the screen under the transport bar. */
+enum class MainView { Arrange, Mixer, Play }
+
+/** Kinds of track that "+ Track" adds. */
+enum class TrackKind { Audio, Synth, Drums }
 
 /** How fast meters fall back after a peak. */
 private const val METER_FALL_DB_PER_SECOND = 24f
@@ -97,8 +113,23 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     var loading by mutableStateOf(true)
         private set
 
-    /** Mixer instead of the arrange view. */
-    var showMixer by mutableStateOf(false)
+    /** The timeline, the mixer, or the pads and keys of an instrument. */
+    var view by mutableStateOf(MainView.Arrange)
+        private set
+    /** Instrument track that the play view plays. */
+    var playTrackId by mutableLongStateOf(-1L)
+        private set
+    /** True while notes played on the pads or keys are recorded into the armed instrument track. */
+    var recordingMidi by mutableStateOf(false)
+        private set
+    /** Track id and pad index being sampled from the microphone, Koala style. */
+    var samplingPad by mutableStateOf<Pair<Long, Int>?>(null)
+        private set
+    /** MIDI item open in the piano roll. */
+    var noteEditorItemId by mutableStateOf<Long?>(null)
+        private set
+    /** True while the piano roll loops its pattern. */
+    var auditioning by mutableStateOf(false)
         private set
     /** Track id (or [MASTER]) whose effect chain is open, or null. */
     var fxTarget by mutableStateOf<Long?>(null)
@@ -169,9 +200,49 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Instruments the engine already has, with the settings it was last given. */
+    private val pushedInstruments = mutableMapOf<Long, Instrument>()
+
+    private fun syncInstruments(p: Project) {
+        for (inst in p.instruments) {
+            val prev = pushedInstruments[inst.id]
+            if (prev == null) {
+                NativeEngine.createInstrument(inst.id, inst.type.code, inst.values.toFloatArray())
+            } else if (prev.values != inst.values) {
+                inst.values.forEachIndexed { i, v ->
+                    if (prev.values.getOrNull(i) != v) NativeEngine.setInstrumentParam(inst.id, i, v)
+                }
+            }
+            if (inst.pads.isNotEmpty() && prev?.pads != inst.pads) pushPads(inst)
+            pushedInstruments[inst.id] = inst
+        }
+    }
+
+    private fun pushPads(inst: Instrument) {
+        val pads = inst.pads
+        val params = FloatArray(pads.size * 5)
+        val ranges = LongArray(pads.size * 2)
+        pads.forEachIndexed { i, pad ->
+            params[i * 5] = pad.gain
+            params[i * 5 + 1] = pad.pitch
+            params[i * 5 + 2] = if (pad.reverse) 1f else 0f
+            params[i * 5 + 3] = if (pad.oneShot) 1f else 0f
+            params[i * 5 + 4] = pad.chokeGroup.toFloat()
+            ranges[i * 2] = pad.start
+            ranges[i * 2 + 1] = pad.end
+        }
+        NativeEngine.setDrumPads(inst.id, IntArray(pads.size) { pads[it].sourceId }, params, ranges)
+    }
+
+    /** Timeline notes of each MIDI item; items never change in place, so they key the cache by identity. */
+    private var noteCache = IdentityHashMap<Item, List<Note>>()
+
+    fun timelineNotes(item: Item): List<Note> = noteCache.getOrPut(item) { Midi.timelineNotes(item) }
+
     /** Pushes the project to the audio engine. */
     private fun sync(p: Project) {
         syncEffects(p)
+        syncInstruments(p)
         val trackParams = FloatArray(p.tracks.size * 4)
         val counts = IntArray(p.tracks.size)
         val items = p.tracks.map { t -> t.items.filter { !it.mute && it.sourceId in sources } }
@@ -210,14 +281,39 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             points += t.volumeEnv.map { EnvPoint(it.frame, Scales.gainToPosition(it.value)) }
             points += t.panEnv
         }
+        // Instrument tracks play the notes of their unmuted MIDI items.
+        val cache = IdentityHashMap<Item, List<Note>>()
+        for (t in p.tracks) for (item in t.items) if (item.isMidi) cache[item] = noteCache[item] ?: Midi.timelineNotes(item)
+        noteCache = cache
+        val trackNotes = p.tracks.map { t ->
+            if (t.instrument == null) emptyList() else t.items.filter { it.isMidi && !it.mute }.flatMap { cache.getValue(it) }
+        }
+        val noteCounts = IntArray(p.tracks.size) { trackNotes[it].size }
+        val noteTimes = LongArray(noteCounts.sum() * 2)
+        val noteValues = FloatArray(noteTimes.size)
+        var n = 0
+        for (notes in trackNotes) for (note in notes) {
+            noteTimes[n * 2] = note.start
+            noteTimes[n * 2 + 1] = note.length
+            noteValues[n * 2] = note.pitch.toFloat()
+            noteValues[n * 2 + 1] = note.velocity
+            n++
+        }
         NativeEngine.setArrangement(
             trackParams, counts, itemParams, itemGains,
             fxCounts, fxIds,
             envCounts, points.map { it.frame }.toLongArray(), points.map { it.value }.toFloatArray(),
+            LongArray(p.tracks.size) { p.tracks[it].instrument?.id ?: -1L }, noteCounts, noteTimes, noteValues,
             p.masterGain,
         )
         NativeEngine.setTempo(p.tempo)
-        NativeEngine.setLoop(p.loopStart, p.loopEnd, p.loopOn)
+        // While the piano roll auditions its pattern, the engine loops that instead.
+        val audition = if (auditioning) noteEditorItemId?.let { p.findItem(it)?.second } else null
+        if (audition != null) {
+            NativeEngine.setLoop(audition.position, audition.position + minOf(audition.length, Midi.patternLength(audition)), true)
+        } else {
+            NativeEngine.setLoop(p.loopStart, p.loopEnd, p.loopOn)
+        }
     }
 
     private fun applyProject(p: Project) {
@@ -229,6 +325,10 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         if (selectedItems.any { it !in itemIds }) selectedItems = selectedItems.intersect(itemIds)
         if (p.tracks.none { it.id == armedTrackId }) armedTrackId = -1
         if (p.tracks.none { it.id == selectedTrackId }) selectedTrackId = -1
+        if (noteEditorItemId != null && noteEditorItemId !in itemIds) {
+            if (auditioning) toggleAudition()
+            noteEditorItemId = null
+        }
     }
 
     /** Applies an undoable edit. */
@@ -277,7 +377,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
         position = NativeEngine.position()
         masterLevel = meter(masterLevel, NativeEngine.masterPeak())
-        if (recording) {
+        if (recording || samplingPad != null) {
             recordedFrames = NativeEngine.recordedFrames()
             inputLevel = meter(inputLevel, NativeEngine.inputLevel())
         }
@@ -332,6 +432,14 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             stopRecording()
             return
         }
+        if (recordingMidi) {
+            stopMidiRecording()
+            return
+        }
+        if (auditioning) {
+            toggleAudition()
+            return
+        }
         playing = !playing
         NativeEngine.setPlaying(playing)
     }
@@ -339,6 +447,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     /** Stop button: first press stops, a second press returns to the start. */
     fun stop() {
         if (recording) stopRecording()
+        if (recordingMidi) stopMidiRecording()
         if (!playing) {
             seekFrames(0)
             scrollPx = 0f
@@ -365,7 +474,29 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         scheduleSave()
     }
 
-    fun changeTempo(delta: Double) = commit(project.copy(tempo = (project.tempo + delta).coerceIn(30.0, 300.0)))
+    fun changeTempo(delta: Double) = setTempo(project.tempo + delta)
+
+    /**
+     * Sets the tempo. MIDI items and the loop keep their place in bars, as
+     * with REAPER's beat timebase; audio stays where it was recorded.
+     */
+    fun setTempo(bpm: Double) {
+        val p = project
+        val tempo = bpm.coerceIn(30.0, 300.0)
+        if (tempo == p.tempo) return
+        val ratio = p.tempo / tempo
+        commit(
+            p.copy(
+                tempo = tempo,
+                loopStart = (p.loopStart * ratio).roundToLong(),
+                loopEnd = (p.loopEnd * ratio).roundToLong(),
+                tracks = p.tracks.map { t ->
+                    if (t.items.none { it.isMidi }) t
+                    else t.copy(items = t.items.map { if (it.isMidi) Midi.scaleTime(it, ratio) else it })
+                },
+            )
+        )
+    }
 
     fun toggleSnap() {
         settings = settings.copy(snap = !settings.snap)
@@ -439,12 +570,22 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------ recording
 
+    /** True when the record button records notes (an instrument track is armed) rather than the microphone. */
+    val recordsMidi: Boolean get() = project.tracks.firstOrNull { it.id == armedTrackId }?.instrument != null
+
     fun toggleRecord() {
-        if (recording) stopRecording() else startRecording()
+        when {
+            recording -> stopRecording()
+            recordingMidi -> stopMidiRecording()
+            samplingPad != null -> Unit
+            recordsMidi -> startMidiRecording()
+            else -> startRecording()
+        }
     }
 
     private fun startRecording() {
-        if (!NativeEngine.startRecording()) {
+        if (auditioning) toggleAudition()
+        if (!NativeEngine.startRecording(true)) {
             message = "Could not open the microphone"
             return
         }
@@ -483,7 +624,133 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** True while a take is being recorded into this track. */
-    fun isRecordingInto(track: Track) = recording && track.id == armedTrackId
+    fun isRecordingInto(track: Track) = (recording || recordingMidi) && track.id == armedTrackId
+
+    // ------------------------------------------------------------ playing instruments and recording MIDI
+
+    /** Notes held live on each instrument, so none is left hanging. */
+    private val liveHeld = HashMap<Long, MutableSet<Int>>()
+    /** Notes being recorded: pitch to the frame and velocity they started with. */
+    private val heldNotes = HashMap<Int, Pair<Long, Float>>()
+    /** Item that this recording made because no pattern was under its first note; it grows bar by bar. */
+    private var takeItemId = -1L
+    private var outputLatency = 0L
+
+    /** Plays a note on [trackId]'s instrument now, and records it while that track records. */
+    fun noteOn(trackId: Long, pitch: Int, velocity: Float) {
+        val inst = project.tracks.firstOrNull { it.id == trackId }?.instrument ?: return
+        NativeEngine.liveNote(inst.id, pitch, velocity)
+        liveHeld.getOrPut(inst.id) { mutableSetOf() } += pitch
+        if (recordingMidi && trackId == armedTrackId) heldNotes[pitch] = recordFrame() to velocity
+    }
+
+    fun noteOff(trackId: Long, pitch: Int) {
+        val inst = project.tracks.firstOrNull { it.id == trackId }?.instrument ?: return
+        NativeEngine.liveNote(inst.id, pitch, 0f)
+        liveHeld[inst.id]?.remove(pitch)
+        if (recordingMidi && trackId == armedTrackId) finishNote(pitch, recordFrame())
+    }
+
+    /** Plays a short note, as feedback while editing. */
+    fun previewNote(trackId: Long, pitch: Int, velocity: Float = 0.8f) {
+        val inst = project.tracks.firstOrNull { it.id == trackId }?.instrument ?: return
+        NativeEngine.liveNote(inst.id, pitch, velocity)
+        viewModelScope.launch {
+            delay(250)
+            NativeEngine.liveNote(inst.id, pitch, 0f)
+        }
+    }
+
+    /** Releases every note held live, for when the pads or keys go away mid-touch. */
+    fun releaseLiveNotes() {
+        for ((id, pitches) in liveHeld) for (pitch in pitches) NativeEngine.liveNote(id, pitch, 0f)
+        liveHeld.clear()
+    }
+
+    private fun startMidiRecording() {
+        if (auditioning) toggleAudition()
+        heldNotes.clear()
+        takeItemId = -1L
+        outputLatency = NativeEngine.outputLatency()
+        recordStart = position
+        recordingMidi = true
+        if (view != MainView.Play) {
+            project.tracks.firstOrNull { it.id == armedTrackId }?.let { message = "Recording notes into ${it.name}: play its pads or keys" }
+        }
+        if (!playing) {
+            playing = true
+            NativeEngine.setPlaying(true)
+        }
+    }
+
+    private fun stopMidiRecording() {
+        val now = recordFrame()
+        heldNotes.keys.toList().forEach { finishNote(it, now) }
+        recordingMidi = false
+        // The whole take is one undo step.
+        endGesture()
+    }
+
+    /** Timeline frame the performer hears now: the engine renders ahead of the speaker by the output latency. */
+    private fun recordFrame(): Long {
+        val p = project
+        val rendered = NativeEngine.position()
+        var frame = rendered - outputLatency
+        // Just after a loop jump the speaker still plays the end of the loop.
+        if (p.loopOn && p.loopEnd > p.loopStart && rendered >= p.loopStart && frame < p.loopStart) {
+            frame += p.loopEnd - p.loopStart
+        }
+        return frame.coerceAtLeast(0)
+    }
+
+    private fun finishNote(pitch: Int, end: Long) {
+        val (played, velocity) = heldNotes.remove(pitch) ?: return
+        val p = project
+        val track = p.tracks.firstOrNull { it.id == armedTrackId } ?: return
+        val looping = p.loopOn && p.loopEnd > p.loopStart
+        var start = played
+        if (settings.quantizeRecording) {
+            val step = framesPerBeat / 4
+            start = ((played / step).roundToLong() * step).roundToLong()
+            // A note pulled onto the loop end is heard at the loop start.
+            if (looping && played < p.loopEnd && start >= p.loopEnd) start -= p.loopEnd - p.loopStart
+        }
+        val held = when {
+            end >= played -> end - played
+            looping -> p.loopEnd - played // the loop jumped while the note was held
+            else -> 0L
+        }
+        val shortest = framesPerBeat / if (track.instrument?.type == InstrumentType.DRUMS) 4 else 8
+        recordNote(track, Note(start, held.coerceAtLeast(shortest.roundToLong()), pitch, velocity))
+    }
+
+    /** Puts a recorded note into the pattern under it, or else into the item this take makes. */
+    private fun recordNote(track: Track, note: Note) {
+        val p = project
+        val bar = framesPerBeat * 4
+        val under = track.items.lastOrNull { it.isMidi && note.start >= it.position && note.start < it.end }
+        val take = track.items.firstOrNull { it.id == takeItemId }
+        val next = when {
+            under != null -> p.updateItem(under.id) { Midi.mergeRecorded(it, listOf(note)) }
+            take != null && note.start >= take.end -> {
+                // The take grows to the end of the bar this note is in.
+                val length = Midi.barAround(note.start, bar).second - take.position
+                p.updateItem(take.id) { Midi.mergeRecorded(it.copy(length = length, loopLength = length), listOf(note)) }
+            }
+            else -> {
+                val (start, end) = if (p.loopOn && note.start >= p.loopStart && note.start < p.loopEnd) {
+                    p.loopStart to p.loopEnd
+                } else {
+                    Midi.barAround(note.start, bar)
+                }
+                val item = Midi.mergeRecorded(Midi.newItem(start, end - start), listOf(note))
+                takeItemId = item.id
+                p.updateTrack(track.id) { it.copy(items = (it.items + item).sortedBy { i -> i.position }) }
+            }
+        }
+        // Each note is heard on the next pass through the loop.
+        preview(next)
+    }
 
     // ------------------------------------------------------------ tracks
 
@@ -492,12 +759,33 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         return Track(Ids.next(), "Audio $number", number - 1)
     }
 
-    /** Adds an empty track and arms it, so the next recording lands there. */
-    fun addTrack() {
-        val t = newTrack()
+    /**
+     * Adds an empty track and arms it, so the next recording lands there.
+     * A drum track comes with the built-in kit and an empty one-bar pattern
+     * at the playhead, ready for the step sequencer.
+     */
+    fun addTrack(kind: TrackKind = TrackKind.Audio) {
+        val t = when (kind) {
+            TrackKind.Audio -> newTrack()
+            TrackKind.Synth -> {
+                val number = nextTrackNumber++
+                Track(Ids.next(), "Synth $number", number - 1, instrument = Instrument(Ids.next(), InstrumentType.SYNTH))
+            }
+            TrackKind.Drums -> {
+                val number = nextTrackNumber++
+                val (start, end) = Midi.barAround(position, framesPerBeat * 4)
+                Track(
+                    Ids.next(), "Drums $number", number - 1,
+                    items = listOf(Midi.newItem(start, end - start)),
+                    instrument = Instrument(Ids.next(), InstrumentType.DRUMS, pads = List(PAD_COUNT) { kitPad(it) }),
+                )
+            }
+        }
         commit(project.copy(tracks = project.tracks + t))
         armedTrackId = t.id
         selectedTrackId = t.id
+        selectedItems = t.items.map { it.id }.toSet()
+        playTrackId = if (t.instrument != null) t.id else playTrackId
     }
 
     fun deleteTrack(id: Long) = commit(project.copy(tracks = project.tracks.filterNot { it.id == id }))
@@ -518,6 +806,8 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             solo = false,
             items = t.items.map { it.copy(id = Ids.next()) },
             fx = t.fx.map { it.copy(id = Ids.next()) },
+            // Its own instrument, so the two tracks never share voices.
+            instrument = t.instrument?.copy(id = Ids.next()),
         )
         commit(project.copy(tracks = project.tracks.toMutableList().apply { add(index + 1, copy) }))
         selectedTrackId = copy.id
@@ -556,8 +846,14 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         sync(p)
     }
 
-    fun toggleMixer() {
-        showMixer = !showMixer
+    /** Shows [v], or goes back to the timeline when it is already showing. */
+    fun showView(v: MainView) {
+        if (view == v) {
+            view = MainView.Arrange
+            return
+        }
+        if (v == MainView.Play) playTrack?.let { openPlay(it.id) }
+        view = v
     }
 
     // ------------------------------------------------------------ effects
@@ -710,8 +1006,9 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val handleZone = laneH * 0.35f
         val mode = when {
             item.id !in selectedItems -> DragMode.Move
-            y < handleZone && abs(x - (x0 + framesToPx(item.fadeIn))) < edge * 1.4f -> DragMode.FadeIn
-            y < handleZone && abs(x - (x1 - framesToPx(item.fadeOut))) < edge * 1.4f -> DragMode.FadeOut
+            // MIDI items have no fades.
+            !item.isMidi && y < handleZone && abs(x - (x0 + framesToPx(item.fadeIn))) < edge * 1.4f -> DragMode.FadeIn
+            !item.isMidi && y < handleZone && abs(x - (x1 - framesToPx(item.fadeOut))) < edge * 1.4f -> DragMode.FadeOut
             x - x0 < edge && x1 - x0 > edge * 3 -> DragMode.TrimLeft
             x1 - x < edge && x1 - x0 > edge * 3 -> DragMode.TrimRight
             else -> DragMode.Move
@@ -737,7 +1034,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val baseProject = gestureBase ?: return
         dragPx += dxPx
         val df = pxToFrames(dragPx)
-        val srcLen = sources[base.sourceId]?.length ?: base.length
+        val srcLen = if (base.isMidi) Midi.sourceLength(base) else sources[base.sourceId]?.length ?: base.length
         val updated = when (dragMode) {
             DragMode.Move -> base.copy(position = snapped(base.position + df))
             DragMode.TrimLeft -> Edits.trimLeft(base, snapped(base.position + df))
@@ -833,8 +1130,236 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         moves.firstOrNull()?.let { selectedTrackId = tracks[it.first].id }
     }
 
+    // ------------------------------------------------------------ instruments and drum pads
+
+    /** The track the play view shows: the chosen one, else the selected or the first instrument track. */
+    val playTrack: Track?
+        get() = project.tracks.firstOrNull { it.id == playTrackId && it.instrument != null }
+            ?: project.tracks.firstOrNull { it.id == selectedTrackId && it.instrument != null }
+            ?: project.tracks.firstOrNull { it.instrument != null }
+
+    /** Shows the pads or keys of an instrument track and arms it, so recording captures what is played. */
+    fun openPlay(trackId: Long) {
+        if (project.tracks.none { it.id == trackId && it.instrument != null }) return
+        playTrackId = trackId
+        selectedTrackId = trackId
+        if (!recording && !recordingMidi) armedTrackId = trackId
+        view = MainView.Play
+    }
+
+    fun toggleQuantizeRecording() {
+        settings = settings.copy(quantizeRecording = !settings.quantizeRecording)
+        scheduleSave()
+    }
+
+    /** Live synth or kit parameter change; [endGesture] makes it one undo step. */
+    fun setInstrumentParam(trackId: Long, index: Int, value: Float) {
+        if (gestureBase == null) gestureBase = project
+        val p = project.updateTrack(trackId) { t ->
+            val inst = t.instrument ?: return@updateTrack t
+            t.copy(instrument = inst.copy(values = inst.values.toMutableList().also { it[index] = value }))
+        }
+        project = p
+        syncInstruments(p)
+    }
+
+    fun resetInstrument(trackId: Long) = commit(
+        project.updateTrack(trackId) { t -> t.copy(instrument = t.instrument?.let { it.copy(values = it.type.defaults()) }) }
+    )
+
+    /** Changes one pad; [live] changes (sliders) become one undo step at [endGesture]. */
+    fun updatePad(trackId: Long, index: Int, live: Boolean = false, change: (Pad) -> Pad) {
+        val p = project.updateTrack(trackId) { t ->
+            val inst = t.instrument ?: return@updateTrack t
+            t.copy(instrument = inst.copy(pads = inst.pads.mapIndexed { i, pad -> if (i == index) change(pad) else pad }))
+        }
+        if (live) preview(p) else commit(p)
+    }
+
+    /** Engine source of built-in kit sound [index], made and saved with the project on first use. */
+    private fun kitSource(index: Int): Int {
+        val sound = DrumKit.sounds[index]
+        sources.entries.firstOrNull { it.value.fileName == sound.file }?.let { return it.key }
+        val samples = DrumKit.render(index, sampleRate)
+        val id = NativeEngine.createSource(samples)
+        sources = sources + (id to SourceInfo(sound.file, samples.size.toLong(), NativeEngine.sourcePeaks(id, PEAK_BUCKET)))
+        viewModelScope.launch(Dispatchers.IO) { WavFile.writeFloatMono(store.audioFile(sound.file), samples, sampleRate) }
+        return id
+    }
+
+    private fun kitPad(index: Int): Pad {
+        val sound = DrumKit.sounds[index]
+        return Pad(sourceId = kitSource(index), name = sound.name, chokeGroup = sound.chokeGroup)
+    }
+
+    fun setPadKitSound(trackId: Long, index: Int, sound: Int) {
+        val pad = kitPad(sound)
+        updatePad(trackId, index) { pad }
+    }
+
+    fun clearPad(trackId: Long, index: Int) = updatePad(trackId, index) { Pad() }
+
+    /** The selected audio item, which can be loaded into a pad. */
+    val selectedAudioItem: Item?
+        get() = project.tracks.flatMap { it.items }.firstOrNull { it.id in selectedItems && !it.isMidi }
+
+    /** Loads the selected audio item into a pad, like sending an item to REAPER's sampler. */
+    fun setPadFromSelectedItem(trackId: Long, index: Int) {
+        val item = selectedAudioItem ?: return
+        updatePad(trackId, index) {
+            Pad(sourceId = item.sourceId, name = "Clip", gain = item.gain, start = item.offset, end = item.offset + item.length)
+        }
+    }
+
+    /** Records the microphone into a pad until [stopSampling]; the transport stays put. */
+    fun startSampling(trackId: Long, index: Int) {
+        if (recording || recordingMidi || samplingPad != null) return
+        if (auditioning) toggleAudition()
+        if (playing) {
+            playing = false
+            NativeEngine.setPlaying(false)
+        }
+        if (!NativeEngine.startRecording(false)) {
+            message = "Could not open the microphone"
+            return
+        }
+        recordedFrames = 0
+        samplingPad = trackId to index
+    }
+
+    fun stopSampling() {
+        val (trackId, index) = samplingPad ?: return
+        samplingPad = null
+        inputLevel = 0f
+        val id = NativeEngine.stopRecording()
+        if (id < 0) return
+        val samples = NativeEngine.sourceSamples(id)
+        val info = SourceInfo("sample_${UUID.randomUUID()}.wav", samples.size.toLong(), NativeEngine.sourcePeaks(id, PEAK_BUCKET))
+        sources = sources + (id to info)
+        viewModelScope.launch(Dispatchers.IO) { WavFile.writeFloatMono(store.audioFile(info.fileName), samples, sampleRate) }
+        // Skip the silence before and after the sound, as Koala trims a fresh sample.
+        val (start, end) = Edits.soundRegion(samples, sampleRate)
+        updatePad(trackId, index) { Pad(sourceId = id, name = "Sample", start = start, end = end) }
+    }
+
+    // ------------------------------------------------------------ importing audio files
+
+    /** Turns decoded audio into an engine source saved with the project, off the main thread. */
+    private suspend fun importSource(audio: ImportedAudio, prefix: String): Int? = withContext(Dispatchers.Default) {
+        val samples = WavFile.resample(audio.samples, audio.sampleRate, sampleRate)
+        if (samples.isEmpty()) return@withContext null
+        val id = NativeEngine.createSource(samples)
+        val info = SourceInfo("${prefix}_${UUID.randomUUID()}.wav", samples.size.toLong(), NativeEngine.sourcePeaks(id, PEAK_BUCKET))
+        withContext(Dispatchers.IO) { WavFile.writeFloatMono(store.audioFile(info.fileName), samples, sampleRate) }
+        withContext(Dispatchers.Main) { sources = sources + (id to info) }
+        id
+    }
+
+    /** Puts an imported file on a new track at the playhead, like REAPER's Insert > Media file. */
+    fun importAudio(audio: ImportedAudio) {
+        message = "Importing ${audio.name}…"
+        viewModelScope.launch {
+            val id = importSource(audio, "import") ?: return@launch
+            val t = newTrack().copy(name = audio.name.take(24).ifEmpty { "Import" })
+            val item = Item(Ids.next(), id, position, 0, sources[id]?.length ?: 0L)
+            commit(project.copy(tracks = project.tracks + t.copy(items = listOf(item))))
+            selectedTrackId = t.id
+            selectedItems = setOf(item.id)
+            message = "Imported ${t.name}"
+        }
+    }
+
+    /** Loads an imported file into a pad. */
+    fun importToPad(trackId: Long, index: Int, audio: ImportedAudio) {
+        viewModelScope.launch {
+            val id = importSource(audio, "pad") ?: return@launch
+            updatePad(trackId, index) { Pad(sourceId = id, name = audio.name.take(14).ifEmpty { "Sound" }) }
+        }
+    }
+
+    // ------------------------------------------------------------ MIDI items and the piano roll
+
+    val selectedMidiItem: Item?
+        get() = project.tracks.flatMap { it.items }.firstOrNull { it.id in selectedItems && it.isMidi }
+
+    /** Adds an empty pattern at the playhead's bar on the selected instrument track. */
+    fun addPattern() {
+        val track = project.tracks.firstOrNull { it.id == selectedTrackId && it.instrument != null }
+        if (track == null) {
+            message = "Select a synth or drum track first"
+            return
+        }
+        val bar = framesPerBeat * 4
+        val start = Midi.barAround(position, bar).first
+        val bars = if (track.instrument?.type == InstrumentType.DRUMS) 1 else 4
+        val item = Midi.newItem(start, (bar * bars).roundToLong())
+        commit(project.updateTrack(track.id) { it.copy(items = (it.items + item).sortedBy { i -> i.position }) })
+        selectedItems = setOf(item.id)
+    }
+
+    fun openNoteEditor(itemId: Long) {
+        val (track, item) = project.findItem(itemId) ?: return
+        if (!item.isMidi) return
+        selectedItems = setOf(itemId)
+        selectedTrackId = track.id
+        noteEditorItemId = itemId
+    }
+
+    fun closeNoteEditor() {
+        if (auditioning) toggleAudition()
+        endGesture()
+        noteEditorItemId = null
+    }
+
+    /** Replaces a MIDI item's notes; [live] changes (drags) become one undo step at [endGesture]. */
+    fun setNotes(itemId: Long, notes: List<Note>, live: Boolean = false) {
+        val p = project.updateItem(itemId) { it.copy(notes = Midi.sorted(notes)) }
+        if (live) preview(p) else commit(p)
+    }
+
+    fun setPatternBars(itemId: Long, bars: Int) {
+        val length = (framesPerBeat * 4 * bars).roundToLong()
+        commit(project.updateItem(itemId) { Midi.setPatternLength(it, length) })
+    }
+
+    /** Pulls the pattern's notes onto a grid of [division] notes per bar. */
+    fun quantizeNotes(itemId: Long, division: Int) {
+        val grid = framesPerBeat * 4 / division
+        commit(project.updateItem(itemId) { it.copy(notes = Midi.quantize(it.notes ?: emptyList(), grid, it.loopLength)) })
+    }
+
+    /** Loops the pattern open in the piano roll, so it plays while it is edited. */
+    fun toggleAudition() {
+        if (auditioning) {
+            auditioning = false
+            playing = false
+            NativeEngine.setPlaying(false)
+            NativeEngine.setLoop(project.loopStart, project.loopEnd, project.loopOn)
+            return
+        }
+        if (recording || recordingMidi || samplingPad != null) return
+        val item = noteEditorItemId?.let { project.findItem(it)?.second } ?: return
+        auditioning = true
+        sync(project)
+        seekFrames(item.position)
+        playing = true
+        NativeEngine.setPlaying(true)
+    }
+
+    /** Where the playhead is inside the open pattern, or null when it is not playing it. */
+    fun patternPosition(item: Item): Long? {
+        if (!playing || position < item.position || position >= item.end) return null
+        val local = position - item.position + item.offset
+        val loop = Midi.patternLength(item)
+        return if (item.loopLength > 0) Math.floorMod(local, loop) else local
+    }
+
     fun onAppBackground() {
         if (recording) stopRecording()
+        if (recordingMidi) stopMidiRecording()
+        if (samplingPad != null) stopSampling()
+        releaseLiveNotes()
+        if (auditioning) toggleAudition()
         if (playing) {
             playing = false
             NativeEngine.setPlaying(false)
