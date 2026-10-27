@@ -1,9 +1,12 @@
 package com.alonmeller.mobiledaw.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -26,6 +29,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -110,89 +114,106 @@ fun FxDialog(vm: DawViewModel, target: Long) {
     }
 }
 
+/**
+ * One effect, as GarageBand shows a plug-in: a header in the effect's color
+ * with its power switch, then its controls as a row of knobs.
+ */
 @Composable
 private fun EffectCard(vm: DawViewModel, target: Long, effect: Effect, index: Int, count: Int) {
     val color = effectColor(effect.type)
+    val on = !effect.bypass
+    val shape = RoundedCornerShape(12.dp)
     Column(
         Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(DawColors.Background)
+            .clip(shape)
+            .background(Brush.verticalGradient(listOf(Color(0xFF232327), Color(0xFF1A1A1D))))
+            .border(1.dp, DawColors.Separator, shape)
     ) {
         Row(
             Modifier
                 .fillMaxWidth()
-                .background(color.copy(alpha = if (effect.bypass) 0.25f else 0.85f))
-                .padding(horizontal = 12.dp, vertical = 6.dp),
+                .background(
+                    Brush.verticalGradient(
+                        if (on) listOf(DawColors.shade(color, 0.35f), DawColors.shade(color, 0.55f))
+                        else listOf(Color(0xFF3A3A3E), Color(0xFF2E2E32))
+                    )
+                )
+                .padding(horizontal = 8.dp, vertical = 5.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            // The power switch, lit while the effect is heard.
+            IconToggle(Glyph.Power, on, color, size = 28.dp, offColor = DawColors.TextSecondary) { vm.toggleBypass(target, effect.id) }
             Text(
                 "${index + 1}. ${effect.type.title}",
-                color = if (effect.bypass) DawColors.TextSecondary else Color.Black,
+                color = if (on) Color.White else DawColors.TextSecondary,
                 fontWeight = FontWeight.Bold,
                 fontSize = 15.sp,
-                modifier = Modifier.weight(1f),
+                modifier = Modifier.weight(1f).padding(start = 4.dp),
             )
-            PillButton(if (effect.bypass) "Off" else "On", if (effect.bypass) DawColors.PanelRaised else DawColors.MeterGreen) {
-                vm.toggleBypass(target, effect.id)
-            }
             if (index > 0) PillButton("▲", DawColors.PanelRaised) { vm.moveEffect(target, effect.id, -1) }
             if (index < count - 1) PillButton("▼", DawColors.PanelRaised) { vm.moveEffect(target, effect.id, 1) }
             PillButton("Reset", DawColors.PanelRaised) { vm.resetEffect(target, effect.id) }
             PillButton("✕", DawColors.PanelRaised) { vm.removeEffect(target, effect.id) }
         }
-        Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
-            effect.type.params.forEachIndexed { i, spec ->
-                val value = effect.values.getOrElse(i) { spec.default }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(spec.name, color = DawColors.TextSecondary, fontSize = 13.sp, modifier = Modifier.width(96.dp))
+        BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp)) {
+            val params = effect.type.params
+            val cell = (maxWidth / params.size).coerceIn(56.dp, 92.dp)
+            Row(Modifier.horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+                params.forEachIndexed { i, spec ->
+                    val value = effect.values.getOrElse(i) { spec.default }
                     if (spec.toggle) {
-                        Box(Modifier.weight(1f)) {
-                            PillButton(spec.format(value), if (value > 0.5f) color else DawColors.PanelRaised) {
+                        // A switch, labeled like the knobs beside it.
+                        Column(Modifier.width(cell), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(spec.name, color = DawColors.TextSecondary, fontSize = 10.sp, maxLines = 1)
+                            Spacer(Modifier.height(8.dp))
+                            LabelChip(spec.format(value), value > 0.5f, color, Modifier.width(48.dp)) {
                                 vm.setEffectParam(target, effect.id, i, if (value > 0.5f) 0f else 1f)
                                 vm.endGesture()
                             }
+                            Spacer(Modifier.height(19.dp))
                         }
                     } else {
-                        MiniSlider(
-                            position = spec.toPosition(value),
-                            color = color,
-                            onChange = { vm.setEffectParam(target, effect.id, i, spec.fromPosition(it)) },
+                        ParamKnob(
+                            spec, value, if (on) color else DawColors.TextSecondary,
+                            onChange = { vm.setEffectParam(target, effect.id, i, it) },
                             onEnd = vm::endGesture,
                             onReset = {
                                 vm.setEffectParam(target, effect.id, i, spec.default)
                                 vm.endGesture()
                             },
-                            modifier = Modifier.weight(1f).height(34.dp),
+                            modifier = Modifier.width(cell),
+                            knobSize = 42.dp,
                         )
                     }
-                    Text(
-                        spec.format(value),
-                        color = DawColors.TextPrimary,
-                        fontSize = 13.sp,
-                        modifier = Modifier.width(80.dp).padding(start = 8.dp),
-                    )
                 }
             }
         }
     }
 }
 
+/**
+ * A button for dialogs and panels, raised like GarageBand's: gray for
+ * [DawColors.PanelRaised] (or [DawColors.Panel]), else filled with [color].
+ */
 @Composable
 fun PillButton(label: String, color: Color, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(8.dp)
+    val plain = color == DawColors.PanelRaised || color == DawColors.Panel
     Box(
         Modifier
             .height(30.dp)
-            .clip(RoundedCornerShape(15.dp))
-            .background(color)
+            .clip(shape)
+            .background(if (plain) DawColors.button else Brush.verticalGradient(listOf(DawColors.tint(color, 0.15f), DawColors.shade(color, 0.1f))))
+            .border(1.dp, DawColors.Separator, shape)
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             label,
-            color = if (color == DawColors.PanelRaised || color == DawColors.Panel) DawColors.TextPrimary else Color.Black,
+            color = if (plain) DawColors.TextPrimary else textOn(color),
             fontSize = 13.sp,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,

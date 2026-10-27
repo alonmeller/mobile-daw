@@ -606,27 +606,45 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         scheduleSave()
     }
 
-    fun changeTempo(delta: Double) = setTempo(project.tempo + delta)
-
     /**
      * Sets the tempo. MIDI items and the loop keep their place in bars, as
      * with REAPER's beat timebase; audio stays where it was recorded.
      */
     fun setTempo(bpm: Double) {
-        val p = project
         val tempo = bpm.coerceIn(30.0, 300.0)
-        if (tempo == p.tempo || busyRecording()) return
+        if (tempo == project.tempo || busyRecording()) return
+        commit(retimed(project, tempo))
+    }
+
+    /** The song a tempo drag started from, and the last step it showed. */
+    private var tempoDrag: Pair<Project, Project>? = null
+
+    /**
+     * Sets the tempo while a finger drags the tempo display, as in
+     * GarageBand; [endGesture] makes the drag one undo step. Each step is
+     * worked out from the song as the drag found it, so rounding never adds
+     * up, unless something else changed the song in between.
+     */
+    fun dragTempo(bpm: Double) {
+        if (busyRecording()) return
+        val tempo = bpm.coerceIn(30.0, 300.0)
+        if (tempo == project.tempo) return
+        val base = tempoDrag?.takeIf { it.second === project }?.first ?: project
+        val next = if (tempo == base.tempo) base else retimed(base, tempo)
+        preview(next)
+        tempoDrag = base to next
+    }
+
+    private fun retimed(p: Project, tempo: Double): Project {
         val ratio = p.tempo / tempo
-        commit(
-            p.copy(
-                tempo = tempo,
-                loopStart = (p.loopStart * ratio).roundToLong(),
-                loopEnd = (p.loopEnd * ratio).roundToLong(),
-                tracks = p.tracks.map { t ->
-                    if (t.items.none { it.isMidi }) t
-                    else t.copy(items = t.items.map { if (it.isMidi) Midi.scaleTime(it, ratio) else it })
-                },
-            )
+        return p.copy(
+            tempo = tempo,
+            loopStart = (p.loopStart * ratio).roundToLong(),
+            loopEnd = (p.loopEnd * ratio).roundToLong(),
+            tracks = p.tracks.map { t ->
+                if (t.items.none { it.isMidi }) t
+                else t.copy(items = t.items.map { if (it.isMidi) Midi.scaleTime(it, ratio) else it })
+            },
         )
     }
 
@@ -673,6 +691,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun endGesture() {
+        tempoDrag = null
         val base = gestureBase ?: return
         gestureBase = null
         if (base != project) {
@@ -1071,9 +1090,10 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------ tracks
 
+    /** A new audio track: blue, as GarageBand colors recordings. */
     private fun newTrack(): Track {
         val number = nextTrackNumber++
-        return Track(Ids.next(), "Audio $number", number - 1)
+        return Track(Ids.next(), "Audio $number", DawColors.AUDIO_COLOR)
     }
 
     /**
@@ -1093,13 +1113,13 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             TrackKind.Audio -> newTrack()
             TrackKind.Synth -> {
                 val number = nextTrackNumber++
-                Track(Ids.next(), "Synth $number", number - 1, instrument = Instrument(Ids.next(), InstrumentType.SYNTH))
+                Track(Ids.next(), "Synth $number", DawColors.INSTRUMENT_COLOR, instrument = Instrument(Ids.next(), InstrumentType.SYNTH))
             }
             TrackKind.Drums -> {
                 val number = nextTrackNumber++
                 val (start, end) = Midi.barAround(position, framesPerBeat * 4)
                 Track(
-                    Ids.next(), "Drums $number", number - 1,
+                    Ids.next(), "Drums $number", DawColors.DRUMS_COLOR,
                     items = listOf(Midi.newItem(start, end - start)),
                     instrument = Instrument(Ids.next(), InstrumentType.DRUMS, pads = List(PAD_COUNT) { kitPad(it) }),
                 )
@@ -1119,7 +1139,8 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
      * (no dry sound), so tracks can send it as much or as little as they like.
      */
     private fun newBus(kind: TrackKind): Track {
-        val number = nextTrackNumber++
+        // Counted like any track, so the next "Audio N" still numbers the tracks.
+        nextTrackNumber++
         val reverb = kind == TrackKind.ReverbBus
         val type = if (reverb) EffectType.REVERB else EffectType.DELAY
         val values = type.defaults().toMutableList()
@@ -1133,7 +1154,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val name = if (reverb) "Reverb bus" else "Delay bus"
         val taken = project.tracks.map { it.name }.toSet()
         val unique = if (name !in taken) name else (2..99).map { "$name $it" }.firstOrNull { it !in taken } ?: name
-        return Track(Ids.next(), unique, number - 1, fx = listOf(Effect(Ids.next(), type, values)))
+        return Track(Ids.next(), unique, DawColors.BUS_COLOR, fx = listOf(Effect(Ids.next(), type, values)))
     }
 
     /** Deletes a track; the tracks in its folder stay, one level up. */
@@ -1179,7 +1200,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     fun newFolder(id: Long) {
         if (project.tracks.none { it.id == id }) return
         val number = nextTrackNumber++
-        val folder = Track(Ids.next(), "Folder $number", number - 1)
+        val folder = Track(Ids.next(), "Folder $number", DawColors.FOLDER_COLOR)
         Routing.wrapInFolder(project, id, folder)?.let {
             commit(it)
             selectedTrackId = folder.id
@@ -1746,7 +1767,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         message = "Importing ${audio.name}…"
         viewModelScope.launch {
             val id = importSource(audio, "import") ?: return@launch
-            val t = newTrack().copy(name = audio.name.take(24).ifEmpty { "Import" })
+            val t = newTrack().copy(name = audio.name.take(24).ifEmpty { "Import" }, colorIndex = DawColors.IMPORT_COLOR)
             val item = Item(Ids.next(), id, position, 0, sources[id]?.length ?: 0L)
             commit(project.copy(tracks = project.tracks + t.copy(items = listOf(item))))
             selectedTrackId = t.id
