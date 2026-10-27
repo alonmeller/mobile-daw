@@ -79,22 +79,39 @@ JNIEXPORT jfloatArray JNICALL JNI_FN(sourceSamples)(JNIEnv *env, jobject, jint i
     return toJava(env, engine().sourceSamples(id));
 }
 
-// Tracks arrive flattened: trackParams holds [gain, pan, mute, solo] per track,
-// itemCounts the number of items per track, itemParams
-// [sourceId, position, offset, length, fadeIn, fadeOut] per item and
-// itemGains one gain per item.
+// The arrangement arrives flattened into arrays:
+//   trackParams  [gain, pan, mute, solo] per track
+//   itemCounts   items per track; itemParams [sourceId, position, offset,
+//                length, fadeIn, fadeOut] and itemGains one entry per item
+//   fxCounts     effects per track, then the master's; fxIds in chain order
+//   envCounts    [volume points, pan points] per track; envFrames and
+//                envValues hold the points, track by track, volume first.
+//                Volume values are fader positions (0..1), pan is -1..1.
 JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray trackParams,
                                               jintArray itemCounts, jlongArray itemParams,
-                                              jfloatArray itemGains) {
+                                              jfloatArray itemGains, jintArray fxCounts, jlongArray fxIds,
+                                              jintArray envCounts, jlongArray envFrames,
+                                              jfloatArray envValues, jfloat masterGain) {
     const jsize numTracks = env->GetArrayLength(itemCounts);
     jfloat *tp = env->GetFloatArrayElements(trackParams, nullptr);
     jint *counts = env->GetIntArrayElements(itemCounts, nullptr);
     jlong *ip = env->GetLongArrayElements(itemParams, nullptr);
     jfloat *ig = env->GetFloatArrayElements(itemGains, nullptr);
+    jint *fc = env->GetIntArrayElements(fxCounts, nullptr);
+    jlong *fi = env->GetLongArrayElements(fxIds, nullptr);
+    jint *ec = env->GetIntArrayElements(envCounts, nullptr);
+    jlong *ef = env->GetLongArrayElements(envFrames, nullptr);
+    jfloat *ev = env->GetFloatArrayElements(envValues, nullptr);
 
     auto arrangement = std::make_unique<Arrangement>();
     arrangement->tracks.resize(static_cast<size_t>(numTracks));
     size_t item = 0;
+    size_t fx = 0;
+    size_t point = 0;
+    auto readEnvelope = [&](std::vector<EnvPoint> &out, jint count) {
+        out.reserve(static_cast<size_t>(count));
+        for (jint k = 0; k < count; ++k, ++point) out.push_back({ef[point], ev[point]});
+    };
     for (jsize t = 0; t < numTracks; ++t) {
         TrackMix &mix = arrangement->tracks[static_cast<size_t>(t)];
         mix.gain = tp[t * 4];
@@ -114,13 +131,43 @@ JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray 
             it.gain = ig[item];
             mix.items.push_back(std::move(it));
         }
+        for (jint i = 0; i < fc[t]; ++i, ++fx) {
+            if (auto e = engine().effect(fi[fx])) mix.fx.push_back(std::move(e));
+        }
+        readEnvelope(mix.volumeEnv, ec[t * 2]);
+        readEnvelope(mix.panEnv, ec[t * 2 + 1]);
     }
+    for (jint i = 0; i < fc[numTracks]; ++i, ++fx) {
+        if (auto e = engine().effect(fi[fx])) arrangement->masterFx.push_back(std::move(e));
+    }
+    arrangement->masterGain = masterGain;
 
     env->ReleaseFloatArrayElements(trackParams, tp, JNI_ABORT);
     env->ReleaseIntArrayElements(itemCounts, counts, JNI_ABORT);
     env->ReleaseLongArrayElements(itemParams, ip, JNI_ABORT);
     env->ReleaseFloatArrayElements(itemGains, ig, JNI_ABORT);
+    env->ReleaseIntArrayElements(fxCounts, fc, JNI_ABORT);
+    env->ReleaseLongArrayElements(fxIds, fi, JNI_ABORT);
+    env->ReleaseIntArrayElements(envCounts, ec, JNI_ABORT);
+    env->ReleaseLongArrayElements(envFrames, ef, JNI_ABORT);
+    env->ReleaseFloatArrayElements(envValues, ev, JNI_ABORT);
     engine().setArrangement(std::move(arrangement));
+}
+
+JNIEXPORT jboolean JNICALL JNI_FN(createEffect)(JNIEnv *env, jobject, jlong id, jint kind, jfloatArray params) {
+    const jsize n = env->GetArrayLength(params);
+    jfloat *p = env->GetFloatArrayElements(params, nullptr);
+    const bool ok = engine().createEffect(id, kind, p, n);
+    env->ReleaseFloatArrayElements(params, p, JNI_ABORT);
+    return ok;
+}
+
+JNIEXPORT void JNICALL JNI_FN(setEffectParam)(JNIEnv *, jobject, jlong id, jint index, jfloat value) {
+    engine().setEffectParam(id, index, value);
+}
+
+JNIEXPORT void JNICALL JNI_FN(setEffectBypass)(JNIEnv *, jobject, jlong id, jboolean bypass) {
+    engine().setEffectBypass(id, bypass);
 }
 
 JNIEXPORT jfloat JNICALL JNI_FN(trackPeak)(JNIEnv *, jobject, jint index) { return engine().trackPeak(index); }

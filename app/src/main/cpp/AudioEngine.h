@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "Effects.h"
 #include "RingBuffer.h"
 
 using Samples = std::vector<float>;
@@ -27,18 +28,36 @@ struct Item {
     float gain = 1.0f;
 };
 
+struct EnvPoint {
+    int64_t frame = 0;
+    float value = 0.0f;
+};
+
+// Processing block size: items are mixed, FX run and envelopes are ramped
+// in blocks of at most this many frames.
+constexpr int kBlock = 256;
+
 struct TrackMix {
     float gain = 1.0f;
     float pan = 0.0f;
     bool mute = false;
     bool solo = false;
     std::vector<Item> items;
+    std::vector<std::shared_ptr<Effect>> fx;  // pre-fader insert chain, as in REAPER
+    std::vector<EnvPoint> volumeEnv;          // multiplies the fader gain
+    std::vector<EnvPoint> panEnv;             // replaces the pan knob when present
+    // Scratch buffers, allocated with the snapshot on the UI thread.
+    std::vector<float> left = std::vector<float>(kBlock);
+    std::vector<float> right = std::vector<float>(kBlock);
 };
 
 // Snapshot of everything the audio thread needs to render. The UI builds a
-// new one on every edit and swaps it in.
+// new one on every edit and swaps it in. Effects are shared with older
+// snapshots, so their state (reverb tails, delay lines) survives edits.
 struct Arrangement {
     std::vector<TrackMix> tracks;
+    std::vector<std::shared_ptr<Effect>> masterFx;
+    float masterGain = 1.0f;
     bool anySolo = false;
 };
 
@@ -70,7 +89,8 @@ public:
     int64_t recordedFrames() const { return recordedFrames_.load(); }
     int64_t recordStartFrame() const { return recordStartFrame_; }
     int64_t lastTakeStart() const { return lastTakeStart_; }
-    float inputLevel() const { return inputPeak_.load(); }
+    // Meters report the highest peak since they were last read.
+    float inputLevel() { return inputPeak_.exchange(0.0f); }
 
     // Sources: immutable audio buffers that items point into
     int createSource(const float *data, int64_t numFrames);
@@ -80,12 +100,18 @@ public:
     std::shared_ptr<const Samples> source(int id);
 
     void setArrangement(std::unique_ptr<Arrangement> arrangement);
-    float trackPeak(int index) const;
+    float trackPeak(int index);
+
+    // Effects live in a registry keyed by the UI's effect id.
+    bool createEffect(int64_t id, int kind, const float *params, int numParams);
+    void setEffectParam(int64_t id, int index, float value);
+    void setEffectBypass(int64_t id, bool bypass);
+    std::shared_ptr<Effect> effect(int64_t id);
 
     // Metronome
     void setMetronome(bool enabled) { metronomeOn_.store(enabled); }
     void setTempo(double bpm) { tempo_.store(bpm); }
-    float masterPeak() const { return masterPeak_.load(); }
+    float masterPeak() { return masterPeak_.exchange(0.0f); }
 
     // Oboe callbacks
     oboe::DataCallbackResult onAudioReady(oboe::AudioStream *stream, void *audioData,
@@ -107,7 +133,8 @@ private:
     void closeInput();
     void drainLoop();
     void drainOnce();
-    void renderSegment(float *out, int32_t numFrames, int64_t pos);
+    void renderSegment(float *out, int32_t numFrames, int64_t pos, bool playing);
+    void renderBlock(float *out, int numFrames, int64_t pos, bool playing);
     void renderMetronome(float *out, int32_t numFrames, int64_t pos);
 
     std::shared_ptr<oboe::AudioStream> output_;
@@ -119,11 +146,18 @@ private:
     std::unordered_map<int, std::shared_ptr<const Samples>> sources_;
     int nextSourceId_ = 1;
 
+    std::mutex effectsMutex_;
+    std::unordered_map<int64_t, std::shared_ptr<Effect>> effects_;
+
     std::mutex arrangementMutex_;
     std::unique_ptr<Arrangement> arrangement_ = std::make_unique<Arrangement>();
     std::array<std::atomic<float>, kMaxMeters> trackPeaks_{};
+    std::array<float, kBlock> mono_{};
+    std::array<float, kBlock> masterL_{};
+    std::array<float, kBlock> masterR_{};
 
     std::atomic<bool> playing_{false};
+    int64_t tailFrames_ = 0;  // audio thread only
     std::atomic<int64_t> position_{0};
     std::atomic<float> masterPeak_{0.0f};
     std::atomic<int64_t> loopStart_{0};

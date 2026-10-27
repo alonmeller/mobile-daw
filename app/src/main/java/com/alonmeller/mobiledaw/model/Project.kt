@@ -42,7 +42,17 @@ data class Track(
     val mute: Boolean = false,
     val solo: Boolean = false,
     val items: List<Item> = emptyList(),
-)
+    val fx: List<Effect> = emptyList(),
+    val volumeEnv: List<EnvPoint> = emptyList(),
+    val panEnv: List<EnvPoint> = emptyList(),
+) {
+    fun envelope(kind: EnvKind) = if (kind == EnvKind.Volume) volumeEnv else panEnv
+    fun withEnvelope(kind: EnvKind, points: List<EnvPoint>) =
+        if (kind == EnvKind.Volume) copy(volumeEnv = points) else copy(panEnv = points)
+}
+
+/** Effect chains are addressed by track id, or by [MASTER] for the master bus. */
+const val MASTER = -2L
 
 data class Marker(val id: Long, val position: Long, val name: String)
 
@@ -54,7 +64,17 @@ data class Project(
     val loopStart: Long = 0,
     val loopEnd: Long = 0,
     val loopOn: Boolean = false,
+    val masterFx: List<Effect> = emptyList(),
+    val masterGain: Float = 1f,
 ) {
+    fun fxChain(target: Long): List<Effect> =
+        if (target == MASTER) masterFx else tracks.firstOrNull { it.id == target }?.fx ?: emptyList()
+
+    fun withFxChain(target: Long, chain: List<Effect>): Project =
+        if (target == MASTER) copy(masterFx = chain) else updateTrack(target) { it.copy(fx = chain) }
+
+    val allEffects: List<Effect> get() = masterFx + tracks.flatMap { it.fx }
+
     fun findItem(itemId: Long): Pair<Track, Item>? {
         for (t in tracks) for (i in t.items) if (i.id == itemId) return t to i
         return null

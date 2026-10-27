@@ -5,6 +5,7 @@ find_package(oboe REQUIRED CONFIG)
 
 add_library(mobiledaw SHARED
         AudioEngine.cpp
+        Effects.cpp
         jni_bridge.cpp)
 
 target_compile_options(mobiledaw PRIVATE -Wall -Wextra -O3)

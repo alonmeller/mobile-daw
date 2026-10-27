@@ -32,13 +32,24 @@ object NativeEngine {
     external fun sourcePeaks(id: Int, framesPerBucket: Int): FloatArray
     external fun sourceSamples(id: Int): FloatArray
 
+    /** See jni_bridge.cpp for the layout of these flattened arrays. */
     external fun setArrangement(
         trackParams: FloatArray,
         itemCounts: IntArray,
         itemParams: LongArray,
         itemGains: FloatArray,
+        fxCounts: IntArray,
+        fxIds: LongArray,
+        envCounts: IntArray,
+        envFrames: LongArray,
+        envValues: FloatArray,
+        masterGain: Float,
     )
     external fun trackPeak(index: Int): Float
+
+    external fun createEffect(id: Long, type: Int, params: FloatArray): Boolean
+    external fun setEffectParam(id: Long, index: Int, value: Float)
+    external fun setEffectBypass(id: Long, bypass: Boolean)
 
     external fun setMetronome(enabled: Boolean)
     external fun setTempo(bpm: Double)

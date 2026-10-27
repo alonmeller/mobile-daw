@@ -194,7 +194,7 @@ oboe::DataCallbackResult AudioEngine::InputCallback::onAudioReady(oboe::AudioStr
     const auto *in = static_cast<const float *>(audioData);
     float peak = 0.0f;
     for (int32_t i = 0; i < numFrames; ++i) peak = std::max(peak, std::fabs(in[i]));
-    engine_.inputPeak_.store(peak);
+    engine_.inputPeak_.store(std::max(engine_.inputPeak_.load(), peak));
     if (engine_.recording_.load()) engine_.ring_.write(in, static_cast<size_t>(numFrames));
     return oboe::DataCallbackResult::Continue;
 }
@@ -247,9 +247,9 @@ void AudioEngine::setArrangement(std::unique_ptr<Arrangement> arrangement) {
     arrangement_.swap(arrangement);
 }
 
-float AudioEngine::trackPeak(int index) const {
+float AudioEngine::trackPeak(int index) {
     if (index < 0 || index >= kMaxMeters) return 0.0f;
-    return trackPeaks_[static_cast<size_t>(index)].load();
+    return trackPeaks_[static_cast<size_t>(index)].exchange(0.0f);
 }
 
 void AudioEngine::renderMetronome(float *out, int32_t numFrames, int64_t pos) {
@@ -270,23 +270,94 @@ void AudioEngine::renderMetronome(float *out, int32_t numFrames, int64_t pos) {
 
 namespace {
 inline float smooth(float x) { return x * x * (3.0f - 2.0f * x); }
+
+// Piecewise-linear envelope value at `frame`; `fallback` when there are no points.
+float envelopeAt(const std::vector<EnvPoint> &env, int64_t frame, float fallback) {
+    if (env.empty()) return fallback;
+    if (frame <= env.front().frame) return env.front().value;
+    if (frame >= env.back().frame) return env.back().value;
+    auto it = std::upper_bound(env.begin(), env.end(), frame,
+                               [](int64_t f, const EnvPoint &p) { return f < p.frame; });
+    const EnvPoint &b = *it;
+    const EnvPoint &a = *(it - 1);
+    const float t = static_cast<float>(frame - a.frame) / static_cast<float>(b.frame - a.frame);
+    return a.value + (b.value - a.value) * t;
+}
+
+// Fader scale, the same as Scales on the Kotlin side: positions 0..1 span
+// -60..+6 dB, and the bottom is silence.
+inline float faderToGain(float position) {
+    if (position <= 0.005f) return 0.0f;
+    const float db = -60.0f + std::clamp(position, 0.0f, 1.0f) * 66.0f;
+    return std::pow(10.0f, db / 20.0f);
+}
+
+// Volume envelopes hold fader positions, so a straight line between two
+// points sounds like a straight move of the fader.
+inline float volumeAt(const std::vector<EnvPoint> &env, int64_t frame) {
+    return env.empty() ? 1.0f : faderToGain(envelopeAt(env, frame, 0.0f));
+}
+
+// Equal-power pan gains, unity at center.
+inline void panGains(float pan, float &left, float &right) {
+    const float angle = (std::clamp(pan, -1.0f, 1.0f) + 1.0f) * kPi * 0.25f;
+    left = std::cos(angle) * 1.41421356f;
+    right = std::sin(angle) * 1.41421356f;
+}
 }  // namespace
 
-void AudioEngine::renderSegment(float *out, int32_t numFrames, int64_t pos) {
-    const Arrangement &arr = *arrangement_;
-    const int64_t segEnd = pos + numFrames;
+bool AudioEngine::createEffect(int64_t id, int kind, const float *params, int numParams) {
+    std::lock_guard<std::mutex> lock(effectsMutex_);
+    if (effects_.count(id)) return true;
+    auto fx = Effect::create(static_cast<EffectKind>(kind), sampleRate_);
+    if (!fx) return false;
+    // Parameters are set before the effect can reach the audio thread.
+    for (int i = 0; i < numParams; ++i) fx->setParam(i, params[i]);
+    effects_[id] = std::move(fx);
+    return true;
+}
+
+void AudioEngine::setEffectParam(int64_t id, int index, float value) {
+    if (auto fx = effect(id)) fx->setParam(index, value);
+}
+
+void AudioEngine::setEffectBypass(int64_t id, bool bypass) {
+    if (auto fx = effect(id)) fx->setBypass(bypass);
+}
+
+std::shared_ptr<Effect> AudioEngine::effect(int64_t id) {
+    std::lock_guard<std::mutex> lock(effectsMutex_);
+    auto it = effects_.find(id);
+    return it == effects_.end() ? nullptr : it->second;
+}
+
+void AudioEngine::renderSegment(float *out, int32_t numFrames, int64_t pos, bool playing) {
+    for (int32_t done = 0; done < numFrames; done += kBlock) {
+        const int n = static_cast<int>(std::min<int32_t>(kBlock, numFrames - done));
+        renderBlock(out + 2 * done, n, playing ? pos + done : pos, playing);
+    }
+    if (playing && metronomeOn_.load()) renderMetronome(out, numFrames, pos);
+}
+
+void AudioEngine::renderBlock(float *out, int n, int64_t pos, bool playing) {
+    Arrangement &arr = *arrangement_;
+    const int64_t blockEnd = pos + n;
+    std::fill(masterL_.begin(), masterL_.begin() + n, 0.0f);
+    std::fill(masterR_.begin(), masterR_.begin() + n, 0.0f);
+
     for (size_t ti = 0; ti < arr.tracks.size(); ++ti) {
-        const TrackMix &t = arr.tracks[ti];
+        TrackMix &t = arr.tracks[ti];
         if (t.mute || (arr.anySolo && !t.solo)) continue;
-        const float angle = (t.pan + 1.0f) * kPi * 0.25f;
-        const float left = t.gain * std::cos(angle) * 1.41421356f;
-        const float right = t.gain * std::sin(angle) * 1.41421356f;
-        float peak = 0.0f;
+
+        // 1. Mix the track's items into a mono buffer.
+        std::fill(mono_.begin(), mono_.begin() + n, 0.0f);
+        bool any = false;
         for (const Item &item : t.items) {
-            if (!item.source) continue;
+            if (!item.source || !playing) continue;
             const int64_t from = std::max(pos, item.position);
-            const int64_t to = std::min(segEnd, item.position + item.length);
+            const int64_t to = std::min(blockEnd, item.position + item.length);
             if (from >= to) continue;
+            any = true;
             const auto &src = *item.source;
             const auto srcLen = static_cast<int64_t>(src.size());
             for (int64_t f = from; f < to; ++f) {
@@ -297,16 +368,50 @@ void AudioEngine::renderSegment(float *out, int32_t numFrames, int64_t pos) {
                 if (local < item.fadeIn) g *= smooth(static_cast<float>(local) / static_cast<float>(item.fadeIn));
                 const int64_t remain = item.length - local;
                 if (remain < item.fadeOut) g *= smooth(static_cast<float>(remain) / static_cast<float>(item.fadeOut));
-                const float s = src[static_cast<size_t>(idx)] * g;
-                peak = std::max(peak, std::fabs(s * t.gain));
-                const auto i = static_cast<size_t>(f - pos);
-                out[2 * i] += s * left;
-                out[2 * i + 1] += s * right;
+                mono_[static_cast<size_t>(f - pos)] += src[static_cast<size_t>(idx)] * g;
             }
+        }
+        // A track with no audio and no effects contributes nothing; effects
+        // keep running on silence so reverb and delay tails ring out.
+        if (!any && t.fx.empty()) continue;
+
+        // 2. Insert effects (pre-fader).
+        float *l = t.left.data();
+        float *r = t.right.data();
+        std::copy(mono_.begin(), mono_.begin() + n, l);
+        std::copy(mono_.begin(), mono_.begin() + n, r);
+        for (auto &fx : t.fx) {
+            if (fx && !fx->bypassed()) fx->process(l, r, n);
+        }
+
+        // 3. Fader and pan, ramped across the block when automated.
+        const float g0 = t.gain * volumeAt(t.volumeEnv, pos);
+        const float g1 = t.gain * volumeAt(t.volumeEnv, blockEnd);
+        float pl0, pr0, pl1, pr1;
+        panGains(envelopeAt(t.panEnv, pos, t.pan), pl0, pr0);
+        panGains(envelopeAt(t.panEnv, blockEnd, t.pan), pl1, pr1);
+        const float inv = 1.0f / static_cast<float>(n);
+        float peak = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            const float k = static_cast<float>(i) * inv;
+            const float g = g0 + (g1 - g0) * k;
+            const float sl = l[i] * g * (pl0 + (pl1 - pl0) * k);
+            const float sr = r[i] * g * (pr0 + (pr1 - pr0) * k);
+            masterL_[static_cast<size_t>(i)] += sl;
+            masterR_[static_cast<size_t>(i)] += sr;
+            peak = std::max(peak, std::max(std::fabs(sl), std::fabs(sr)));
         }
         if (ti < kMaxMeters) trackPeaks_[ti].store(std::max(trackPeaks_[ti].load(), peak));
     }
-    if (metronomeOn_.load()) renderMetronome(out, numFrames, pos);
+
+    // 4. Master bus.
+    for (auto &fx : arr.masterFx) {
+        if (fx && !fx->bypassed()) fx->process(masterL_.data(), masterR_.data(), n);
+    }
+    for (int i = 0; i < n; ++i) {
+        out[2 * i] += masterL_[static_cast<size_t>(i)] * arr.masterGain;
+        out[2 * i + 1] += masterR_[static_cast<size_t>(i)] * arr.masterGain;
+    }
 }
 
 oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *audioData, int32_t numFrames) {
@@ -314,7 +419,7 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
     std::fill(out, out + numFrames * 2, 0.0f);
 
     if (playing_.load()) {
-        for (auto &p : trackPeaks_) p.store(0.0f);
+        tailFrames_ = static_cast<int64_t>(sampleRate_) * 4;
         int64_t pos = position_.load();
         // Never block the audio thread: if the UI is swapping the arrangement
         // right now, skip this buffer's mix (a single ~2 ms gap at worst).
@@ -330,7 +435,7 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
             const bool wraps = loop && pos < loopEnd && pos + count >= loopEnd;
             if (wraps) count = static_cast<int32_t>(loopEnd - pos);
             if (lock.owns_lock()) {
-                renderSegment(out + 2 * done, count, pos);
+                renderSegment(out + 2 * done, count, pos, true);
             } else if (metronomeOn_.load()) {
                 renderMetronome(out + 2 * done, count, pos);
             }
@@ -339,6 +444,12 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
             if (wraps) pos = loopStart;
         }
         position_.store(pos);
+    } else if (tailFrames_ > 0) {
+        // Like REAPER's "run FX when stopped": let reverb and delay tails ring
+        // out for a few seconds after stopping, then go quiet to save battery.
+        std::unique_lock<std::mutex> lock(arrangementMutex_, std::try_to_lock);
+        if (lock.owns_lock()) renderSegment(out, numFrames, position_.load(), false);
+        tailFrames_ -= numFrames;
     }
 
     float master = 0.0f;
@@ -346,7 +457,7 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
         out[i] = std::clamp(out[i], -1.0f, 1.0f);
         master = std::max(master, std::fabs(out[i]));
     }
-    masterPeak_.store(master);
+    masterPeak_.store(std::max(masterPeak_.load(), master));
     return oboe::DataCallbackResult::Continue;
 }
 
