@@ -93,4 +93,16 @@ class EditsTest {
         assertEquals(2, h.redo(1))
         assertTrue(h.canUndo)
     }
+
+    @Test
+    fun soundRegionSkipsSilence() {
+        val rate = 1000
+        val samples = FloatArray(2000)
+        for (i in 500 until 700) samples[i] = 0.5f
+        assertEquals(495L to 800L, Edits.soundRegion(samples, rate))
+        // Sound right up to the end, and pure silence.
+        for (i in 1950 until 2000) samples[i] = 0.5f
+        assertEquals(495L to 0L, Edits.soundRegion(samples, rate))
+        assertEquals(0L to 0L, Edits.soundRegion(FloatArray(100), rate))
+    }
 }

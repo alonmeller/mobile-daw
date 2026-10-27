@@ -5,7 +5,11 @@ import kotlin.math.ln
 import kotlin.math.log10
 import kotlin.math.pow
 
-/** One effect parameter. [log] sliders move exponentially, [toggle] ones are on/off. */
+/**
+ * One effect or instrument parameter. [log] sliders move exponentially,
+ * [toggle] ones are on/off, and [choices] ones pick one of a few named values
+ * (stored as 0, 1, 2, ...).
+ */
 data class ParamSpec(
     val name: String,
     val min: Float,
@@ -14,6 +18,7 @@ data class ParamSpec(
     val unit: String = "",
     val log: Boolean = false,
     val toggle: Boolean = false,
+    val choices: List<String>? = null,
 ) {
     /** Slider position 0..1 for [value]. */
     fun toPosition(value: Float): Float {
@@ -23,10 +28,12 @@ data class ParamSpec(
 
     fun fromPosition(position: Float): Float {
         val p = position.coerceIn(0f, 1f)
-        return if (log && min > 0f) min * exp(p * ln(max / min)) else min + p * (max - min)
+        val v = if (log && min > 0f) min * exp(p * ln(max / min)) else min + p * (max - min)
+        return if (choices != null) kotlin.math.round(v) else v
     }
 
     fun format(value: Float): String = when {
+        choices != null -> choices.getOrElse(value.toInt()) { "" }
         toggle -> if (value > 0.5f) "On" else "Off"
         unit == "%" -> "${(value * 100).toInt()}%"
         unit == "Hz" && value >= 1000f -> "%.1f kHz".format(value / 1000f)
@@ -35,6 +42,8 @@ data class ParamSpec(
         unit == "ms" && value < 10f -> "%.1f ms".format(value)
         unit == "ms" -> "${value.toInt()} ms"
         unit == "dB" -> "%+.1f dB".format(value)
+        unit == "ct" -> "${value.toInt()} ct"
+        unit == "st" -> "%+d st".format(kotlin.math.round(value).toInt())
         else -> "%.2f".format(value)
     }
 }

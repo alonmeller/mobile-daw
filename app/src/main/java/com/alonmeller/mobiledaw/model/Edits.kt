@@ -106,6 +106,20 @@ object Edits {
     /** Copy of [item] placed right after it, like REAPER's duplicate. */
     fun duplicate(item: Item): Item = item.copy(id = Ids.next(), position = item.end)
 
+    /**
+     * Start and end frames of the sound in a fresh microphone sample: the
+     * silence before and after it is skipped, keeping 5 ms before the first
+     * loud sample and 100 ms after the last. An end of 0 means "to the end".
+     */
+    fun soundRegion(samples: FloatArray, sampleRate: Int, threshold: Float = 0.02f): Pair<Long, Long> {
+        val first = samples.indexOfFirst { kotlin.math.abs(it) > threshold }
+        if (first < 0) return 0L to 0L
+        val last = samples.indexOfLast { kotlin.math.abs(it) > threshold }
+        val start = (first - sampleRate / 200).coerceAtLeast(0)
+        val end = last + 1 + sampleRate / 10
+        return start.toLong() to (if (end >= samples.size) 0L else end.toLong())
+    }
+
     /** Gain that brings [peak] up (or down) to full scale, capped at +20 dB. */
     fun normalizeGain(peak: Float): Float = if (peak <= 1e-4f) 1f else (1f / peak).coerceAtMost(10f)
 }

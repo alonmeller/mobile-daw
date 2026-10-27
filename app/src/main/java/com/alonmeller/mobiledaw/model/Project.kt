@@ -17,6 +17,11 @@ object Ids {
 /**
  * A media item: the window [offset, offset + length) of an audio source,
  * placed at [position] on the timeline. All times are in sample frames.
+ *
+ * A MIDI item has [notes] instead of an audio source (its [sourceId] is -1).
+ * Its notes are timed from the start of its source, like audio, and when
+ * [loopLength] is above 0 that source repeats every [loopLength] frames, so
+ * stretching the item repeats the pattern, as REAPER's "loop source" does.
  */
 data class Item(
     val id: Long,
@@ -28,8 +33,11 @@ data class Item(
     val fadeOut: Long = 0,
     val gain: Float = 1f,
     val mute: Boolean = false,
+    val notes: List<Note>? = null,
+    val loopLength: Long = 0,
 ) {
     val end: Long get() = position + length
+    val isMidi: Boolean get() = notes != null
     fun contains(frame: Long) = frame > position && frame < end
 }
 
@@ -45,6 +53,8 @@ data class Track(
     val fx: List<Effect> = emptyList(),
     val volumeEnv: List<EnvPoint> = emptyList(),
     val panEnv: List<EnvPoint> = emptyList(),
+    /** Set on instrument tracks, which play their MIDI items through it. */
+    val instrument: Instrument? = null,
 ) {
     fun envelope(kind: EnvKind) = if (kind == EnvKind.Volume) volumeEnv else panEnv
     fun withEnvelope(kind: EnvKind, points: List<EnvPoint>) =
@@ -74,6 +84,8 @@ data class Project(
         if (target == MASTER) copy(masterFx = chain) else updateTrack(target) { it.copy(fx = chain) }
 
     val allEffects: List<Effect> get() = masterFx + tracks.flatMap { it.fx }
+
+    val instruments: List<Instrument> get() = tracks.mapNotNull { it.instrument }
 
     fun findItem(itemId: Long): Pair<Track, Item>? {
         for (t in tracks) for (i in t.items) if (i.id == itemId) return t to i

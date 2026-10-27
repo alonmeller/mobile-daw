@@ -1,5 +1,6 @@
 #include <jni.h>
 
+#include <algorithm>
 #include <memory>
 
 #include "AudioEngine.h"
@@ -45,7 +46,11 @@ JNIEXPORT void JNICALL JNI_FN(setLoop)(JNIEnv *, jobject, jlong start, jlong end
     engine().setLoop(start, end, enabled);
 }
 
-JNIEXPORT jboolean JNICALL JNI_FN(startRecording)(JNIEnv *, jobject) { return engine().startRecording(); }
+JNIEXPORT jboolean JNICALL JNI_FN(startRecording)(JNIEnv *, jobject, jboolean withTransport) {
+    return engine().startRecording(withTransport);
+}
+
+JNIEXPORT jlong JNICALL JNI_FN(outputLatency)(JNIEnv *, jobject) { return engine().outputLatencyFrames(); }
 
 JNIEXPORT jint JNICALL JNI_FN(stopRecording)(JNIEnv *, jobject) { return engine().stopRecording(); }
 
@@ -87,11 +92,15 @@ JNIEXPORT jfloatArray JNICALL JNI_FN(sourceSamples)(JNIEnv *env, jobject, jint i
 //   envCounts    [volume points, pan points] per track; envFrames and
 //                envValues hold the points, track by track, volume first.
 //                Volume values are fader positions (0..1), pan is -1..1.
+//   instIds      the track's instrument id, or -1 for an audio track
+//   noteCounts   MIDI notes per track; noteTimes [start, length] in
+//                timeline frames and noteValues [pitch, velocity] per note
 JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray trackParams,
                                               jintArray itemCounts, jlongArray itemParams,
                                               jfloatArray itemGains, jintArray fxCounts, jlongArray fxIds,
                                               jintArray envCounts, jlongArray envFrames,
-                                              jfloatArray envValues, jfloat masterGain) {
+                                              jfloatArray envValues, jlongArray instIds, jintArray noteCounts,
+                                              jlongArray noteTimes, jfloatArray noteValues, jfloat masterGain) {
     const jsize numTracks = env->GetArrayLength(itemCounts);
     jfloat *tp = env->GetFloatArrayElements(trackParams, nullptr);
     jint *counts = env->GetIntArrayElements(itemCounts, nullptr);
@@ -102,12 +111,17 @@ JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray 
     jint *ec = env->GetIntArrayElements(envCounts, nullptr);
     jlong *ef = env->GetLongArrayElements(envFrames, nullptr);
     jfloat *ev = env->GetFloatArrayElements(envValues, nullptr);
+    jlong *ii = env->GetLongArrayElements(instIds, nullptr);
+    jint *nc = env->GetIntArrayElements(noteCounts, nullptr);
+    jlong *nt = env->GetLongArrayElements(noteTimes, nullptr);
+    jfloat *nv = env->GetFloatArrayElements(noteValues, nullptr);
 
     auto arrangement = std::make_unique<Arrangement>();
     arrangement->tracks.resize(static_cast<size_t>(numTracks));
     size_t item = 0;
     size_t fx = 0;
     size_t point = 0;
+    size_t note = 0;
     auto readEnvelope = [&](std::vector<EnvPoint> &out, jint count) {
         out.reserve(static_cast<size_t>(count));
         for (jint k = 0; k < count; ++k, ++point) out.push_back({ef[point], ev[point]});
@@ -136,6 +150,22 @@ JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray 
         }
         readEnvelope(mix.volumeEnv, ec[t * 2]);
         readEnvelope(mix.panEnv, ec[t * 2 + 1]);
+        if (ii[t] >= 0) {
+            mix.instrumentId = ii[t];
+            mix.instrument = engine().instrument(ii[t]);
+            mix.pads = engine().drumPads(ii[t]);
+        }
+        mix.notes.reserve(static_cast<size_t>(nc[t]));
+        for (jint i = 0; i < nc[t]; ++i, ++note) {
+            MidiNote m;
+            m.start = nt[note * 2];
+            m.length = nt[note * 2 + 1];
+            m.pitch = static_cast<int>(nv[note * 2]);
+            m.velocity = nv[note * 2 + 1];
+            mix.notes.push_back(m);
+        }
+        std::stable_sort(mix.notes.begin(), mix.notes.end(),
+                         [](const MidiNote &a, const MidiNote &b) { return a.start < b.start; });
     }
     for (jint i = 0; i < fc[numTracks]; ++i, ++fx) {
         if (auto e = engine().effect(fi[fx])) arrangement->masterFx.push_back(std::move(e));
@@ -151,7 +181,53 @@ JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray 
     env->ReleaseIntArrayElements(envCounts, ec, JNI_ABORT);
     env->ReleaseLongArrayElements(envFrames, ef, JNI_ABORT);
     env->ReleaseFloatArrayElements(envValues, ev, JNI_ABORT);
+    env->ReleaseLongArrayElements(instIds, ii, JNI_ABORT);
+    env->ReleaseIntArrayElements(noteCounts, nc, JNI_ABORT);
+    env->ReleaseLongArrayElements(noteTimes, nt, JNI_ABORT);
+    env->ReleaseFloatArrayElements(noteValues, nv, JNI_ABORT);
     engine().setArrangement(std::move(arrangement));
+}
+
+JNIEXPORT jboolean JNICALL JNI_FN(createInstrument)(JNIEnv *env, jobject, jlong id, jint kind, jfloatArray params) {
+    const jsize n = env->GetArrayLength(params);
+    jfloat *p = env->GetFloatArrayElements(params, nullptr);
+    const bool ok = engine().createInstrument(id, kind, p, n);
+    env->ReleaseFloatArrayElements(params, p, JNI_ABORT);
+    return ok;
+}
+
+JNIEXPORT void JNICALL JNI_FN(setInstrumentParam)(JNIEnv *, jobject, jlong id, jint index, jfloat value) {
+    engine().setInstrumentParam(id, index, value);
+}
+
+// Pads arrive as sources [source id or -1] per pad, params [gain, pitch,
+// reverse, oneShot, chokeGroup] per pad and ranges [start, end] per pad.
+JNIEXPORT void JNICALL JNI_FN(setDrumPads)(JNIEnv *env, jobject, jlong id, jintArray sources, jfloatArray params,
+                                           jlongArray ranges) {
+    const jsize n = env->GetArrayLength(sources);
+    jint *s = env->GetIntArrayElements(sources, nullptr);
+    jfloat *p = env->GetFloatArrayElements(params, nullptr);
+    jlong *r = env->GetLongArrayElements(ranges, nullptr);
+    std::vector<PadConfig> pads(static_cast<size_t>(n));
+    for (jsize i = 0; i < n; ++i) {
+        PadConfig &pad = pads[static_cast<size_t>(i)];
+        if (s[i] >= 0) pad.sample = engine().source(s[i]);
+        pad.gain = p[i * 5];
+        pad.pitch = p[i * 5 + 1];
+        pad.reverse = p[i * 5 + 2] > 0.5f;
+        pad.oneShot = p[i * 5 + 3] > 0.5f;
+        pad.chokeGroup = static_cast<int>(p[i * 5 + 4]);
+        pad.start = r[i * 2];
+        pad.end = r[i * 2 + 1];
+    }
+    env->ReleaseIntArrayElements(sources, s, JNI_ABORT);
+    env->ReleaseFloatArrayElements(params, p, JNI_ABORT);
+    env->ReleaseLongArrayElements(ranges, r, JNI_ABORT);
+    engine().setDrumPads(id, std::move(pads));
+}
+
+JNIEXPORT void JNICALL JNI_FN(liveNote)(JNIEnv *, jobject, jlong id, jint pitch, jfloat velocity) {
+    engine().liveNote(id, pitch, velocity);
 }
 
 JNIEXPORT jboolean JNICALL JNI_FN(createEffect)(JNIEnv *env, jobject, jlong id, jint kind, jfloatArray params) {

@@ -4,8 +4,13 @@ import com.alonmeller.mobiledaw.model.Effect
 import com.alonmeller.mobiledaw.model.EffectType
 import com.alonmeller.mobiledaw.model.EnvPoint
 import com.alonmeller.mobiledaw.model.Ids
+import com.alonmeller.mobiledaw.model.Instrument
+import com.alonmeller.mobiledaw.model.InstrumentType
 import com.alonmeller.mobiledaw.model.Item
 import com.alonmeller.mobiledaw.model.Marker
+import com.alonmeller.mobiledaw.model.Note
+import com.alonmeller.mobiledaw.model.PAD_COUNT
+import com.alonmeller.mobiledaw.model.Pad
 import com.alonmeller.mobiledaw.model.Project
 import com.alonmeller.mobiledaw.model.Track
 import org.json.JSONArray
@@ -17,13 +22,16 @@ data class ProjectSettings(
     val metronome: Boolean = false,
     val snap: Boolean = true,
     val gridDivision: Int = 4,
+    /** Pulls notes played live onto the nearest 1/16 while recording. */
+    val quantizeRecording: Boolean = true,
 )
 
 data class LoadedProject(val project: Project, val settings: ProjectSettings)
 
 /**
  * Stores the project as project.json plus one WAV file per audio source.
- * Items refer to sources by file name on disk and by engine source id in memory.
+ * Items and drum pads refer to sources by file name on disk and by engine
+ * source id in memory.
  */
 class ProjectStore(root: File) {
     val dir: File = File(root, "projects/default").apply { mkdirs() }
@@ -53,6 +61,19 @@ class ProjectStore(root: File) {
                 if (itemsJson != null) {
                     for (j in 0 until itemsJson.length()) {
                         val it = itemsJson.getJSONObject(j)
+                        if (it.optBoolean("midi", false)) {
+                            items += Item(
+                                id = Ids.next(),
+                                sourceId = -1,
+                                position = frames(it.getLong("position")),
+                                offset = frames(it.optLong("offset", 0)),
+                                length = frames(it.getLong("length")),
+                                mute = it.optBoolean("mute", false),
+                                notes = readNotes(it.optJSONArray("notes"), ::frames),
+                                loopLength = frames(it.optLong("loop", 0)),
+                            )
+                            continue
+                        }
                         val src = source(it.getString("file")) ?: continue
                         items += Item(
                             id = Ids.next(),
@@ -93,6 +114,7 @@ class ProjectStore(root: File) {
                     fx = readEffects(t.optJSONArray("fx")),
                     volumeEnv = readEnvelope(t.optJSONArray("volumeEnv"), ::frames),
                     panEnv = readEnvelope(t.optJSONArray("panEnv"), ::frames),
+                    instrument = t.optJSONObject("instrument")?.let { readInstrument(it, ::frames, ::source) },
                 )
             }
             val markers = json.optJSONArray("markers")?.let { m ->
@@ -116,6 +138,7 @@ class ProjectStore(root: File) {
                 metronome = json.optBoolean("metronome", false),
                 snap = json.optBoolean("snap", true),
                 gridDivision = json.optInt("grid", 4),
+                quantizeRecording = json.optBoolean("quantize", true),
             )
             LoadedProject(project, settings)
         }.getOrNull()
@@ -130,6 +153,19 @@ class ProjectStore(root: File) {
         project.tracks.forEach { t ->
             val items = JSONArray()
             t.items.forEach { item ->
+                if (item.isMidi) {
+                    items.put(
+                        JSONObject()
+                            .put("midi", true)
+                            .put("position", item.position)
+                            .put("offset", item.offset)
+                            .put("length", item.length)
+                            .put("loop", item.loopLength)
+                            .put("mute", item.mute)
+                            .put("notes", writeNotes(item.notes ?: emptyList()))
+                    )
+                    return@forEach
+                }
                 val file = fileOf(item.sourceId) ?: return@forEach
                 items.put(
                     JSONObject()
@@ -155,17 +191,19 @@ class ProjectStore(root: File) {
                     .put("fx", writeEffects(t.fx))
                     .put("volumeEnv", writeEnvelope(t.volumeEnv))
                     .put("panEnv", writeEnvelope(t.panEnv))
+                    .apply { t.instrument?.let { put("instrument", writeInstrument(it, fileOf)) } }
             )
         }
         val markers = JSONArray()
         project.markers.forEach { markers.put(JSONObject().put("position", it.position).put("name", it.name)) }
         val json = JSONObject()
-            .put("version", 3)
+            .put("version", 4)
             .put("tempo", project.tempo)
             .put("sampleRate", sampleRate)
             .put("metronome", settings.metronome)
             .put("snap", settings.snap)
             .put("grid", settings.gridDivision)
+            .put("quantize", settings.quantizeRecording)
             .put("loop", JSONObject().put("start", project.loopStart).put("end", project.loopEnd).put("on", project.loopOn))
             .put("markers", markers)
             .put("masterGain", project.masterGain.toDouble())
@@ -214,7 +252,68 @@ class ProjectStore(root: File) {
         return arr
     }
 
-    /** Deletes WAV files that no saved item refers to any more. */
+    private fun readNotes(arr: JSONArray?, frames: (Long) -> Long): List<Note> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).map { i ->
+            val n = arr.getJSONArray(i)
+            Note(frames(n.getLong(0)), frames(n.getLong(1)).coerceAtLeast(1), n.getInt(2), n.optDouble(3, 0.8).toFloat())
+        }.sortedWith(compareBy({ it.start }, { it.pitch }))
+    }
+
+    private fun writeNotes(notes: List<Note>): JSONArray {
+        val arr = JSONArray()
+        notes.forEach { arr.put(JSONArray().put(it.start).put(it.length).put(it.pitch).put(it.velocity.toDouble())) }
+        return arr
+    }
+
+    private fun readInstrument(o: JSONObject, frames: (Long) -> Long, source: (String) -> Int?): Instrument? {
+        val type = InstrumentType.fromCode(o.optInt("type", -1)) ?: return null
+        val saved = o.optJSONArray("values")
+        val values = type.params.mapIndexed { k, spec ->
+            if (saved != null && k < saved.length()) saved.getDouble(k).toFloat() else spec.default
+        }
+        val padsJson = o.optJSONArray("pads")
+        val pads = if (type != InstrumentType.DRUMS) emptyList() else List(PAD_COUNT) { i ->
+            val p = padsJson?.optJSONObject(i) ?: return@List Pad()
+            val file = p.optString("file", "")
+            val src = if (file.isEmpty() || !audioFile(file).exists()) null else source(file)
+            Pad(
+                sourceId = src ?: -1,
+                name = if (src == null) "" else p.optString("name", ""),
+                gain = p.optDouble("gain", 1.0).toFloat(),
+                pitch = p.optDouble("pitch", 0.0).toFloat(),
+                start = frames(p.optLong("start", 0)),
+                end = frames(p.optLong("end", 0)),
+                reverse = p.optBoolean("reverse", false),
+                oneShot = p.optBoolean("oneShot", true),
+                chokeGroup = p.optInt("choke", 0),
+            )
+        }
+        return Instrument(Ids.next(), type, values, pads)
+    }
+
+    private fun writeInstrument(inst: Instrument, fileOf: (Int) -> String?): JSONObject {
+        val values = JSONArray()
+        inst.values.forEach { values.put(it.toDouble()) }
+        val pads = JSONArray()
+        inst.pads.forEach { pad ->
+            pads.put(
+                JSONObject()
+                    .put("file", fileOf(pad.sourceId) ?: "")
+                    .put("name", pad.name)
+                    .put("gain", pad.gain.toDouble())
+                    .put("pitch", pad.pitch.toDouble())
+                    .put("start", pad.start)
+                    .put("end", pad.end)
+                    .put("reverse", pad.reverse)
+                    .put("oneShot", pad.oneShot)
+                    .put("choke", pad.chokeGroup)
+            )
+        }
+        return JSONObject().put("type", inst.type.code).put("values", values).put("pads", pads)
+    }
+
+    /** Deletes WAV files that no saved item or pad refers to any more. */
     fun deleteUnused(used: Set<String>) {
         dir.listFiles { f -> f.extension == "wav" && f.name !in used }?.forEach { it.delete() }
     }

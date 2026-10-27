@@ -16,7 +16,8 @@ object NativeEngine {
     external fun position(): Long
     external fun setLoop(start: Long, end: Long, enabled: Boolean)
 
-    external fun startRecording(): Boolean
+    /** With [withTransport] false only the input is captured (sampling into a pad). */
+    external fun startRecording(withTransport: Boolean): Boolean
     /** Returns the id of a new source holding the take, or -1. */
     external fun stopRecording(): Int
     external fun isRecording(): Boolean
@@ -25,6 +26,8 @@ object NativeEngine {
     /** Timeline position of the last take after latency compensation. */
     external fun lastTakeStart(): Long
     external fun inputLevel(): Float
+    /** Frames between the render position and what the speaker plays now. */
+    external fun outputLatency(): Long
     external fun masterPeak(): Float
 
     external fun createSource(samples: FloatArray): Int
@@ -43,6 +46,10 @@ object NativeEngine {
         envCounts: IntArray,
         envFrames: LongArray,
         envValues: FloatArray,
+        instIds: LongArray,
+        noteCounts: IntArray,
+        noteTimes: LongArray,
+        noteValues: FloatArray,
         masterGain: Float,
     )
     external fun trackPeak(index: Int): Float
@@ -50,6 +57,13 @@ object NativeEngine {
     external fun createEffect(id: Long, type: Int, params: FloatArray): Boolean
     external fun setEffectParam(id: Long, index: Int, value: Float)
     external fun setEffectBypass(id: Long, bypass: Boolean)
+
+    external fun createInstrument(id: Long, type: Int, params: FloatArray): Boolean
+    external fun setInstrumentParam(id: Long, index: Int, value: Float)
+    /** 16 pads: [sources], [gain, pitch, reverse, oneShot, chokeGroup] and [start, end] per pad. */
+    external fun setDrumPads(id: Long, sources: IntArray, params: FloatArray, ranges: LongArray)
+    /** Plays (velocity > 0) or releases (velocity 0) a note right now. */
+    external fun liveNote(id: Long, pitch: Int, velocity: Float)
 
     external fun setMetronome(enabled: Boolean)
     external fun setTempo(bpm: Double)

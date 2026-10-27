@@ -21,11 +21,14 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Test effect DSP
+      - name: Test effect and instrument DSP
         run: |
           g++ -std=c++17 -O2 -Wall -Wextra -I app/src/main/cpp \
             app/src/test/cpp/effects_test.cpp app/src/main/cpp/Effects.cpp -o effects_test
           ./effects_test
+          g++ -std=c++17 -O2 -Wall -Wextra -I app/src/main/cpp \
+            app/src/test/cpp/instruments_test.cpp app/src/main/cpp/Instruments.cpp -o instruments_test
+          ./instruments_test
 
       - name: Build debug APK
         run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
