@@ -80,4 +80,6 @@ dependencies {
     implementation("com.google.oboe:oboe:1.9.0")
 
     testImplementation("junit:junit:4.13.2")
+    // The real org.json, in place of the stubs in android.jar, so saving and loading can be tested.
+    testImplementation("org.json:json:20231013")
 }

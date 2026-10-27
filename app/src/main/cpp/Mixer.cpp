@@ -43,6 +43,98 @@ inline void panGains(float pan, float &left, float &right) {
 }
 }  // namespace
 
+void Arrangement::prepare() {
+    const int n = static_cast<int>(tracks.size());
+    // Routing that points nowhere goes straight to the master.
+    for (int i = 0; i < n; ++i) {
+        TrackMix &t = tracks[static_cast<size_t>(i)];
+        if (t.parent < 0 || t.parent >= n || t.parent == i) t.parent = -1;
+        t.sends.erase(std::remove_if(t.sends.begin(), t.sends.end(),
+                                     [&](const Send &s) { return s.target < 0 || s.target >= n || s.target == i; }),
+                      t.sends.end());
+    }
+
+    // Every track runs before the tracks it plays into (Kahn's algorithm, in
+    // track order). The app never builds a loop, but should one arrive, the
+    // connections that close it are cut rather than letting the order fail.
+    std::vector<int> waiting(static_cast<size_t>(n), 0);  // inputs not yet run
+    for (const TrackMix &t : tracks) {
+        if (t.parent >= 0) ++waiting[static_cast<size_t>(t.parent)];
+        for (const Send &s : t.sends) ++waiting[static_cast<size_t>(s.target)];
+    }
+    std::vector<char> done(static_cast<size_t>(n), 0);
+    order.clear();
+    order.reserve(static_cast<size_t>(n));
+    while (static_cast<int>(order.size()) < n) {
+        int next = -1;
+        for (int i = 0; i < n && next < 0; ++i) {
+            if (!done[static_cast<size_t>(i)] && waiting[static_cast<size_t>(i)] == 0) next = i;
+        }
+        if (next < 0) {
+            for (int i = 0; i < n && next < 0; ++i) {
+                if (!done[static_cast<size_t>(i)]) next = i;
+            }
+            for (int j = 0; j < n; ++j) {
+                if (done[static_cast<size_t>(j)]) continue;
+                TrackMix &u = tracks[static_cast<size_t>(j)];
+                if (u.parent == next) u.parent = -1;
+                u.sends.erase(std::remove_if(u.sends.begin(), u.sends.end(),
+                                             [&](const Send &s) { return s.target == next; }),
+                              u.sends.end());
+            }
+            waiting[static_cast<size_t>(next)] = 0;
+        }
+        done[static_cast<size_t>(next)] = 1;
+        order.push_back(next);
+        const TrackMix &t = tracks[static_cast<size_t>(next)];
+        if (t.parent >= 0) --waiting[static_cast<size_t>(t.parent)];
+        for (const Send &s : t.sends) --waiting[static_cast<size_t>(s.target)];
+    }
+
+    // Solo in place, as REAPER does it: a soloed track is heard through the
+    // folders and sends it plays into, and whatever plays into it is heard
+    // through it. Soloing a folder solos the tracks in it, sends and all;
+    // soloing a reverb bus plays the reverb of every track that sends to it.
+    anySolo = false;
+    for (const TrackMix &t : tracks) anySolo = anySolo || t.solo;
+    std::vector<char> soloed(static_cast<size_t>(n), 0);  // soloed, or in a soloed folder
+    std::vector<char> after(static_cast<size_t>(n), 0);   // a soloed track plays into it
+    std::vector<char> before(static_cast<size_t>(n), 0);  // it plays into a soloed track
+    if (anySolo) {
+        // Backwards through the order, a folder comes before the tracks in it.
+        for (auto it = order.rbegin(); it != order.rend(); ++it) {
+            const TrackMix &t = tracks[static_cast<size_t>(*it)];
+            soloed[static_cast<size_t>(*it)] = t.solo || (t.parent >= 0 && soloed[static_cast<size_t>(t.parent)]);
+        }
+        for (int i : order) {
+            const TrackMix &t = tracks[static_cast<size_t>(i)];
+            if (!soloed[static_cast<size_t>(i)] && !after[static_cast<size_t>(i)]) continue;
+            if (t.parent >= 0) after[static_cast<size_t>(t.parent)] = 1;
+            for (const Send &s : t.sends) after[static_cast<size_t>(s.target)] = 1;
+        }
+        for (auto it = order.rbegin(); it != order.rend(); ++it) {
+            const TrackMix &t = tracks[static_cast<size_t>(*it)];
+            auto leadsToSolo = [&](int target) {
+                return soloed[static_cast<size_t>(target)] || before[static_cast<size_t>(target)];
+            };
+            bool feeds = t.parent >= 0 && leadsToSolo(t.parent);
+            for (const Send &s : t.sends) feeds = feeds || leadsToSolo(s.target);
+            before[static_cast<size_t>(*it)] = feeds;
+        }
+    }
+    for (int i = 0; i < n; ++i) {
+        TrackMix &t = tracks[static_cast<size_t>(i)];
+        const bool soloPath = soloed[static_cast<size_t>(i)] || after[static_cast<size_t>(i)];
+        auto leadsToSolo = [&](int target) {
+            return soloed[static_cast<size_t>(target)] || before[static_cast<size_t>(target)];
+        };
+        // A folder that only passes a soloed track along keeps its own items quiet.
+        t.ownHeard = !anySolo || soloed[static_cast<size_t>(i)] || before[static_cast<size_t>(i)];
+        t.mainOpen = !anySolo || soloPath || (t.parent >= 0 && leadsToSolo(t.parent));
+        for (Send &s : t.sends) s.open = !anySolo || soloPath || leadsToSolo(s.target);
+    }
+}
+
 std::unique_ptr<Arrangement> Arrangement::cloneForRender() const {
     auto copy = std::make_unique<Arrangement>(*this);
     for (auto &t : copy->tracks) {
@@ -57,84 +149,122 @@ std::unique_ptr<Arrangement> Arrangement::cloneForRender() const {
     return copy;
 }
 
+void Mixer::receive(TrackMix &t, const float *l, const float *r, int n, float gain) {
+    float *inL = t.inLeft.data();
+    float *inR = t.inRight.data();
+    if (t.received) {
+        for (int i = 0; i < n; ++i) {
+            inL[i] += l[i] * gain;
+            inR[i] += r[i] * gain;
+        }
+    } else {
+        for (int i = 0; i < n; ++i) {
+            inL[i] = l[i] * gain;
+            inR[i] = r[i] * gain;
+        }
+        t.received = true;
+    }
+}
+
 bool Mixer::renderBlock(Arrangement &arr, float *out, int n, int64_t pos, bool playing,
                         std::atomic<float> *peaks, const TrackTaps *taps) {
     const int64_t blockEnd = pos + n;
     bool sounding = false;
     std::fill(masterL_.begin(), masterL_.begin() + n, 0.0f);
     std::fill(masterR_.begin(), masterR_.begin() + n, 0.0f);
+    for (TrackMix &t : arr.tracks) t.received = false;
 
-    for (size_t ti = 0; ti < arr.tracks.size(); ++ti) {
+    // Each track runs after everything that plays into it, so a folder or a
+    // bus hears its tracks in the same block.
+    for (const int index : arr.order) {
+        const auto ti = static_cast<size_t>(index);
         TrackMix &t = arr.tracks[ti];
         float *stem = taps && ti < taps->stems.size() ? taps->stems[ti] : nullptr;
         float *dry = taps && ti < taps->dry.size() ? taps->dry[ti] : nullptr;
         if (stem) std::fill(stem, stem + 2 * n, 0.0f);
         if (dry) std::fill(dry, dry + n, 0.0f);
-        // Soloing another track takes this one out of the mix, but not out of
-        // its stem. A muted track's stem stays silent; its dry tap does not,
-        // so a project exported elsewhere can unmute it.
-        const bool heard = !t.mute && (!arr.anySolo || t.solo);
-        if (t.mute) stem = nullptr;
-        if (!heard && !stem && !dry) {
-            if (t.instrument) t.instrument->allNotesOff(true);
-            continue;
-        }
 
-        // 1. Mix the track's items into a mono buffer.
-        std::fill(mono_.begin(), mono_.begin() + n, 0.0f);
+        // 1. The track's own sound: its items and its instrument, mixed to mono.
+        // Mute and solo can keep it out of the mix; a muted track still fills
+        // its dry tap, so a project exported elsewhere can unmute it.
+        const bool own = t.ownHeard && !t.mute;
         bool any = false;
-        for (const Item &item : t.items) {
-            if (!item.source || !playing) continue;
-            const int64_t from = std::max(pos, item.position);
-            const int64_t to = std::min(blockEnd, item.position + item.length);
-            if (from >= to) continue;
-            any = true;
-            const auto &src = *item.source;
-            const auto srcLen = static_cast<int64_t>(src.size());
-            for (int64_t f = from; f < to; ++f) {
-                const int64_t local = f - item.position;
-                const int64_t idx = item.offset + local;
-                if (idx < 0 || idx >= srcLen) continue;
-                float g = item.gain;
-                if (local < item.fadeIn) g *= smooth(static_cast<float>(local) / static_cast<float>(item.fadeIn));
-                const int64_t remain = item.length - local;
-                if (remain < item.fadeOut) g *= smooth(static_cast<float>(remain) / static_cast<float>(item.fadeOut));
-                mono_[static_cast<size_t>(f - pos)] += src[static_cast<size_t>(idx)] * g;
-            }
-        }
-        // 1b. The instrument: start the notes that begin in this block, then
-        // render every sounding voice on top of the items.
-        if (t.instrument) {
-            if (playing) {
-                auto it = std::lower_bound(t.notes.begin(), t.notes.end(), pos,
-                                           [](const MidiNote &m, int64_t f) { return m.start < f; });
-                for (; it != t.notes.end() && it->start < blockEnd; ++it) {
-                    t.instrument->noteOn(t.pads, it->pitch, it->velocity, static_cast<int>(it->start - pos),
-                                         it->length);
+        if (own || dry) {
+            std::fill(mono_.begin(), mono_.begin() + n, 0.0f);
+            for (const Item &item : t.items) {
+                if (!item.source || !playing) continue;
+                const int64_t from = std::max(pos, item.position);
+                const int64_t to = std::min(blockEnd, item.position + item.length);
+                if (from >= to) continue;
+                any = true;
+                const auto &src = *item.source;
+                const auto srcLen = static_cast<int64_t>(src.size());
+                for (int64_t f = from; f < to; ++f) {
+                    const int64_t local = f - item.position;
+                    const int64_t idx = item.offset + local;
+                    if (idx < 0 || idx >= srcLen) continue;
+                    float g = item.gain;
+                    if (local < item.fadeIn) g *= smooth(static_cast<float>(local) / static_cast<float>(item.fadeIn));
+                    const int64_t remain = item.length - local;
+                    if (remain < item.fadeOut) g *= smooth(static_cast<float>(remain) / static_cast<float>(item.fadeOut));
+                    mono_[static_cast<size_t>(f - pos)] += src[static_cast<size_t>(idx)] * g;
                 }
             }
-            if (t.instrument->active()) {
-                t.instrument->render(mono_.data(), n);
-                any = true;
-                sounding = true;
+            // The instrument: start the notes that begin in this block, then
+            // render every sounding voice on top of the items.
+            if (t.instrument) {
+                if (playing) {
+                    auto it = std::lower_bound(t.notes.begin(), t.notes.end(), pos,
+                                               [](const MidiNote &m, int64_t f) { return m.start < f; });
+                    for (; it != t.notes.end() && it->start < blockEnd; ++it) {
+                        t.instrument->noteOn(t.pads, it->pitch, it->velocity, static_cast<int>(it->start - pos),
+                                             it->length);
+                    }
+                }
+                if (t.instrument->active()) {
+                    t.instrument->render(mono_.data(), n);
+                    any = true;
+                    sounding = true;
+                }
             }
+            if (dry) std::copy(mono_.begin(), mono_.begin() + n, dry);
+            if (!own) any = false;
+        } else if (t.instrument) {
+            t.instrument->allNotesOff(true);
         }
-        if (dry) std::copy(mono_.begin(), mono_.begin() + n, dry);
 
-        // A track with no audio and no effects contributes nothing; effects
-        // keep running on silence so reverb and delay tails ring out.
-        if (!any && t.fx.empty()) continue;
+        // A muted track passes nothing on, not even what its tracks bring it.
+        if (t.mute) continue;
+        // With no sound and no effects there is nothing to do; effects keep
+        // running on silence so reverb and delay tails ring out.
+        if (!any && !t.received && t.fx.empty()) continue;
 
-        // 2. Insert effects (pre-fader).
+        // 2. Its own sound plus what it receives, through the insert effects (pre-fader).
         float *l = t.left.data();
         float *r = t.right.data();
-        std::copy(mono_.begin(), mono_.begin() + n, l);
-        std::copy(mono_.begin(), mono_.begin() + n, r);
+        if (any) {
+            std::copy(mono_.begin(), mono_.begin() + n, l);
+            std::copy(mono_.begin(), mono_.begin() + n, r);
+        } else {
+            std::fill(l, l + n, 0.0f);
+            std::fill(r, r + n, 0.0f);
+        }
+        if (t.received) {
+            for (int i = 0; i < n; ++i) {
+                l[i] += t.inLeft[static_cast<size_t>(i)];
+                r[i] += t.inRight[static_cast<size_t>(i)];
+            }
+        }
         for (auto &fx : t.fx) {
             if (fx && !fx->bypassed()) fx->process(l, r, n);
         }
 
-        // 3. Fader and pan, ramped across the block when automated.
+        // 3. Pre-fader sends leave before the fader and pan.
+        for (const Send &s : t.sends) {
+            if (s.preFader && s.open && !s.mute) receive(arr.tracks[static_cast<size_t>(s.target)], l, r, n, s.gain);
+        }
+
+        // 4. Fader and pan, ramped across the block when automated.
         const float g0 = t.gain * volumeAt(t.volumeEnv, pos);
         const float g1 = t.gain * volumeAt(t.volumeEnv, blockEnd);
         float pl0, pr0, pl1, pr1;
@@ -145,22 +275,35 @@ bool Mixer::renderBlock(Arrangement &arr, float *out, int n, int64_t pos, bool p
         for (int i = 0; i < n; ++i) {
             const float k = static_cast<float>(i) * inv;
             const float g = g0 + (g1 - g0) * k;
-            const float sl = l[i] * g * (pl0 + (pl1 - pl0) * k);
-            const float sr = r[i] * g * (pr0 + (pr1 - pr0) * k);
-            if (heard) {
-                masterL_[static_cast<size_t>(i)] += sl;
-                masterR_[static_cast<size_t>(i)] += sr;
-            }
-            if (stem) {
-                stem[2 * i] = sl;
-                stem[2 * i + 1] = sr;
-            }
-            peak = std::max(peak, std::max(std::fabs(sl), std::fabs(sr)));
+            l[i] *= g * (pl0 + (pl1 - pl0) * k);
+            r[i] *= g * (pr0 + (pr1 - pr0) * k);
+            peak = std::max(peak, std::max(std::fabs(l[i]), std::fabs(r[i])));
         }
-        if (peaks && ti < kMaxMeters) peaks[ti].store(std::max(peaks[ti].load(), peak));
+        if (peaks && ti < static_cast<size_t>(kMaxMeters)) peaks[ti].store(std::max(peaks[ti].load(), peak));
+        if (stem) {
+            for (int i = 0; i < n; ++i) {
+                stem[2 * i] = l[i];
+                stem[2 * i + 1] = r[i];
+            }
+        }
+
+        // 5. On to the folder above (or the master), and to the post-fader sends.
+        if (t.mainOpen) {
+            if (t.parent >= 0) {
+                receive(arr.tracks[static_cast<size_t>(t.parent)], l, r, n, 1.0f);
+            } else {
+                for (int i = 0; i < n; ++i) {
+                    masterL_[static_cast<size_t>(i)] += l[i];
+                    masterR_[static_cast<size_t>(i)] += r[i];
+                }
+            }
+        }
+        for (const Send &s : t.sends) {
+            if (!s.preFader && s.open && !s.mute) receive(arr.tracks[static_cast<size_t>(s.target)], l, r, n, s.gain);
+        }
     }
 
-    // 4. Master bus.
+    // 6. Master bus.
     for (auto &fx : arr.masterFx) {
         if (fx && !fx->bypassed()) fx->process(masterL_.data(), masterR_.data(), n);
     }

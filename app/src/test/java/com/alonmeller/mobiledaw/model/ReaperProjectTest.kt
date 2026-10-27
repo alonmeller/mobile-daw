@@ -191,6 +191,70 @@ class ReaperProjectTest {
         assertTrue("VOLPAN 1 0 -1 -1 1" in notes)
     }
 
+    /** Each track's name, ISBUS and AUXRECV lines, in REAPER's track order. */
+    private fun routing(text: String): List<Triple<String, String, List<String>>> {
+        val count = lines(text).count { it.startsWith("<TRACK ") }
+        return (0 until count).map { n ->
+            val t = block(text, "TRACK", nth = n)
+            Triple(
+                t.first { it.startsWith("NAME ") }.removePrefix("NAME ").trim('"'),
+                t.first { it.startsWith("ISBUS ") },
+                t.filter { it.startsWith("AUXRECV ") },
+            )
+        }
+    }
+
+    @Test
+    fun foldersBecomeReaperFolders() {
+        // Band > (Drums > Kick), Bass; then Vocal at the top again.
+        val band = Track(20, "Band", 0)
+        val kit = drums.copy(indent = 1)
+        val kick = Track(21, "Kick", 0, indent = 2)
+        val bass = Track(22, "Bass", 0, indent = 1)
+        val song = project.copy(tracks = listOf(band, kit, kick, bass, vocal))
+        assertEquals(
+            listOf("Band" to "ISBUS 1 1", "Drums" to "ISBUS 1 1", "Kick" to "ISBUS 2 -1", "Bass" to "ISBUS 2 -1", "Vocal" to "ISBUS 0 0"),
+            routing(write(song)).map { it.first to it.second },
+        )
+        // A rendered instrument folder keeps its notes track inside, so its tracks stay in the folder.
+        val rendered = mapOf(2L to ReaperProject.RenderedTrack("Drums (instrument).wav", 96_000))
+        assertEquals(
+            listOf(
+                "Band" to "ISBUS 1 1", "Drums" to "ISBUS 1 1", "Drums MIDI" to "ISBUS 0 0", "Kick" to "ISBUS 2 -1",
+                "Bass" to "ISBUS 2 -1", "Vocal" to "ISBUS 0 0",
+            ),
+            routing(write(song, rendered)).map { it.first to it.second },
+        )
+        // An instrument track that is not a folder has its notes track next to it, closing the folder after it.
+        val last = project.copy(tracks = listOf(band, kit.copy(indent = 1)))
+        assertEquals(
+            listOf("Band" to "ISBUS 1 1", "Drums" to "ISBUS 0 0", "Drums MIDI" to "ISBUS 2 -1"),
+            routing(write(last, rendered)).map { it.first to it.second },
+        )
+    }
+
+    @Test
+    fun sendsArriveOnTheReceivingTrack() {
+        val plainBus = Track(30, "Group", 0)
+        val reverbBus = Track(31, "Reverb", 0, fx = listOf(Effect(32, EffectType.REVERB)))
+        val singer = vocal.copy(
+            sends = listOf(Send(1, target = 30, gain = 0.5f), Send(2, target = 31, gain = 0.25f, preFader = true)),
+        )
+        val kit = drums.copy(sends = listOf(Send(3, target = 30, gain = 1f, mute = true)))
+        val song = project.copy(tracks = listOf(singer, kit, plainBus, reverbBus))
+        val rendered = mapOf(2L to ReaperProject.RenderedTrack("Drums (instrument).wav", 96_000))
+        val tracks = routing(write(song, rendered))
+        assertEquals(listOf("Vocal", "Drums", "Drums MIDI", "Group", "Reverb"), tracks.map { it.first })
+        // The drums' audio is track 1 in REAPER: the notes track below it takes index 2.
+        assertEquals(
+            listOf("AUXRECV 0 0 0.5 0 0 0 0 0 0 -1 0 -1", "AUXRECV 1 0 1 0 1 0 0 0 0 -1 0 -1"),
+            tracks[3].third,
+        )
+        // Pre-fader is REAPER's mode 3; into a track with effects REAPER cannot play, the send arrives muted.
+        assertEquals(listOf("AUXRECV 0 3 0.25 0 1 0 0 0 0 -1 0 -1"), tracks[4].third)
+        assertTrue(tracks.take(3).all { it.third.isEmpty() })
+    }
+
     @Test
     fun guidsAreWellFormedAndRepeatable() {
         val guid = Regex("\\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\\}")

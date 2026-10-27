@@ -64,6 +64,8 @@ struct RenderJob {
     std::string mixPath;                 // stereo master mix
     std::vector<std::string> stemPaths;  // per track: stereo after effects, fader and pan
     std::vector<std::string> dryPaths;   // per track: mono, before any effect
+    // Renders as if no track were soloed, so every stem is whole.
+    bool ignoreSolo = false;
 };
 
 struct RenderResult {
