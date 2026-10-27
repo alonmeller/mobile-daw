@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.MobileDAW" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF141416</item>
+        <item name="android:statusBarColor">#FF141416</item>
+        <item name="android:navigationBarColor">#FF141416</item>
+    </style>
+</resources>
