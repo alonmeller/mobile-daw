@@ -391,11 +391,22 @@ void Instrument::setParam(int index, float value) {
 }
 
 std::shared_ptr<Instrument> Instrument::create(InstrumentKind kind, int sampleRate) {
+    std::shared_ptr<Instrument> inst;
     switch (kind) {
         case InstrumentKind::Synth:
-            return std::make_shared<Synth>(sampleRate);
+            inst = std::make_shared<Synth>(sampleRate);
+            break;
         case InstrumentKind::Drums:
-            return std::make_shared<Drums>(sampleRate);
+            inst = std::make_shared<Drums>(sampleRate);
+            break;
     }
-    return nullptr;
+    if (inst) inst->kind_ = kind;
+    return inst;
+}
+
+std::shared_ptr<Instrument> Instrument::clone() const {
+    auto inst = create(kind_, sampleRate_);
+    if (!inst) return nullptr;
+    for (int i = 0; i < std::min(numParams_, inst->numParams_); ++i) inst->setParam(i, param(i));
+    return inst;
 }

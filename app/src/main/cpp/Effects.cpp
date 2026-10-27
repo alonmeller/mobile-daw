@@ -439,15 +439,25 @@ void Effect::setParam(int index, float value) {
 }
 
 std::shared_ptr<Effect> Effect::create(EffectKind kind, int sampleRate) {
+    std::shared_ptr<Effect> fx;
     switch (kind) {
-        case EffectKind::Eq: return std::make_shared<Eq>(sampleRate);
-        case EffectKind::Compressor: return std::make_shared<Compressor>(sampleRate);
-        case EffectKind::Reverb: return std::make_shared<Reverb>(sampleRate);
-        case EffectKind::Delay: return std::make_shared<Delay>(sampleRate);
-        case EffectKind::Chorus: return std::make_shared<Chorus>(sampleRate);
-        case EffectKind::Distortion: return std::make_shared<Distortion>(sampleRate);
-        case EffectKind::Gate: return std::make_shared<Gate>(sampleRate);
-        case EffectKind::Limiter: return std::make_shared<Limiter>(sampleRate);
+        case EffectKind::Eq: fx = std::make_shared<Eq>(sampleRate); break;
+        case EffectKind::Compressor: fx = std::make_shared<Compressor>(sampleRate); break;
+        case EffectKind::Reverb: fx = std::make_shared<Reverb>(sampleRate); break;
+        case EffectKind::Delay: fx = std::make_shared<Delay>(sampleRate); break;
+        case EffectKind::Chorus: fx = std::make_shared<Chorus>(sampleRate); break;
+        case EffectKind::Distortion: fx = std::make_shared<Distortion>(sampleRate); break;
+        case EffectKind::Gate: fx = std::make_shared<Gate>(sampleRate); break;
+        case EffectKind::Limiter: fx = std::make_shared<Limiter>(sampleRate); break;
     }
-    return nullptr;
+    if (fx) fx->kind_ = kind;
+    return fx;
+}
+
+std::shared_ptr<Effect> Effect::clone() const {
+    auto fx = create(kind_, sampleRate_);
+    if (!fx) return nullptr;
+    for (int i = 0; i < std::min(numParams_, fx->numParams_); ++i) fx->setParam(i, param(i));
+    fx->setBypass(bypassed());
+    return fx;
 }

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "AudioEngine.h"
 
@@ -16,6 +18,25 @@ AudioEngine &engine() {
 jfloatArray toJava(JNIEnv *env, const std::vector<float> &values) {
     jfloatArray result = env->NewFloatArray(static_cast<jsize>(values.size()));
     env->SetFloatArrayRegion(result, 0, static_cast<jsize>(values.size()), values.data());
+    return result;
+}
+
+std::string toString(JNIEnv *env, jstring s) {
+    if (!s) return {};
+    const char *chars = env->GetStringUTFChars(s, nullptr);
+    std::string result(chars ? chars : "");
+    if (chars) env->ReleaseStringUTFChars(s, chars);
+    return result;
+}
+
+std::vector<std::string> toStrings(JNIEnv *env, jobjectArray array) {
+    std::vector<std::string> result;
+    const jsize n = array ? env->GetArrayLength(array) : 0;
+    for (jsize i = 0; i < n; ++i) {
+        auto s = static_cast<jstring>(env->GetObjectArrayElement(array, i));
+        result.push_back(toString(env, s));
+        if (s) env->DeleteLocalRef(s);
+    }
     return result;
 }
 }  // namespace
@@ -253,5 +274,33 @@ JNIEXPORT void JNICALL JNI_FN(setMetronome)(JNIEnv *, jobject, jboolean enabled)
 }
 
 JNIEXPORT void JNICALL JNI_FN(setTempo)(JNIEnv *, jobject, jdouble bpm) { engine().setTempo(bpm); }
+
+// Renders the arrangement being played now into 32-bit float WAV files: the
+// stereo mix (unless mixPath is empty), a stereo stem for each track with a
+// path in stemPaths, and the mono pre-effect output of each track with a
+// path in dryPaths (empty strings skip a track). Paths should be plain ASCII.
+// Blocks until done; returns [ok, cancelled, frames, peak, loudness in LUFS].
+JNIEXPORT jdoubleArray JNICALL JNI_FN(render)(JNIEnv *env, jobject, jlong start, jlong end, jlong maxTail,
+                                              jstring mixPath, jobjectArray stemPaths, jobjectArray dryPaths) {
+    RenderJob job;
+    job.start = start;
+    job.end = end;
+    job.maxTail = maxTail;
+    job.mixPath = toString(env, mixPath);
+    job.stemPaths = toStrings(env, stemPaths);
+    job.dryPaths = toStrings(env, dryPaths);
+    const RenderResult r = engine().render(std::move(job));
+    const jdouble values[5] = {r.ok ? 1.0 : 0.0, r.cancelled ? 1.0 : 0.0, static_cast<jdouble>(r.frames),
+                               static_cast<jdouble>(r.peak), r.loudness};
+    jdoubleArray result = env->NewDoubleArray(5);
+    env->SetDoubleArrayRegion(result, 0, 5, values);
+    return result;
+}
+
+JNIEXPORT jfloat JNICALL JNI_FN(renderProgress)(JNIEnv *, jobject) { return engine().renderProgress(); }
+
+JNIEXPORT void JNICALL JNI_FN(cancelRender)(JNIEnv *, jobject) { engine().cancelRender(); }
+
+JNIEXPORT void JNICALL JNI_FN(clearSession)(JNIEnv *, jobject) { engine().clearSession(); }
 
 }  // extern "C"

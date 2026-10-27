@@ -15,6 +15,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -66,6 +67,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.alonmeller.mobiledaw.DawViewModel
@@ -91,10 +93,16 @@ private val RulerHeight = 34.dp
 
 /**
  * The whole app. [withMic] runs an action once the microphone may be used,
- * and [pickAudio] lets the user choose an audio file to import.
+ * [pickAudio] lets the user choose an audio file to import, and
+ * [exportActions] shares or saves an exported file.
  */
 @Composable
-fun DawScreen(vm: DawViewModel, withMic: (() -> Unit) -> Unit, pickAudio: ((ImportedAudio) -> Unit) -> Unit) {
+fun DawScreen(
+    vm: DawViewModel,
+    withMic: (() -> Unit) -> Unit,
+    pickAudio: ((ImportedAudio) -> Unit) -> Unit,
+    exportActions: ExportActions,
+) {
     val density = LocalDensity.current.density
     LaunchedEffect(density) { vm.setDensity(density) }
     LaunchedEffect(Unit) {
@@ -123,6 +131,8 @@ fun DawScreen(vm: DawViewModel, withMic: (() -> Unit) -> Unit, pickAudio: ((Impo
     }
     vm.fxTarget?.let { FxDialog(vm, it) }
     vm.noteEditorItemId?.let { NoteEditor(vm, it) }
+    if (vm.showSongs) SongsDialog(vm)
+    if (vm.exportOpen) ExportDialog(vm, exportActions)
     vm.message?.let { msg ->
         LaunchedEffect(msg) {
             kotlinx.coroutines.delay(2500)
@@ -212,46 +222,54 @@ private fun EmptyHint() {
 @Composable
 private fun TransportBar(vm: DawViewModel, onRecordPressed: () -> Unit) {
     val recordingAny = vm.recording || vm.recordingMidi
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .height(60.dp)
-            .background(DawColors.Panel)
-            .padding(horizontal = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-    ) {
-        RoundButton(onClick = vm::rewind) { GlyphIcon(Glyph.Rewind, DawColors.TextPrimary, size = 18.dp) }
-        RoundButton(onClick = vm::stop) { GlyphIcon(Glyph.Stop, DawColors.TextPrimary, size = 20.dp) }
-        RoundButton(onClick = vm::togglePlay, active = vm.playing && !recordingAny, activeColor = DawColors.MeterGreen) {
-            GlyphIcon(if (vm.playing) Glyph.Pause else Glyph.Play, DawColors.TextPrimary)
-        }
-        RoundButton(onClick = onRecordPressed, active = recordingAny, activeColor = DawColors.Record) {
-            GlyphIcon(Glyph.Record, if (recordingAny) Color.White else DawColors.Record)
-        }
-        RoundButton(onClick = vm::toggleLoop, active = vm.project.loopOn, activeColor = DawColors.Loop) {
-            Text("⟳", color = DawColors.TextPrimary, fontSize = 20.sp)
-        }
-        TimeDisplay(vm)
-        TempoControl(vm)
-        RoundButton(onClick = vm::toggleMetronome, active = vm.settings.metronome, activeColor = DawColors.Accent) {
-            GlyphIcon(Glyph.Metronome, DawColors.TextPrimary, size = 20.dp)
-        }
-        // Switches between the timeline and the mixer, like REAPER's View > Mixer,
-        // or the pads and keys of an instrument.
-        RoundButton(onClick = { vm.showView(MainView.Mixer) }, active = vm.view == MainView.Mixer, activeColor = DawColors.Accent) {
-            Text("MIX", color = DawColors.TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-        }
-        RoundButton(onClick = { vm.showView(MainView.Play) }, active = vm.view == MainView.Play, activeColor = DawColors.Accent) {
-            GlyphIcon(Glyph.Pads, DawColors.TextPrimary, size = 20.dp)
-        }
+    // Smaller buttons on narrow phones, so the whole bar still fits.
+    BoxWithConstraints(Modifier.fillMaxWidth().height(60.dp).background(DawColors.Panel)) {
+        val compact = maxWidth < 860.dp
+        val button = if (compact) 36.dp else 40.dp
+        Row(
+            Modifier
+                .fillMaxSize()
+                .padding(horizontal = if (compact) 8.dp else 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 6.dp),
+        ) {
+            // "My Songs", like GarageBand's song browser.
+            RoundButton(onClick = vm::openSongs, size = button) { GlyphIcon(Glyph.Songs, DawColors.TextPrimary, size = 20.dp) }
+            RoundButton(onClick = vm::rewind, size = button) { GlyphIcon(Glyph.Rewind, DawColors.TextPrimary, size = 18.dp) }
+            RoundButton(onClick = vm::stop, size = button) { GlyphIcon(Glyph.Stop, DawColors.TextPrimary, size = 20.dp) }
+            RoundButton(onClick = vm::togglePlay, active = vm.playing && !recordingAny, activeColor = DawColors.MeterGreen, size = button) {
+                GlyphIcon(if (vm.playing) Glyph.Pause else Glyph.Play, DawColors.TextPrimary)
+            }
+            RoundButton(onClick = onRecordPressed, active = recordingAny, activeColor = DawColors.Record, size = button) {
+                GlyphIcon(Glyph.Record, if (recordingAny) Color.White else DawColors.Record)
+            }
+            RoundButton(onClick = vm::toggleLoop, active = vm.project.loopOn, activeColor = DawColors.Loop, size = button) {
+                Text("⟳", color = DawColors.TextPrimary, fontSize = 20.sp)
+            }
+            TimeDisplay(vm)
+            TempoControl(vm)
+            RoundButton(onClick = vm::toggleMetronome, active = vm.settings.metronome, activeColor = DawColors.Accent, size = button) {
+                GlyphIcon(Glyph.Metronome, DawColors.TextPrimary, size = 20.dp)
+            }
+            // Switches between the timeline and the mixer, like REAPER's View > Mixer,
+            // or the pads and keys of an instrument.
+            RoundButton(onClick = { vm.showView(MainView.Mixer) }, active = vm.view == MainView.Mixer, activeColor = DawColors.Accent, size = button) {
+                Text("MIX", color = DawColors.TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            }
+            RoundButton(onClick = { vm.showView(MainView.Play) }, active = vm.view == MainView.Play, activeColor = DawColors.Accent, size = button) {
+                GlyphIcon(Glyph.Pads, DawColors.TextPrimary, size = 20.dp)
+            }
 
-        Spacer(Modifier.weight(1f))
+            Spacer(Modifier.weight(1f))
 
-        vm.message?.let { Text(it, color = DawColors.Solo, fontSize = 12.sp, maxLines = 1) }
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (vm.recording || vm.samplingPad != null) LevelMeter(vm.inputLevel, Modifier.width(70.dp).height(8.dp), label = "IN")
-            LevelMeter(vm.masterLevel, Modifier.width(70.dp).height(8.dp), label = "OUT")
+            vm.message?.let { Text(it, color = DawColors.Solo, fontSize = 12.sp, maxLines = 1) }
+            // Export and share, like REAPER's Render and GarageBand's Share.
+            RoundButton(onClick = vm::openExport, size = button) { GlyphIcon(Glyph.Share, DawColors.TextPrimary, size = 20.dp) }
+            val meterWidth = if (compact) 56.dp else 70.dp
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (vm.recording || vm.samplingPad != null) LevelMeter(vm.inputLevel, Modifier.width(meterWidth).height(8.dp), label = "IN")
+                LevelMeter(vm.masterLevel, Modifier.width(meterWidth).height(8.dp), label = "OUT")
+            }
         }
     }
 }
@@ -332,11 +350,12 @@ private fun RoundButton(
     onClick: () -> Unit,
     active: Boolean = false,
     activeColor: Color = DawColors.Accent,
+    size: Dp = 40.dp,
     content: @Composable () -> Unit,
 ) {
     Box(
         Modifier
-            .size(40.dp)
+            .size(size)
             .clip(CircleShape)
             .background(if (active) activeColor.copy(alpha = 0.85f) else DawColors.PanelRaised)
             .clickable(onClick = onClick),

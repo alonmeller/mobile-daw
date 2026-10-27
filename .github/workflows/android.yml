@@ -21,7 +21,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Test effect and instrument DSP
+      - name: Test effect, instrument and render DSP
         run: |
           g++ -std=c++17 -O2 -Wall -Wextra -I app/src/main/cpp \
             app/src/test/cpp/effects_test.cpp app/src/main/cpp/Effects.cpp -o effects_test
@@ -29,6 +29,10 @@ jobs:
           g++ -std=c++17 -O2 -Wall -Wextra -I app/src/main/cpp \
             app/src/test/cpp/instruments_test.cpp app/src/main/cpp/Instruments.cpp -o instruments_test
           ./instruments_test
+          g++ -std=c++17 -O2 -Wall -Wextra -I app/src/main/cpp \
+            app/src/test/cpp/render_test.cpp app/src/main/cpp/Render.cpp app/src/main/cpp/Mixer.cpp \
+            app/src/main/cpp/Effects.cpp app/src/main/cpp/Instruments.cpp -o render_test
+          ./render_test
 
       - name: Build debug APK
         run: ./gradlew --no-daemon testDebugUnitTest assembleDebug

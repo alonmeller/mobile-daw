@@ -13,48 +13,9 @@
 
 #include "Effects.h"
 #include "Instruments.h"
+#include "Mixer.h"
+#include "Render.h"
 #include "RingBuffer.h"
-
-// A media item: a window [offset, offset + length) of a source placed at
-// `position` on the timeline, with fades and its own gain (REAPER-style).
-struct Item {
-    std::shared_ptr<const Samples> source;
-    int64_t position = 0;
-    int64_t offset = 0;
-    int64_t length = 0;
-    int64_t fadeIn = 0;
-    int64_t fadeOut = 0;
-    float gain = 1.0f;
-};
-
-struct EnvPoint {
-    int64_t frame = 0;
-    float value = 0.0f;
-};
-
-// Processing block size: items are mixed, FX run and envelopes are ramped
-// in blocks of at most this many frames.
-constexpr int kBlock = 256;
-
-struct TrackMix {
-    float gain = 1.0f;
-    float pan = 0.0f;
-    bool mute = false;
-    bool solo = false;
-    std::vector<Item> items;
-    std::vector<std::shared_ptr<Effect>> fx;  // pre-fader insert chain, as in REAPER
-    std::vector<EnvPoint> volumeEnv;          // multiplies the fader gain
-    std::vector<EnvPoint> panEnv;             // replaces the pan knob when present
-    // Instrument tracks: the instrument (shared with older snapshots so its
-    // voices survive edits), its pads and the MIDI notes, sorted by start.
-    std::shared_ptr<Instrument> instrument;
-    int64_t instrumentId = -1;
-    std::vector<PadConfig> pads;
-    std::vector<MidiNote> notes;
-    // Scratch buffers, allocated with the snapshot on the UI thread.
-    std::vector<float> left = std::vector<float>(kBlock);
-    std::vector<float> right = std::vector<float>(kBlock);
-};
 
 // A note played live from the UI (pads, keyboard); velocity 0 is a note off.
 struct LiveNote {
@@ -90,18 +51,6 @@ private:
     std::atomic<uint32_t> head_{0};
     std::atomic<uint32_t> tail_{0};
 };
-
-// Snapshot of everything the audio thread needs to render. The UI builds a
-// new one on every edit and swaps it in. Effects are shared with older
-// snapshots, so their state (reverb tails, delay lines) survives edits.
-struct Arrangement {
-    std::vector<TrackMix> tracks;
-    std::vector<std::shared_ptr<Effect>> masterFx;
-    float masterGain = 1.0f;
-    bool anySolo = false;
-};
-
-constexpr int kMaxMeters = 128;
 
 // Real-time multitrack engine: stereo output mixes the arrangement plus a
 // metronome; a separate mono input stream records new takes into sources.
@@ -162,6 +111,15 @@ public:
     // Plays a note now, transport running or not.
     void liveNote(int64_t instrumentId, int pitch, float velocity);
 
+    // Offline rendering ("Render to file"): renders a copy of the arrangement
+    // being played now, on the calling thread, while playback carries on.
+    RenderResult render(RenderJob job);
+    float renderProgress() const { return renderProgress_.load(); }
+    void cancelRender() { cancelRender_.store(true); }
+
+    // Forgets every source, effect and instrument, before another project opens.
+    void clearSession();
+
     // Metronome
     void setMetronome(bool enabled) { metronomeOn_.store(enabled); }
     void setTempo(double bpm) { tempo_.store(bpm); }
@@ -188,7 +146,6 @@ private:
     void drainLoop();
     void drainOnce();
     void renderSegment(float *out, int32_t numFrames, int64_t pos, bool playing);
-    void renderBlock(float *out, int numFrames, int64_t pos, bool playing);
     void renderMetronome(float *out, int32_t numFrames, int64_t pos);
     void applyLiveNotes();
 
@@ -212,9 +169,9 @@ private:
     std::mutex arrangementMutex_;
     std::unique_ptr<Arrangement> arrangement_ = std::make_unique<Arrangement>();
     std::array<std::atomic<float>, kMaxMeters> trackPeaks_{};
-    std::array<float, kBlock> mono_{};
-    std::array<float, kBlock> masterL_{};
-    std::array<float, kBlock> masterR_{};
+    Mixer mixer_;
+    std::atomic<float> renderProgress_{0.0f};
+    std::atomic<bool> cancelRender_{false};
 
     std::atomic<bool> playing_{false};
     // Audio thread only: how long to keep rendering after stop (FX tails and
