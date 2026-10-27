@@ -11,6 +11,12 @@ AudioEngine &engine() {
     if (!gEngine) gEngine = std::make_unique<AudioEngine>();
     return *gEngine;
 }
+
+jfloatArray toJava(JNIEnv *env, const std::vector<float> &values) {
+    jfloatArray result = env->NewFloatArray(static_cast<jsize>(values.size()));
+    env->SetFloatArrayRegion(result, 0, static_cast<jsize>(values.size()), values.data());
+    return result;
+}
 }  // namespace
 
 #define JNI_FN(name) Java_com_alonmeller_mobiledaw_audio_NativeEngine_##name
@@ -35,11 +41,13 @@ JNIEXPORT void JNICALL JNI_FN(seek)(JNIEnv *, jobject, jlong frame) { engine().s
 
 JNIEXPORT jlong JNICALL JNI_FN(position)(JNIEnv *, jobject) { return engine().position(); }
 
+JNIEXPORT void JNICALL JNI_FN(setLoop)(JNIEnv *, jobject, jlong start, jlong end, jboolean enabled) {
+    engine().setLoop(start, end, enabled);
+}
+
 JNIEXPORT jboolean JNICALL JNI_FN(startRecording)(JNIEnv *, jobject) { return engine().startRecording(); }
 
-JNIEXPORT jint JNICALL JNI_FN(stopRecording)(JNIEnv *, jobject, jint targetId) {
-    return engine().stopRecording(targetId);
-}
+JNIEXPORT jint JNICALL JNI_FN(stopRecording)(JNIEnv *, jobject) { return engine().stopRecording(); }
 
 JNIEXPORT jboolean JNICALL JNI_FN(isRecording)(JNIEnv *, jobject) { return engine().isRecording(); }
 
@@ -47,59 +55,75 @@ JNIEXPORT jlong JNICALL JNI_FN(recordedFrames)(JNIEnv *, jobject) { return engin
 
 JNIEXPORT jlong JNICALL JNI_FN(recordStartFrame)(JNIEnv *, jobject) { return engine().recordStartFrame(); }
 
+JNIEXPORT jlong JNICALL JNI_FN(lastTakeStart)(JNIEnv *, jobject) { return engine().lastTakeStart(); }
+
 JNIEXPORT jfloat JNICALL JNI_FN(inputLevel)(JNIEnv *, jobject) { return engine().inputLevel(); }
 
 JNIEXPORT jfloat JNICALL JNI_FN(masterPeak)(JNIEnv *, jobject) { return engine().masterPeak(); }
 
-JNIEXPORT jint JNICALL JNI_FN(addTrack)(JNIEnv *env, jobject, jfloatArray samples, jlong startFrame) {
+JNIEXPORT jint JNICALL JNI_FN(createSource)(JNIEnv *env, jobject, jfloatArray samples) {
     const jsize n = env->GetArrayLength(samples);
     jfloat *data = env->GetFloatArrayElements(samples, nullptr);
-    const int id = engine().addTrack(data, n, startFrame);
+    const int id = engine().createSource(data, n);
     env->ReleaseFloatArrayElements(samples, data, JNI_ABORT);
     return id;
 }
 
-JNIEXPORT void JNICALL JNI_FN(removeTrack)(JNIEnv *, jobject, jint id) { engine().removeTrack(id); }
+JNIEXPORT jlong JNICALL JNI_FN(sourceLength)(JNIEnv *, jobject, jint id) { return engine().sourceLength(id); }
 
-JNIEXPORT void JNICALL JNI_FN(setTrackGain)(JNIEnv *, jobject, jint id, jfloat gain) {
-    engine().setTrackGain(id, gain);
+JNIEXPORT jfloatArray JNICALL JNI_FN(sourcePeaks)(JNIEnv *env, jobject, jint id, jint framesPerBucket) {
+    return toJava(env, engine().sourcePeaks(id, framesPerBucket));
 }
 
-JNIEXPORT void JNICALL JNI_FN(setTrackPan)(JNIEnv *, jobject, jint id, jfloat pan) {
-    engine().setTrackPan(id, pan);
+JNIEXPORT jfloatArray JNICALL JNI_FN(sourceSamples)(JNIEnv *env, jobject, jint id) {
+    return toJava(env, engine().sourceSamples(id));
 }
 
-JNIEXPORT void JNICALL JNI_FN(setTrackMute)(JNIEnv *, jobject, jint id, jboolean mute) {
-    engine().setTrackMute(id, mute);
+// Tracks arrive flattened: trackParams holds [gain, pan, mute, solo] per track,
+// itemCounts the number of items per track, itemParams
+// [sourceId, position, offset, length, fadeIn, fadeOut] per item and
+// itemGains one gain per item.
+JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray trackParams,
+                                              jintArray itemCounts, jlongArray itemParams,
+                                              jfloatArray itemGains) {
+    const jsize numTracks = env->GetArrayLength(itemCounts);
+    jfloat *tp = env->GetFloatArrayElements(trackParams, nullptr);
+    jint *counts = env->GetIntArrayElements(itemCounts, nullptr);
+    jlong *ip = env->GetLongArrayElements(itemParams, nullptr);
+    jfloat *ig = env->GetFloatArrayElements(itemGains, nullptr);
+
+    auto arrangement = std::make_unique<Arrangement>();
+    arrangement->tracks.resize(static_cast<size_t>(numTracks));
+    size_t item = 0;
+    for (jsize t = 0; t < numTracks; ++t) {
+        TrackMix &mix = arrangement->tracks[static_cast<size_t>(t)];
+        mix.gain = tp[t * 4];
+        mix.pan = tp[t * 4 + 1];
+        mix.mute = tp[t * 4 + 2] > 0.5f;
+        mix.solo = tp[t * 4 + 3] > 0.5f;
+        mix.items.reserve(static_cast<size_t>(counts[t]));
+        for (jint i = 0; i < counts[t]; ++i, ++item) {
+            const jlong *p = ip + item * 6;
+            Item it;
+            it.source = engine().source(static_cast<int>(p[0]));
+            it.position = p[1];
+            it.offset = p[2];
+            it.length = p[3];
+            it.fadeIn = p[4];
+            it.fadeOut = p[5];
+            it.gain = ig[item];
+            mix.items.push_back(std::move(it));
+        }
+    }
+
+    env->ReleaseFloatArrayElements(trackParams, tp, JNI_ABORT);
+    env->ReleaseIntArrayElements(itemCounts, counts, JNI_ABORT);
+    env->ReleaseLongArrayElements(itemParams, ip, JNI_ABORT);
+    env->ReleaseFloatArrayElements(itemGains, ig, JNI_ABORT);
+    engine().setArrangement(std::move(arrangement));
 }
 
-JNIEXPORT void JNICALL JNI_FN(setTrackSolo)(JNIEnv *, jobject, jint id, jboolean solo) {
-    engine().setTrackSolo(id, solo);
-}
-
-JNIEXPORT void JNICALL JNI_FN(setTrackStart)(JNIEnv *, jobject, jint id, jlong startFrame) {
-    engine().setTrackStart(id, startFrame);
-}
-
-JNIEXPORT jlong JNICALL JNI_FN(trackLength)(JNIEnv *, jobject, jint id) { return engine().trackLength(id); }
-
-JNIEXPORT jlong JNICALL JNI_FN(trackStart)(JNIEnv *, jobject, jint id) { return engine().trackStart(id); }
-
-JNIEXPORT jfloat JNICALL JNI_FN(trackPeak)(JNIEnv *, jobject, jint id) { return engine().trackPeak(id); }
-
-JNIEXPORT jfloatArray JNICALL JNI_FN(trackPeaks)(JNIEnv *env, jobject, jint id, jint framesPerBucket) {
-    const auto peaks = engine().trackPeaks(id, framesPerBucket);
-    jfloatArray result = env->NewFloatArray(static_cast<jsize>(peaks.size()));
-    env->SetFloatArrayRegion(result, 0, static_cast<jsize>(peaks.size()), peaks.data());
-    return result;
-}
-
-JNIEXPORT jfloatArray JNICALL JNI_FN(trackSamples)(JNIEnv *env, jobject, jint id) {
-    const auto samples = engine().trackSamples(id);
-    jfloatArray result = env->NewFloatArray(static_cast<jsize>(samples.size()));
-    env->SetFloatArrayRegion(result, 0, static_cast<jsize>(samples.size()), samples.data());
-    return result;
-}
+JNIEXPORT jfloat JNICALL JNI_FN(trackPeak)(JNIEnv *, jobject, jint index) { return engine().trackPeak(index); }
 
 JNIEXPORT void JNICALL JNI_FN(setMetronome)(JNIEnv *, jobject, jboolean enabled) {
     engine().setMetronome(enabled);

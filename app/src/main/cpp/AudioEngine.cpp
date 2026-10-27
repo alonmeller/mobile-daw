@@ -108,6 +108,12 @@ void AudioEngine::setPlaying(bool playing) { playing_.store(playing); }
 
 void AudioEngine::seek(int64_t frame) { position_.store(std::max<int64_t>(0, frame)); }
 
+void AudioEngine::setLoop(int64_t start, int64_t end, bool enabled) {
+    loopStart_.store(std::max<int64_t>(0, start));
+    loopEnd_.store(std::max<int64_t>(0, end));
+    loopOn_.store(enabled && end > start);
+}
+
 bool AudioEngine::startRecording() {
     if (recording_.load()) return true;
     if (!openInput()) return false;
@@ -125,7 +131,7 @@ bool AudioEngine::startRecording() {
     return true;
 }
 
-int AudioEngine::stopRecording(int targetId) {
+int AudioEngine::stopRecording() {
     if (!recording_.load()) return -1;
     recording_.store(false);
     draining_.store(false);
@@ -155,22 +161,15 @@ int AudioEngine::stopRecording(int targetId) {
     }
     if (skip >= recordBuffer_.size()) return -1;
 
-    std::vector<float> take(recordBuffer_.begin() + static_cast<std::ptrdiff_t>(skip), recordBuffer_.end());
+    auto take = std::make_shared<Samples>(recordBuffer_.begin() + static_cast<std::ptrdiff_t>(skip),
+                                          recordBuffer_.end());
     recordBuffer_.clear();
     recordBuffer_.shrink_to_fit();
+    lastTakeStart_ = start;
 
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    if (auto *target = findTrack(targetId); target && target->samples.empty()) {
-        target->samples = std::move(take);
-        target->startFrame = start;
-        return targetId;
-    }
-    auto track = std::make_unique<Track>();
-    track->samples = std::move(take);
-    track->startFrame = start;
-    track->id = nextTrackId_++;
-    int id = track->id;
-    tracks_.push_back(std::move(track));
+    std::lock_guard<std::mutex> lock(sourcesMutex_);
+    const int id = nextSourceId_++;
+    sources_[id] = std::move(take);
     return id;
 }
 
@@ -200,94 +199,57 @@ oboe::DataCallbackResult AudioEngine::InputCallback::onAudioReady(oboe::AudioStr
     return oboe::DataCallbackResult::Continue;
 }
 
-Track *AudioEngine::findTrack(int id) {
-    for (auto &t : tracks_) {
-        if (t->id == id) return t.get();
-    }
-    return nullptr;
-}
-
-int AudioEngine::addTrack(const float *data, int64_t numFrames, int64_t startFrame) {
-    auto track = std::make_unique<Track>();
-    track->samples.assign(data, data + numFrames);
-    track->startFrame = startFrame;
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    track->id = nextTrackId_++;
-    int id = track->id;
-    tracks_.push_back(std::move(track));
+int AudioEngine::createSource(const float *data, int64_t numFrames) {
+    auto samples = std::make_shared<Samples>(data, data + numFrames);
+    std::lock_guard<std::mutex> lock(sourcesMutex_);
+    const int id = nextSourceId_++;
+    sources_[id] = std::move(samples);
     return id;
 }
 
-void AudioEngine::removeTrack(int id) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(),
-                                 [id](const std::unique_ptr<Track> &t) { return t->id == id; }),
-                  tracks_.end());
+std::shared_ptr<const Samples> AudioEngine::source(int id) {
+    std::lock_guard<std::mutex> lock(sourcesMutex_);
+    auto it = sources_.find(id);
+    return it == sources_.end() ? nullptr : it->second;
 }
 
-void AudioEngine::setTrackGain(int id, float gain) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    if (auto *t = findTrack(id)) t->gain.store(gain);
+int64_t AudioEngine::sourceLength(int id) {
+    auto s = source(id);
+    return s ? static_cast<int64_t>(s->size()) : 0;
 }
 
-void AudioEngine::setTrackPan(int id, float pan) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    if (auto *t = findTrack(id)) t->pan.store(std::clamp(pan, -1.0f, 1.0f));
-}
-
-void AudioEngine::setTrackMute(int id, bool mute) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    if (auto *t = findTrack(id)) t->mute.store(mute);
-}
-
-void AudioEngine::setTrackSolo(int id, bool solo) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    if (auto *t = findTrack(id)) t->solo.store(solo);
-}
-
-void AudioEngine::setTrackStart(int id, int64_t startFrame) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    if (auto *t = findTrack(id)) t->startFrame = std::max<int64_t>(0, startFrame);
-}
-
-int64_t AudioEngine::trackLength(int id) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    auto *t = findTrack(id);
-    return t ? static_cast<int64_t>(t->samples.size()) : 0;
-}
-
-int64_t AudioEngine::trackStart(int id) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    auto *t = findTrack(id);
-    return t ? t->startFrame : 0;
-}
-
-float AudioEngine::trackPeak(int id) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    auto *t = findTrack(id);
-    return t ? t->peak.load() : 0.0f;
-}
-
-std::vector<float> AudioEngine::trackPeaks(int id, int framesPerBucket) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
+std::vector<float> AudioEngine::sourcePeaks(int id, int framesPerBucket) {
     std::vector<float> peaks;
-    auto *t = findTrack(id);
-    if (!t || framesPerBucket <= 0) return peaks;
-    const size_t n = t->samples.size();
-    peaks.reserve(n / static_cast<size_t>(framesPerBucket) + 1);
-    for (size_t i = 0; i < n; i += static_cast<size_t>(framesPerBucket)) {
-        const size_t end = std::min(n, i + static_cast<size_t>(framesPerBucket));
+    auto s = source(id);
+    if (!s || framesPerBucket <= 0) return peaks;
+    const size_t n = s->size();
+    const auto step = static_cast<size_t>(framesPerBucket);
+    peaks.reserve(n / step + 1);
+    for (size_t i = 0; i < n; i += step) {
+        const size_t end = std::min(n, i + step);
         float p = 0.0f;
-        for (size_t j = i; j < end; ++j) p = std::max(p, std::fabs(t->samples[j]));
+        for (size_t j = i; j < end; ++j) p = std::max(p, std::fabs((*s)[j]));
         peaks.push_back(p);
     }
     return peaks;
 }
 
-std::vector<float> AudioEngine::trackSamples(int id) {
-    std::lock_guard<std::mutex> lock(tracksMutex_);
-    auto *t = findTrack(id);
-    return t ? t->samples : std::vector<float>();
+std::vector<float> AudioEngine::sourceSamples(int id) {
+    auto s = source(id);
+    return s ? *s : std::vector<float>();
+}
+
+void AudioEngine::setArrangement(std::unique_ptr<Arrangement> arrangement) {
+    arrangement->anySolo = false;
+    for (auto &t : arrangement->tracks) arrangement->anySolo = arrangement->anySolo || t.solo;
+    std::lock_guard<std::mutex> lock(arrangementMutex_);
+    // The old arrangement is destroyed here on the UI thread, never on the audio thread.
+    arrangement_.swap(arrangement);
+}
+
+float AudioEngine::trackPeak(int index) const {
+    if (index < 0 || index >= kMaxMeters) return 0.0f;
+    return trackPeaks_[static_cast<size_t>(index)].load();
 }
 
 void AudioEngine::renderMetronome(float *out, int32_t numFrames, int64_t pos) {
@@ -306,42 +268,74 @@ void AudioEngine::renderMetronome(float *out, int32_t numFrames, int64_t pos) {
     }
 }
 
+namespace {
+inline float smooth(float x) { return x * x * (3.0f - 2.0f * x); }
+}  // namespace
+
+void AudioEngine::renderSegment(float *out, int32_t numFrames, int64_t pos) {
+    const Arrangement &arr = *arrangement_;
+    const int64_t segEnd = pos + numFrames;
+    for (size_t ti = 0; ti < arr.tracks.size(); ++ti) {
+        const TrackMix &t = arr.tracks[ti];
+        if (t.mute || (arr.anySolo && !t.solo)) continue;
+        const float angle = (t.pan + 1.0f) * kPi * 0.25f;
+        const float left = t.gain * std::cos(angle) * 1.41421356f;
+        const float right = t.gain * std::sin(angle) * 1.41421356f;
+        float peak = 0.0f;
+        for (const Item &item : t.items) {
+            if (!item.source) continue;
+            const int64_t from = std::max(pos, item.position);
+            const int64_t to = std::min(segEnd, item.position + item.length);
+            if (from >= to) continue;
+            const auto &src = *item.source;
+            const auto srcLen = static_cast<int64_t>(src.size());
+            for (int64_t f = from; f < to; ++f) {
+                const int64_t local = f - item.position;
+                const int64_t idx = item.offset + local;
+                if (idx < 0 || idx >= srcLen) continue;
+                float g = item.gain;
+                if (local < item.fadeIn) g *= smooth(static_cast<float>(local) / static_cast<float>(item.fadeIn));
+                const int64_t remain = item.length - local;
+                if (remain < item.fadeOut) g *= smooth(static_cast<float>(remain) / static_cast<float>(item.fadeOut));
+                const float s = src[static_cast<size_t>(idx)] * g;
+                peak = std::max(peak, std::fabs(s * t.gain));
+                const auto i = static_cast<size_t>(f - pos);
+                out[2 * i] += s * left;
+                out[2 * i + 1] += s * right;
+            }
+        }
+        if (ti < kMaxMeters) trackPeaks_[ti].store(std::max(trackPeaks_[ti].load(), peak));
+    }
+    if (metronomeOn_.load()) renderMetronome(out, numFrames, pos);
+}
+
 oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *audioData, int32_t numFrames) {
     auto *out = static_cast<float *>(audioData);
     std::fill(out, out + numFrames * 2, 0.0f);
 
     if (playing_.load()) {
-        const int64_t pos = position_.load();
-        // Never block the audio thread: if the UI is editing the track list
-        // right now, skip this buffer's track mix.
-        std::unique_lock<std::mutex> lock(tracksMutex_, std::try_to_lock);
-        if (lock.owns_lock()) {
-            bool anySolo = false;
-            for (auto &t : tracks_) anySolo = anySolo || t->solo.load();
-            for (auto &t : tracks_) {
-                if (t->mute.load() || (anySolo && !t->solo.load())) {
-                    t->peak.store(0.0f);
-                    continue;
-                }
-                const float gain = t->gain.load();
-                const float angle = (t->pan.load() + 1.0f) * kPi * 0.25f;
-                const float left = gain * std::cos(angle) * 1.41421356f;
-                const float right = gain * std::sin(angle) * 1.41421356f;
-                const int64_t len = static_cast<int64_t>(t->samples.size());
-                float peak = 0.0f;
-                for (int32_t i = 0; i < numFrames; ++i) {
-                    const int64_t idx = pos + i - t->startFrame;
-                    if (idx < 0 || idx >= len) continue;
-                    const float s = t->samples[static_cast<size_t>(idx)];
-                    peak = std::max(peak, std::fabs(s * gain));
-                    out[2 * i] += s * left;
-                    out[2 * i + 1] += s * right;
-                }
-                t->peak.store(peak);
+        for (auto &p : trackPeaks_) p.store(0.0f);
+        int64_t pos = position_.load();
+        // Never block the audio thread: if the UI is swapping the arrangement
+        // right now, skip this buffer's mix (a single ~2 ms gap at worst).
+        std::unique_lock<std::mutex> lock(arrangementMutex_, std::try_to_lock);
+        const bool loop = loopOn_.load() && !recording_.load();
+        const int64_t loopStart = loopStart_.load();
+        const int64_t loopEnd = loopEnd_.load();
+        int32_t done = 0;
+        while (done < numFrames) {
+            int32_t count = numFrames - done;
+            if (loop && pos < loopEnd) count = static_cast<int32_t>(std::min<int64_t>(count, loopEnd - pos));
+            if (lock.owns_lock()) {
+                renderSegment(out + 2 * done, count, pos);
+            } else if (metronomeOn_.load()) {
+                renderMetronome(out + 2 * done, count, pos);
             }
+            pos += count;
+            done += count;
+            if (loop && pos >= loopEnd) pos = loopStart;
         }
-        if (metronomeOn_.load()) renderMetronome(out, numFrames, pos);
-        position_.store(pos + numFrames);
+        position_.store(pos);
     }
 
     float master = 0.0f;

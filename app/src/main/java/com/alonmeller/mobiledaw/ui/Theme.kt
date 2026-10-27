@@ -20,6 +20,8 @@ object DawColors {
     val Playhead = Color(0xFFFFFFFF)
     val Mute = Color(0xFFFF9F0A)
     val Solo = Color(0xFFFFD60A)
+    val Loop = Color(0xFF30B0C7)
+    val Marker = Color(0xFFFF9F0A)
     val Lcd = Color(0xFF0E1A14)
     val LcdText = Color(0xFF7CFFB2)
     val MeterGreen = Color(0xFF30D158)
