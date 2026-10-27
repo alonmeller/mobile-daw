@@ -9,25 +9,28 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitHorizontalTouchSlopOrCancellation
 import androidx.compose.foundation.gestures.awaitTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.awaitVerticalTouchSlopOrCancellation
 import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.verticalDrag
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -50,26 +53,32 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.alonmeller.mobiledaw.DawViewModel
@@ -78,6 +87,7 @@ import com.alonmeller.mobiledaw.PEAK_BUCKET
 import com.alonmeller.mobiledaw.SourceInfo
 import com.alonmeller.mobiledaw.TrackKind
 import com.alonmeller.mobiledaw.data.ImportedAudio
+import com.alonmeller.mobiledaw.model.EffectType
 import com.alonmeller.mobiledaw.model.EnvKind
 import com.alonmeller.mobiledaw.model.FIRST_PAD_NOTE
 import com.alonmeller.mobiledaw.model.InstrumentType
@@ -90,13 +100,14 @@ import com.alonmeller.mobiledaw.model.Takes
 import com.alonmeller.mobiledaw.model.Track
 import kotlin.math.floor
 import kotlin.math.max
+import kotlin.math.roundToInt
 
-private val HeaderWidth = 204.dp
+private val HeaderWidth = 212.dp
 private val TrackHeight = 92.dp
-private val RulerHeight = 34.dp
-/** Room an item leaves above and below it in its lane, and the height of its title strip. */
+private val RulerHeight = 30.dp
+/** Room an item leaves above and below it in its lane, and the height of its name bar. */
 private val ItemPad = 4.dp
-private val ItemTitle = 14.dp
+private val ItemTitle = 15.dp
 
 /**
  * The whole app. [withMic] runs an action once the microphone may be used,
@@ -121,20 +132,23 @@ fun DawScreen(
 
     // Kept here so the track list stays where it was after a visit to the mixer.
     val trackScroll = rememberScrollState()
-    Column(
+    Box(
         Modifier
             .fillMaxSize()
             .background(DawColors.Background)
     ) {
-        TransportBar(vm, withMic) {
-            // Recording notes needs no microphone.
-            if (vm.recording || vm.recordingMidi || vm.recordsMidi) vm.toggleRecord() else withMic(vm::toggleRecord)
+        Column(Modifier.fillMaxSize()) {
+            TransportBar(vm, withMic) {
+                // Recording notes needs no microphone.
+                if (vm.recording || vm.recordingMidi || vm.recordsMidi) vm.toggleRecord() else withMic(vm::toggleRecord)
+            }
+            when (vm.view) {
+                MainView.Mixer -> MixerView(vm, Modifier.fillMaxSize())
+                MainView.Play -> PlayView(vm, withMic, pickAudio, Modifier.fillMaxSize())
+                MainView.Arrange -> ArrangeView(vm, trackScroll, pickAudio, withMic)
+            }
         }
-        when (vm.view) {
-            MainView.Mixer -> MixerView(vm, Modifier.fillMaxSize())
-            MainView.Play -> PlayView(vm, withMic, pickAudio, Modifier.fillMaxSize())
-            MainView.Arrange -> ArrangeView(vm, trackScroll, pickAudio, withMic)
-        }
+        vm.message?.let { Toast(it, Modifier.align(Alignment.BottomCenter).padding(start = 24.dp, end = 24.dp, bottom = 18.dp)) }
     }
     vm.fxTarget?.let { FxDialog(vm, it) }
     vm.routingTrackId?.let { RoutingDialog(vm, it) }
@@ -175,12 +189,15 @@ private fun ArrangeView(
             Column(Modifier.fillMaxSize().verticalScroll(trackScroll)) {
                 val tracks = vm.project.tracks
                 val hidden = vm.hiddenTracks
+                val buses = busIds(tracks)
                 var shown = 0
                 tracks.forEachIndexed { index, track ->
                     // Tracks in a collapsed folder are hidden, as in REAPER, unless a take is going into one.
                     if (track.id in hidden && !vm.isRecordingInto(track)) return@forEachIndexed
                     val row = shown++
-                    key(track.id) { TrackRow(vm, track, row, folder = Routing.isFolder(tracks, index), withMic = withMic) }
+                    key(track.id) {
+                        TrackRow(vm, track, row, folder = Routing.isFolder(tracks, index), bus = track.id in buses, withMic = withMic)
+                    }
                 }
                 if (vm.recording && vm.project.tracks.none { vm.isRecordingInto(it) }) {
                     RecordingRow(vm, vm.project.tracks.size)
@@ -191,22 +208,20 @@ private fun ArrangeView(
     }
 }
 
-/** "+ Track" with a choice of track, like GarageBand's instrument browser. */
+/** "+ Track" with a choice of track, like GarageBand's "Choose a track type". */
 @Composable
 private fun AddTrackButton(vm: DawViewModel, pickAudio: ((ImportedAudio) -> Unit) -> Unit) {
     var open by remember { mutableStateOf(false) }
-    Box {
-        Row(
-            Modifier
-                .padding(start = 8.dp)
-                .clip(RoundedCornerShape(6.dp))
-                .background(DawColors.PanelRaised)
-                .clickable(enabled = !vm.recording && !vm.recordingMidi) { open = true }
-                .padding(horizontal = 10.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
+    Box(Modifier.padding(start = 8.dp)) {
+        ToolButton(
+            onClick = { open = true },
+            modifier = Modifier.height(24.dp),
+            enabled = !vm.recording && !vm.recordingMidi,
         ) {
-            Text("+", color = DawColors.TextPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-            Text("  Track", color = DawColors.TextPrimary, fontSize = 13.sp)
+            Row(Modifier.padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                GlyphIcon(Glyph.Plus, DawColors.TextPrimary, size = 12.dp)
+                Text(" Track", color = DawColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            }
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             val add = { kind: TrackKind ->
@@ -228,7 +243,13 @@ private fun AddTrackButton(vm: DawViewModel, pickAudio: ((ImportedAudio) -> Unit
 
 @Composable
 private fun EmptyHint() {
-    Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) {
+    Column(
+        Modifier.fillMaxWidth().height(220.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        InstrumentTile(Glyph.Microphone, DawColors.track(DawColors.AUDIO_COLOR), 64.dp)
+        Spacer(Modifier.height(14.dp))
         Text(
             "לחץ על כפתור ההקלטה האדום כדי להקליט קול,\nאו על \"+ Track\" כדי להוסיף תופים או סינתיסייזר",
             color = DawColors.TextSecondary,
@@ -238,72 +259,242 @@ private fun EmptyHint() {
     }
 }
 
-// ---------------------------------------------------------------- Transport
+/** Tracks that other tracks send to, or that hold only a reverb or delay: the effect buses. */
+internal fun busIds(tracks: List<Track>): Set<Long> =
+    tracks.flatMap { t -> t.sends.map { it.target } }.toSet() +
+        tracks.filter { t ->
+            t.instrument == null && t.items.isEmpty() && t.fx.any { it.type == EffectType.REVERB || it.type == EffectType.DELAY }
+        }.map { it.id }
 
+/** The picture on a track's tile, as GarageBand shows each track's instrument. */
+internal fun trackGlyph(track: Track, folder: Boolean, bus: Boolean) = when {
+    folder -> Glyph.Stack
+    track.instrument?.type == InstrumentType.DRUMS -> Glyph.Drums
+    track.instrument != null -> Glyph.Keys
+    bus -> Glyph.Bus
+    else -> Glyph.Microphone
+}
+
+// ---------------------------------------------------------------- Control bar
+
+/**
+ * GarageBand's control bar: the song list and the views on the left, the
+ * transport, the display and the metronome in the middle, settings, export
+ * and the levels on the right. Every button shrinks together on narrower
+ * phones, so the whole bar always fits.
+ */
 @Composable
 private fun TransportBar(vm: DawViewModel, withMic: (() -> Unit) -> Unit, onRecordPressed: () -> Unit) {
     val recordingAny = vm.recording || vm.recordingMidi
-    // Smaller buttons on narrow phones, so the whole bar still fits.
-    BoxWithConstraints(Modifier.fillMaxWidth().height(60.dp).background(DawColors.Panel)) {
-        val compact = maxWidth < 860.dp
-        val button = if (compact) 34.dp else 40.dp
+    BoxWithConstraints(
+        Modifier
+            .fillMaxWidth()
+            .height(56.dp)
+            .background(DawColors.bar)
+            .drawBehind { drawLine(Color.Black, Offset(0f, size.height - 0.5f), Offset(size.width, size.height - 0.5f), 1f) }
+    ) {
+        val wide = maxWidth >= 860.dp
+        val lcdWidth = when {
+            wide -> 216.dp
+            maxWidth >= 760.dp -> 188.dp
+            else -> 150.dp
+        }
+        val meterWidth = if (maxWidth >= 760.dp) 56.dp else 40.dp
+        val pad = if (wide) 12.dp else 8.dp
+        val gap = if (wide) 8.dp else 6.dp
+        // 13 buttons share what the display, the meters and the gaps leave.
+        val seg = ((maxWidth - pad * 2 - gap * 7 - lcdWidth - meterWidth) / 13).coerceIn(30.dp, 44.dp)
+        val h = (seg - 4.dp).coerceIn(32.dp, 40.dp)
         Row(
             Modifier
                 .fillMaxSize()
-                .padding(horizontal = if (compact) 8.dp else 12.dp),
+                .padding(horizontal = pad),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(if (compact) 3.dp else 6.dp),
         ) {
             // "My Songs", like GarageBand's song browser.
-            RoundButton(onClick = vm::openSongs, size = button) { GlyphIcon(Glyph.Songs, DawColors.TextPrimary, size = 20.dp) }
-            RoundButton(onClick = vm::rewind, size = button) { GlyphIcon(Glyph.Rewind, DawColors.TextPrimary, size = 18.dp) }
-            RoundButton(onClick = vm::stop, size = button) { GlyphIcon(Glyph.Stop, DawColors.TextPrimary, size = 20.dp) }
-            RoundButton(onClick = vm::togglePlay, active = vm.playing && !recordingAny, activeColor = DawColors.MeterGreen, size = button) {
-                GlyphIcon(if (vm.playing) Glyph.Pause else Glyph.Play, DawColors.TextPrimary)
+            ToolButton(onClick = vm::openSongs, modifier = Modifier.size(seg, h)) {
+                GlyphIcon(Glyph.Songs, DawColors.TextPrimary, size = 20.dp)
             }
-            RoundButton(onClick = onRecordPressed, active = recordingAny, activeColor = DawColors.Record, size = button) {
-                GlyphIcon(Glyph.Record, if (recordingAny) Color.White else DawColors.Record)
+            Spacer(Modifier.width(gap))
+            // The tracks, the mixer (REAPER's View > Mixer), or the pads and keys of an instrument.
+            ToolGroup(Modifier.height(h)) {
+                ViewSegment(vm, MainView.Arrange, Glyph.Tracks, seg, first = true)
+                ViewSegment(vm, MainView.Mixer, Glyph.Mixer, seg)
+                ViewSegment(vm, MainView.Play, Glyph.Keys, seg)
             }
-            RoundButton(onClick = vm::toggleLoop, active = vm.project.loopOn, activeColor = DawColors.Loop, size = button) {
-                Text("⟳", color = DawColors.TextPrimary, fontSize = 20.sp)
-            }
-            TimeDisplay(vm)
-            TempoControl(vm)
-            RoundButton(onClick = vm::toggleMetronome, active = vm.settings.metronome, activeColor = DawColors.Accent, size = button) {
-                GlyphIcon(Glyph.Metronome, DawColors.TextPrimary, size = 20.dp)
-            }
-            RecordSettingsButton(vm, withMic, button)
-            // Switches between the timeline and the mixer, like REAPER's View > Mixer,
-            // or the pads and keys of an instrument.
-            RoundButton(onClick = { vm.showView(MainView.Mixer) }, active = vm.view == MainView.Mixer, activeColor = DawColors.Accent, size = button) {
-                Text("MIX", color = DawColors.TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-            }
-            RoundButton(onClick = { vm.showView(MainView.Play) }, active = vm.view == MainView.Play, activeColor = DawColors.Accent, size = button) {
-                GlyphIcon(Glyph.Pads, DawColors.TextPrimary, size = 20.dp)
-            }
-
             Spacer(Modifier.weight(1f))
-
-            vm.message?.let { Text(it, color = DawColors.Solo, fontSize = 12.sp, maxLines = 1) }
-            // Export and share, like REAPER's Render and GarageBand's Share.
-            RoundButton(onClick = vm::openExport, size = button) { GlyphIcon(Glyph.Share, DawColors.TextPrimary, size = 20.dp) }
-            val meterWidth = if (compact) 56.dp else 70.dp
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                if (vm.recording || vm.samplingPad != null || vm.monitoringLive) {
-                    LevelMeter(vm.inputLevel, Modifier.width(meterWidth).height(8.dp), label = "IN")
+            ToolGroup(Modifier.height(h)) {
+                ToolSegment(seg, onClick = vm::rewind, first = true) { GlyphIcon(Glyph.Rewind, DawColors.TextPrimary, size = 18.dp) }
+                ToolSegment(seg, onClick = vm::stop) { GlyphIcon(Glyph.Stop, DawColors.TextPrimary, size = 18.dp) }
+                val playing = vm.playing && !recordingAny
+                ToolSegment(seg, onClick = vm::togglePlay, active = playing, activeColor = DawColors.Play) {
+                    GlyphIcon(if (vm.playing) Glyph.Pause else Glyph.Play, toolColor(playing, DawColors.Play), size = 20.dp)
                 }
-                LevelMeter(vm.masterLevel, Modifier.width(meterWidth).height(8.dp), label = "OUT")
+                ToolSegment(seg, onClick = onRecordPressed, active = recordingAny, activeColor = DawColors.Record) {
+                    GlyphIcon(Glyph.Record, if (recordingAny) DawColors.tint(DawColors.Record, 0.25f) else DawColors.Record, size = 22.dp)
+                }
+                // The cycle area turns yellow, as in GarageBand.
+                ToolSegment(seg, onClick = vm::toggleLoop, active = vm.project.loopOn, activeColor = DawColors.Loop) {
+                    GlyphIcon(Glyph.Cycle, toolColor(vm.project.loopOn, DawColors.Loop), size = 22.dp)
+                }
+            }
+            Spacer(Modifier.width(gap))
+            Lcd(vm, showTime = lcdWidth > 160.dp, modifier = Modifier.width(lcdWidth).height(h + 4.dp))
+            Spacer(Modifier.width(gap))
+            // Count-in and metronome sit by the display, as in GarageBand. The cog has the 2-bar count-in.
+            ToolGroup(Modifier.height(h)) {
+                val countIn = vm.settings.countInBars > 0
+                ToolSegment(seg, onClick = { vm.setCountIn(if (countIn) 0 else 1) }, active = countIn, first = true) {
+                    Text(
+                        "1234",
+                        color = toolColor(countIn, DawColors.Accent),
+                        fontSize = if (seg < 38.dp) 10.sp else 11.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+                ToolSegment(seg, onClick = vm::toggleMetronome, active = vm.settings.metronome) {
+                    GlyphIcon(Glyph.Metronome, toolColor(vm.settings.metronome, DawColors.Accent), size = 20.dp)
+                }
+            }
+            Spacer(Modifier.weight(1f))
+            RecordSettingsButton(vm, withMic, Modifier.size(seg, h))
+            Spacer(Modifier.width(gap))
+            // Export and share, like REAPER's Render and GarageBand's Share.
+            ToolButton(onClick = vm::openExport, modifier = Modifier.size(seg, h)) {
+                GlyphIcon(Glyph.Share, DawColors.TextPrimary, size = 20.dp)
+            }
+            Spacer(Modifier.width(gap))
+            val labels = meterWidth > 50.dp
+            Column(Modifier.width(meterWidth), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                if (vm.recording || vm.samplingPad != null || vm.monitoringLive) {
+                    LevelMeter(vm.inputLevel, Modifier.fillMaxWidth().height(12.dp), label = if (labels) "IN" else null)
+                }
+                LevelMeter(vm.masterLevel, Modifier.fillMaxWidth().height(12.dp), label = if (labels) "OUT" else null)
             }
         }
     }
 }
 
+@Composable
+private fun RowScope.ViewSegment(vm: DawViewModel, view: MainView, glyph: Glyph, width: Dp, first: Boolean = false) {
+    val on = vm.view == view
+    ToolSegment(width, onClick = { if (!on) vm.showView(view) }, active = on, first = first) {
+        GlyphIcon(glyph, toolColor(on, DawColors.Accent), size = 20.dp)
+    }
+}
+
+/** Digits that keep their width, so the display does not jiggle as they change. */
+private val LcdDigits = TextStyle(fontFeatureSettings = "tnum")
+
+/**
+ * GarageBand's display: bar and beat, the time and the tempo, light on dark.
+ * During a count-in it counts the beats down in red instead.
+ */
+@Composable
+private fun Lcd(vm: DawViewModel, showTime: Boolean, modifier: Modifier) {
+    val seconds = vm.position.toDouble() / vm.sampleRate
+    val beats = seconds * vm.project.tempo / 60.0
+    val bar = floor(beats / 4).toInt() + 1
+    val beat = floor(beats % 4).toInt() + 1
+    val countIn = vm.countInBeats
+    val shape = RoundedCornerShape(8.dp)
+    BoxWithConstraints(
+        modifier
+            .clip(shape)
+            .background(Brush.verticalGradient(listOf(Color(0xFF0B0B0D), DawColors.Lcd, Color(0xFF1B1B1F))))
+            .border(1.dp, Color.Black, shape),
+    ) {
+        val digits = if (maxWidth < 200.dp) 16.sp else 18.sp
+        Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+            if (countIn > 0) {
+                LcdField("$countIn", "COUNT-IN", Modifier.weight(1.25f), digits, DawColors.Record)
+            } else {
+                LcdField("$bar", "BAR", Modifier.weight(0.7f), digits)
+                LcdField("$beat", "BEAT", Modifier.weight(0.55f), digits)
+            }
+            LcdDivider()
+            if (showTime) {
+                val minutes = (seconds / 60).toInt()
+                LcdField("%d:%04.1f".format(minutes, seconds % 60), "TIME", Modifier.weight(1.25f), digits)
+                LcdDivider()
+            }
+            TempoField(vm, digits, Modifier.weight(0.9f))
+        }
+    }
+}
+
+@Composable
+private fun LcdDivider() {
+    Box(Modifier.padding(vertical = 7.dp).width(1.dp).fillMaxHeight().background(Color(0xFF2E2E33)))
+}
+
+@Composable
+private fun LcdField(value: String, label: String, modifier: Modifier, digits: TextUnit, color: Color = DawColors.LcdText) {
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(value, color = color, fontSize = digits, fontWeight = FontWeight.SemiBold, maxLines = 1, style = LcdDigits)
+        Text(label, color = DawColors.LcdLabel, fontSize = 8.sp, fontWeight = FontWeight.Medium, maxLines = 1, letterSpacing = 0.6.sp)
+    }
+}
+
+/** The tempo on the display: drag it up or down to change it, as in GarageBand, or tap it to type one. */
+@Composable
+private fun TempoField(vm: DawViewModel, digits: TextUnit, modifier: Modifier) {
+    var typing by remember { mutableStateOf(false) }
+    val latestVm by rememberUpdatedState(vm)
+    val step = with(LocalDensity.current) { 6.dp.toPx() }
+    Box(
+        modifier
+            .fillMaxHeight()
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val start = latestVm.project.tempo
+                    val slop = awaitVerticalTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
+                        ?: return@awaitEachGesture
+                    fun moveTo(y: Float) = latestVm.dragTempo(start + ((down.position.y - y) / step).roundToInt())
+                    moveTo(slop.position.y)
+                    verticalDrag(slop.id) { change ->
+                        moveTo(change.position.y)
+                        change.consume()
+                    }
+                    latestVm.endGesture()
+                }
+            }
+            .pointerInput(Unit) { detectTapGestures(onTap = { typing = true }) },
+        contentAlignment = Alignment.Center,
+    ) {
+        LcdField("${vm.project.tempo.roundToInt()}", "TEMPO", Modifier, digits)
+    }
+    if (typing) {
+        var text by remember { mutableStateOf(vm.project.tempo.roundToInt().toString()) }
+        AlertDialog(
+            onDismissRequest = { typing = false },
+            title = { Text("Tempo (BPM)") },
+            text = {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.filter(Char::isDigit).take(3) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    typing = false
+                    text.toIntOrNull()?.let { vm.setTempo(it.toDouble()) }
+                }) { Text("OK") }
+            },
+            dismissButton = { TextButton(onClick = { typing = false }) { Text("Cancel") } },
+        )
+    }
+}
+
 /** Recording settings, as in REAPER's record and metronome options: the count-in, takes and hearing yourself. */
 @Composable
-private fun RecordSettingsButton(vm: DawViewModel, withMic: (() -> Unit) -> Unit, size: Dp) {
+private fun RecordSettingsButton(vm: DawViewModel, withMic: (() -> Unit) -> Unit, modifier: Modifier) {
     var open by remember { mutableStateOf(false) }
     Box {
-        RoundButton(onClick = { open = true }, size = size) { GlyphIcon(Glyph.Settings, DawColors.TextPrimary, size = 20.dp) }
+        ToolButton(onClick = { open = true }, modifier = modifier) { GlyphIcon(Glyph.Settings, DawColors.TextPrimary, size = 20.dp) }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             val s = vm.settings
             fun mark(on: Boolean) = if (on) "✓  " else "     "
@@ -342,206 +533,82 @@ private fun MenuHeading(text: String) {
     )
 }
 
-/** Second toolbar with REAPER's everyday item edits. */
+/** REAPER's everyday item edits, grouped in black bubbles like GarageBand's edit menu. */
 @Composable
 private fun EditBar(vm: DawViewModel) {
     val hasSelection = vm.selectedItems.isNotEmpty()
     Row(
         Modifier
             .fillMaxWidth()
-            .height(44.dp)
+            .height(42.dp)
             .background(DawColors.Background)
             .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 8.dp),
+            .padding(horizontal = 8.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        EditButton("↶ Undo", enabled = vm.canUndo, onClick = vm::undo)
-        EditButton("↷ Redo", enabled = vm.canRedo, onClick = vm::redo)
-        Divider()
+        MenuGroup {
+            MenuAction("↶ Undo", enabled = vm.canUndo, first = true, onClick = vm::undo)
+            MenuAction("↷ Redo", enabled = vm.canRedo, onClick = vm::redo)
+        }
         // The takes of the selected item, as in REAPER: hear each one, then keep the best.
         vm.selectedTakesItem?.let { item ->
-            EditButton("◀") { vm.stepTake(-1) }
-            Text(
-                "Take ${Takes.active(item) + 1}/${Takes.count(item)}",
-                color = DawColors.TextPrimary,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
-            )
-            EditButton("▶") { vm.stepTake(1) }
-            EditButton("Delete take", onClick = vm::deleteTake)
-            EditButton("Keep only this take", onClick = vm::cropTake)
-            Divider()
+            MenuGroup {
+                MenuAction("◀", first = true) { vm.stepTake(-1) }
+                MenuAction("Take ${Takes.active(item) + 1}/${Takes.count(item)}", bold = true, onClick = null)
+                MenuAction("▶") { vm.stepTake(1) }
+                MenuAction("Delete take", onClick = vm::deleteTake)
+                MenuAction("Keep only this take", onClick = vm::cropTake)
+            }
         }
-        EditButton("✂ Split", onClick = vm::splitAtPlayhead)
-        EditButton("⧉ Duplicate", enabled = hasSelection, onClick = vm::duplicateSelected)
-        EditButton("Copy", enabled = hasSelection, onClick = vm::copySelected)
-        EditButton("Paste", onClick = vm::paste)
-        EditButton("Delete", enabled = hasSelection, onClick = vm::deleteSelected)
-        EditButton("Mute item", enabled = hasSelection, onClick = vm::toggleMuteSelected)
-        EditButton("Normalize", enabled = hasSelection, onClick = vm::normalizeSelected)
-        EditButton("↑ Track", enabled = hasSelection) { vm.moveSelectedToTrack(-1) }
-        EditButton("↓ Track", enabled = hasSelection) { vm.moveSelectedToTrack(1) }
-        Divider()
+        MenuGroup {
+            MenuAction("Split", first = true, onClick = vm::splitAtPlayhead)
+            MenuAction("Duplicate", enabled = hasSelection, onClick = vm::duplicateSelected)
+            MenuAction("Copy", enabled = hasSelection, onClick = vm::copySelected)
+            MenuAction("Paste", onClick = vm::paste)
+            MenuAction("Delete", enabled = hasSelection, onClick = vm::deleteSelected)
+            MenuAction("Mute item", enabled = hasSelection, onClick = vm::toggleMuteSelected)
+            MenuAction("Normalize", enabled = hasSelection, onClick = vm::normalizeSelected)
+            MenuAction("↑ Track", enabled = hasSelection) { vm.moveSelectedToTrack(-1) }
+            MenuAction("↓ Track", enabled = hasSelection) { vm.moveSelectedToTrack(1) }
+        }
         // MIDI: a new pattern on an instrument track, and the piano roll for the selected one.
         val midiItem = vm.selectedMidiItem
-        EditButton("+ Pattern", enabled = vm.project.tracks.any { it.id == vm.selectedTrackId && it.instrument != null }, onClick = vm::addPattern)
-        EditButton("✎ Notes", enabled = midiItem != null) { midiItem?.let { vm.openNoteEditor(it.id) } }
-        Divider()
-        EditButton("Snap", active = vm.settings.snap, onClick = vm::toggleSnap)
-        EditButton("Grid " + gridLabel(vm.settings.gridDivision), onClick = vm::cycleGrid)
-        Divider()
-        EditButton("+ Marker", onClick = vm::addMarker)
-        EditButton("◀ Marker") { vm.jumpMarker(forward = false) }
-        EditButton("Marker ▶") { vm.jumpMarker(forward = true) }
-        Divider()
-        EditButton("Zoom −") { vm.zoom(1f / 1.5f) }
-        EditButton("Zoom +") { vm.zoom(1.5f) }
+        MenuGroup {
+            MenuAction(
+                "+ Pattern",
+                enabled = vm.project.tracks.any { it.id == vm.selectedTrackId && it.instrument != null },
+                first = true,
+                onClick = vm::addPattern,
+            )
+            MenuAction("Notes", enabled = midiItem != null) { midiItem?.let { vm.openNoteEditor(it.id) } }
+        }
+        MenuGroup {
+            MenuAction("Snap", active = vm.settings.snap, first = true, onClick = vm::toggleSnap)
+            MenuAction("Grid " + gridLabel(vm.settings.gridDivision), onClick = vm::cycleGrid)
+        }
+        MenuGroup {
+            MenuAction("+ Marker", first = true, onClick = vm::addMarker)
+            MenuAction("◀ Marker") { vm.jumpMarker(forward = false) }
+            MenuAction("Marker ▶") { vm.jumpMarker(forward = true) }
+        }
+        MenuGroup {
+            MenuAction("Zoom −", first = true) { vm.zoom(1f / 1.5f) }
+            MenuAction("Zoom +") { vm.zoom(1.5f) }
+        }
     }
 }
 
 private fun gridLabel(division: Int) = if (division == 1) "1 bar" else "1/$division"
 
-@Composable
-private fun Divider() {
-    Box(Modifier.width(1.dp).height(24.dp).background(DawColors.PanelRaised))
-}
-
-@Composable
-private fun EditButton(label: String, enabled: Boolean = true, active: Boolean = false, onClick: () -> Unit) {
-    Box(
-        Modifier
-            .height(32.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(if (active) DawColors.Accent else DawColors.Panel)
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 12.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            label,
-            color = if (enabled) DawColors.TextPrimary else DawColors.TextSecondary.copy(alpha = 0.5f),
-            fontSize = 13.sp,
-            maxLines = 1,
-        )
-    }
-}
-
-@Composable
-private fun RoundButton(
-    onClick: () -> Unit,
-    active: Boolean = false,
-    activeColor: Color = DawColors.Accent,
-    size: Dp = 40.dp,
-    content: @Composable () -> Unit,
-) {
-    Box(
-        Modifier
-            .size(size)
-            .clip(CircleShape)
-            .background(if (active) activeColor.copy(alpha = 0.85f) else DawColors.PanelRaised)
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) { content() }
-}
-
-@Composable
-private fun TimeDisplay(vm: DawViewModel) {
-    val seconds = vm.position.toDouble() / vm.sampleRate
-    val beats = seconds * vm.project.tempo / 60.0
-    val bar = floor(beats / 4).toInt() + 1
-    val beat = floor(beats % 4).toInt() + 1
-    val sixteenth = floor((beats % 1.0) * 4).toInt() + 1
-    val minutes = (seconds / 60).toInt()
-    val secs = seconds % 60
-    val countIn = vm.countInBeats
-    Column(
-        Modifier
-            .clip(RoundedCornerShape(8.dp))
-            .background(DawColors.Lcd)
-            .border(1.dp, DawColors.PanelRaised, RoundedCornerShape(8.dp))
-            .padding(horizontal = 10.dp, vertical = 3.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text(
-            // The same width as the position, so the bar does not jump.
-            if (countIn > 0) "%-9s%2d".format("COUNT-IN", countIn) else "%3d . %d . %d".format(bar, beat, sixteenth),
-            color = if (countIn > 0) DawColors.Record else DawColors.LcdText,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.Bold,
-            fontSize = 17.sp,
-        )
-        Text(
-            "%02d:%05.2f".format(minutes, secs),
-            color = DawColors.LcdText.copy(alpha = 0.7f),
-            fontFamily = FontFamily.Monospace,
-            fontSize = 11.sp,
-        )
-    }
-}
-
-@Composable
-private fun TempoControl(vm: DawViewModel) {
-    var typing by remember { mutableStateOf(false) }
-    Row(
-        Modifier
-            .clip(RoundedCornerShape(8.dp))
-            .background(DawColors.PanelRaised),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        SmallTextButton("−") { vm.changeTempo(-1.0) }
-        // Tap the number to type a tempo.
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.width(52.dp).clickable { typing = true },
-        ) {
-            Text("${vm.project.tempo.toInt()}", color = DawColors.TextPrimary, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-            Text("BPM", color = DawColors.TextSecondary, fontSize = 9.sp)
-        }
-        SmallTextButton("+") { vm.changeTempo(1.0) }
-    }
-    if (typing) {
-        var text by remember { mutableStateOf(vm.project.tempo.toInt().toString()) }
-        AlertDialog(
-            onDismissRequest = { typing = false },
-            title = { Text("Tempo (BPM)") },
-            text = {
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it.filter(Char::isDigit).take(3) },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    typing = false
-                    text.toIntOrNull()?.let { vm.setTempo(it.toDouble()) }
-                }) { Text("OK") }
-            },
-            dismissButton = { TextButton(onClick = { typing = false }) { Text("Cancel") } },
-        )
-    }
-}
-
-@Composable
-private fun SmallTextButton(text: String, onClick: () -> Unit) {
-    Box(
-        Modifier
-            .size(width = 30.dp, height = 42.dp)
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) { Text(text, color = DawColors.TextPrimary, fontSize = 20.sp) }
-}
-
-/** Horizontal peak meter on the faders' dB scale. */
+/** Horizontal peak meter on the faders' dB scale, at most 7dp thick, with an optional [label] before it. */
 @Composable
 internal fun LevelMeter(level: Float, modifier: Modifier, label: String? = null) {
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
         if (label != null) {
-            Text(label, color = DawColors.TextSecondary, fontSize = 9.sp, modifier = Modifier.width(22.dp))
+            Text(label, color = DawColors.TextSecondary, fontSize = 9.sp, maxLines = 1, modifier = Modifier.width(22.dp))
         }
-        Canvas(Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(3.dp))) {
+        Canvas(Modifier.weight(1f).heightIn(max = 7.dp).fillMaxHeight().clip(RoundedCornerShape(3.dp))) {
             drawMeter(level, Offset.Zero, size, vertical = false)
         }
     }
@@ -611,6 +678,9 @@ private suspend fun PointerInputScope.detectEnvelopeDrag(
 
 // ---------------------------------------------------------------- Ruler
 
+/** Height of the band along the top of the ruler that holds the cycle area and the markers. */
+private val CycleBand = 11.dp
+
 @Composable
 private fun Ruler(vm: DawViewModel, modifier: Modifier) {
     val latestVm by rememberUpdatedState(vm)
@@ -638,51 +708,48 @@ private fun Ruler(vm: DawViewModel, modifier: Modifier) {
             }
     ) {
         val p = vm.project
-        // Loop range
+        val band = CycleBand.toPx()
+        // The cycle area: a yellow bar along the top, gray while the cycle is off, as in GarageBand.
         if (p.loopEnd > p.loopStart) {
             val lx0 = vm.screenX(p.loopStart)
             val lx1 = vm.screenX(p.loopEnd)
-            val color = if (p.loopOn) DawColors.Loop else DawColors.TextSecondary
-            drawRect(color.copy(alpha = 0.35f), Offset(lx0, 0f), Size(lx1 - lx0, size.height * 0.4f))
+            val color = if (p.loopOn) DawColors.Loop else Color(0xFF5C5C62)
+            drawRoundRect(color, Offset(lx0, 1.dp.toPx()), Size(lx1 - lx0, band - 1.dp.toPx()), CornerRadius(3.dp.toPx()))
         }
 
         val beatPx = vm.framesToPx(vm.framesPerBeat.toLong()).coerceAtLeast(0.001f)
         val barPx = beatPx * 4
-        val labelEvery = max(1, (60.dp.toPx() / barPx).toInt() + 1)
+        val labelEvery = max(1, (40.dp.toPx() / barPx).toInt() + 1)
+        val numbers = textPaint(11.dp.toPx(), android.graphics.Color.rgb(0xC7, 0xC7, 0xCC), bold = false)
         var bar = floor(vm.scrollPx / barPx).toInt()
         while (true) {
             val x = bar * barPx - vm.scrollPx
             if (x > size.width) break
-            drawLine(DawColors.TextSecondary, Offset(x, size.height * 0.5f), Offset(x, size.height), 1.dp.toPx())
+            drawLine(DawColors.TextSecondary, Offset(x, band + 1.dp.toPx()), Offset(x, size.height), 1.dp.toPx())
             if (beatPx > 8.dp.toPx()) {
                 for (b in 1..3) {
                     val bx = x + b * beatPx
-                    drawLine(DawColors.GridBar, Offset(bx, size.height * 0.78f), Offset(bx, size.height), 1.dp.toPx())
+                    drawLine(DawColors.GridBar, Offset(bx, size.height * 0.75f), Offset(bx, size.height), 1.dp.toPx())
                 }
             }
             if (bar % labelEvery == 0) {
-                drawContext.canvas.nativeCanvas.drawText(
-                    "${bar + 1}",
-                    x + 4.dp.toPx(),
-                    size.height * 0.72f,
-                    textPaint(11.dp.toPx(), android.graphics.Color.rgb(0xC7, 0xC7, 0xCC), bold = false),
-                )
+                drawContext.canvas.nativeCanvas.drawText("${bar + 1}", x + 4.dp.toPx(), band + 12.dp.toPx(), numbers)
             }
             bar++
         }
 
-        // Markers as small flags along the top
+        // Markers: orange tags with their names, along the top.
+        val tag = textPaint(8.5.dp.toPx(), android.graphics.Color.BLACK, bold = true)
         p.markers.forEach { m ->
             val x = vm.screenX(m.position)
-            if (x < -20f || x > size.width) return@forEach
+            if (x < -60.dp.toPx() || x > size.width) return@forEach
             drawLine(DawColors.Marker, Offset(x, 0f), Offset(x, size.height), 1.5.dp.toPx())
-            drawRoundRect(DawColors.Marker, Offset(x, 0f), Size(16.dp.toPx(), 13.dp.toPx()), CornerRadius(3.dp.toPx()))
-            drawContext.canvas.nativeCanvas.drawText(
-                m.name, x + 3.dp.toPx(), 10.dp.toPx(),
-                textPaint(9.dp.toPx(), android.graphics.Color.BLACK, bold = true),
-            )
+            val w = tag.measureText(m.name) + 8.dp.toPx()
+            drawRoundRect(DawColors.Marker, Offset(x, 0f), Size(w, band), CornerRadius(3.dp.toPx()))
+            drawContext.canvas.nativeCanvas.drawText(m.name, x + 4.dp.toPx(), band - 2.5.dp.toPx(), tag)
         }
-        drawPlayhead(vm, triangle = true)
+        drawLine(Color.Black, Offset(0f, size.height - 0.5f), Offset(size.width, size.height - 0.5f), 1f)
+        drawPlayhead(vm, head = true)
     }
 }
 
@@ -697,19 +764,23 @@ internal fun textPaint(textSize: Float, color: Int, bold: Boolean): android.grap
         }
     }
 
-private fun DrawScope.drawPlayhead(vm: DawViewModel, triangle: Boolean = false) {
+/** The playhead's line; in the ruler it gets GarageBand's head, a white tab with a point. */
+private fun DrawScope.drawPlayhead(vm: DawViewModel, head: Boolean = false) {
     val x = vm.screenX(vm.position)
-    if (x < 0 || x > size.width) return
+    val w = 6.dp.toPx()
+    if (x < -w || x > size.width + w) return
     val color = if (vm.recording || vm.recordingMidi) DawColors.Record else DawColors.Playhead
     drawLine(color, Offset(x, 0f), Offset(x, size.height), 1.5.dp.toPx())
-    if (triangle) {
-        val s = 6.dp.toPx()
+    if (head) {
         val path = Path().apply {
-            moveTo(x - s, size.height - s * 1.4f)
-            lineTo(x + s, size.height - s * 1.4f)
-            lineTo(x, size.height)
+            moveTo(x - w, 0f)
+            lineTo(x + w, 0f)
+            lineTo(x + w, 8.dp.toPx())
+            lineTo(x, 14.dp.toPx())
+            lineTo(x - w, 8.dp.toPx())
             close()
         }
+        drawPath(path, Color.Black.copy(alpha = 0.4f), style = Stroke(2.dp.toPx()))
         drawPath(path, color)
     }
 }
@@ -718,7 +789,7 @@ private fun DrawScope.drawGrid(vm: DawViewModel) {
     val p = vm.project
     if (p.loopOn && p.loopEnd > p.loopStart) {
         val lx0 = vm.screenX(p.loopStart)
-        drawRect(DawColors.Loop.copy(alpha = 0.07f), Offset(lx0, 0f), Size(vm.screenX(p.loopEnd) - lx0, size.height))
+        drawRect(DawColors.Loop.copy(alpha = 0.05f), Offset(lx0, 0f), Size(vm.screenX(p.loopEnd) - lx0, size.height))
     }
     val beatPx = vm.framesToPx(vm.framesPerBeat.toLong()).coerceAtLeast(0.001f)
     if (beatPx < 4f) return
@@ -738,11 +809,14 @@ private fun DrawScope.drawGrid(vm: DawViewModel) {
 
 // ---------------------------------------------------------------- Tracks
 
-/** [row] counts the tracks shown, for the lanes' alternating shades; [folder] is true when tracks play into this one. */
+/**
+ * [row] counts the tracks shown, for the lanes' alternating shades; [folder] is true when tracks play
+ * into this one, and [bus] when it is an effect bus.
+ */
 @Composable
-private fun TrackRow(vm: DawViewModel, track: Track, row: Int, folder: Boolean, withMic: (() -> Unit) -> Unit) {
+private fun TrackRow(vm: DawViewModel, track: Track, row: Int, folder: Boolean, bus: Boolean, withMic: (() -> Unit) -> Unit) {
     Row(Modifier.fillMaxWidth().height(TrackHeight)) {
-        TrackHeader(vm, track, folder, withMic)
+        TrackHeader(vm, track, folder, bus, withMic)
         TrackLane(vm, track, row, Modifier.weight(1f).fillMaxHeight())
     }
     Box(Modifier.fillMaxWidth().height(1.dp).background(Color.Black))
@@ -752,12 +826,17 @@ private fun TrackRow(vm: DawViewModel, track: Track, row: Int, folder: Boolean, 
 private val FolderStep = 10.dp
 private const val MAX_SHOWN_DEPTH = 3
 
+/**
+ * A track header in GarageBand's style: the instrument's tile, the name,
+ * mute, solo and record buttons, and a volume slider with its level meter.
+ * Tapping an instrument's tile opens its pads or keys, as in GarageBand.
+ */
 @Composable
-private fun TrackHeader(vm: DawViewModel, track: Track, folder: Boolean, withMic: (() -> Unit) -> Unit) {
+private fun TrackHeader(vm: DawViewModel, track: Track, folder: Boolean, bus: Boolean, withMic: (() -> Unit) -> Unit) {
     val color = DawColors.track(track.colorIndex)
-    var menuOpen by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
     val selected = vm.selectedTrackId == track.id
+    val armed = vm.armedTrackId == track.id
     val envKind = vm.envModes[track.id]
     Row(
         Modifier
@@ -775,71 +854,61 @@ private fun TrackHeader(vm: DawViewModel, track: Track, folder: Boolean, withMic
                     .background(DawColors.Background)
             )
         }
-        Box(Modifier.width(5.dp).fillMaxHeight().background(color))
         Column(
-            Modifier.padding(horizontal = 8.dp, vertical = 6.dp).fillMaxSize(),
+            Modifier.padding(start = 6.dp, end = 4.dp, top = 6.dp, bottom = 5.dp).fillMaxSize(),
             verticalArrangement = Arrangement.SpaceBetween,
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (folder) {
-                    // A folder: show or hide its tracks.
-                    Box(
-                        Modifier
-                            .size(width = 22.dp, height = 24.dp)
-                            .clip(RoundedCornerShape(5.dp))
-                            .background(DawColors.Background)
-                            .clickable { vm.toggleCollapsed(track.id) },
-                        contentAlignment = Alignment.Center,
-                    ) { Text(if (track.collapsed) "▸" else "▾", color = DawColors.TextPrimary, fontSize = 14.sp) }
-                    Spacer(Modifier.width(4.dp))
+            Row(Modifier.height(48.dp)) {
+                val open: (() -> Unit)? = when {
+                    track.instrument != null -> { { vm.openPlay(track.id) } }
+                    folder -> { { vm.toggleCollapsed(track.id) } }
+                    else -> null
                 }
-                Text(
-                    track.name,
-                    color = DawColors.TextPrimary,
-                    fontSize = 13.sp,
-                    fontWeight = if (folder) FontWeight.Bold else FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                ToggleChip("R", vm.armedTrackId == track.id, DawColors.Record) { vm.toggleArm(track.id) }
-                Spacer(Modifier.width(4.dp))
-                ToggleChip("M", track.mute, DawColors.Mute) { vm.toggleMute(track.id) }
-                Spacer(Modifier.width(4.dp))
-                ToggleChip("S", track.solo, DawColors.Solo) { vm.toggleSolo(track.id) }
-                Box {
-                    Box(
-                        Modifier.size(width = 22.dp, height = 24.dp).clickable { menuOpen = true },
-                        contentAlignment = Alignment.Center,
-                    ) { Text("⋮", color = DawColors.TextSecondary, fontSize = 16.sp) }
-                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        val close = { menuOpen = false }
-                        MenuItem("Rename track") { close(); renaming = true }
-                        MenuItem("Routing and sends…") { close(); vm.openRouting(track.id) }
-                        MenuItem("Duplicate track") { close(); vm.duplicateTrack(track.id) }
-                        MenuItem("Move track up") { close(); vm.moveTrack(track.id, -1) }
-                        MenuItem("Move track down") { close(); vm.moveTrack(track.id, 1) }
-                        MenuItem("Put in a new folder") { close(); vm.newFolder(track.id) }
-                        if (vm.canIndent(track.id)) {
-                            MenuItem("Move into the track above (folder)") { close(); vm.indentTrack(track.id) }
+                InstrumentTile(trackGlyph(track, folder, bus), color, 48.dp, onClick = open)
+                Spacer(Modifier.width(6.dp))
+                Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.SpaceBetween) {
+                    Row(Modifier.fillMaxWidth().height(22.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (folder) {
+                            // A folder: show or hide its tracks.
+                            Text(
+                                if (track.collapsed) "▸" else "▾",
+                                color = DawColors.TextPrimary,
+                                fontSize = 14.sp,
+                                modifier = Modifier.clickable { vm.toggleCollapsed(track.id) }.padding(end = 4.dp),
+                            )
                         }
-                        if (track.indent > 0) {
-                            MenuItem("Move out of folder") { close(); vm.outdentTrack(track.id) }
+                        Text(
+                            track.name,
+                            color = DawColors.TextPrimary,
+                            fontSize = 13.sp,
+                            fontWeight = if (folder) FontWeight.Bold else FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TrackMenu(vm, track, folder, onRename = { renaming = true })
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                        IconToggle(Glyph.Speaker, track.mute, DawColors.Mute) { vm.toggleMute(track.id) }
+                        IconToggle(Glyph.Headphones, track.solo, DawColors.Solo) { vm.toggleSolo(track.id) }
+                        IconToggle(Glyph.Record, armed, DawColors.Record, offColor = DawColors.shade(DawColors.Record, 0.3f)) {
+                            vm.toggleArm(track.id)
                         }
-                        if (track.volumeEnv.isNotEmpty()) {
-                            MenuItem("Clear volume automation") { close(); vm.clearEnvelope(track.id, EnvKind.Volume) }
-                        }
-                        if (track.panEnv.isNotEmpty()) {
-                            MenuItem("Clear pan automation") { close(); vm.clearEnvelope(track.id, EnvKind.Pan) }
-                        }
-                        MenuItem(if (folder) "Delete folder track (keeps its tracks)" else "Delete track") {
-                            close()
-                            vm.deleteTrack(track.id)
+                        if (armed && track.instrument == null) {
+                            // Hear yourself through this track (REAPER's record monitoring): orange when heard,
+                            // gray while it waits for headphones.
+                            IconToggle(
+                                Glyph.Monitor,
+                                vm.settings.monitoring,
+                                if (vm.monitoringLive) DawColors.Monitor else Color(0xFF8E8E93),
+                            ) {
+                                if (vm.settings.monitoring) vm.toggleMonitoring() else withMic(vm::toggleMonitoring)
+                            }
                         }
                     }
                 }
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().height(24.dp), verticalAlignment = Alignment.CenterVertically) {
                 MiniSlider(
                     position = Scales.gainToPosition(track.gain),
                     color = color,
@@ -849,36 +918,19 @@ private fun TrackHeader(vm: DawViewModel, track: Track, folder: Boolean, withMic
                         vm.setTrackGain(track.id, 1f)
                         vm.endGesture()
                     },
-                    modifier = Modifier.weight(1f).height(26.dp),
+                    level = vm.trackLevels[track.id] ?: 0f,
+                    modifier = Modifier.weight(1f).fillMaxHeight(),
                 )
                 Text(
                     Scales.gainLabel(track.gain).removeSuffix(" dB"),
                     color = DawColors.TextSecondary,
                     fontSize = 10.sp,
                     textAlign = TextAlign.End,
-                    modifier = Modifier.width(34.dp),
+                    maxLines = 1,
+                    modifier = Modifier.width(30.dp).padding(end = 3.dp),
                 )
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                LevelMeter(vm.trackLevels[track.id] ?: 0f, Modifier.weight(1f).height(6.dp))
-                Spacer(Modifier.width(6.dp))
-                if (vm.armedTrackId == track.id && track.instrument == null) {
-                    // Hear yourself through this track (REAPER's record monitoring): green when heard, yellow while
-                    // waiting for headphones.
-                    GlyphChip(Glyph.Headphones, vm.settings.monitoring, if (vm.monitoringLive) DawColors.MeterGreen else DawColors.Solo, Modifier.width(30.dp)) {
-                        if (vm.settings.monitoring) vm.toggleMonitoring() else withMic(vm::toggleMonitoring)
-                    }
-                    Spacer(Modifier.width(4.dp))
-                }
-                track.instrument?.let { inst ->
-                    // Opens the instrument's pads or keys.
-                    LabelChip(if (inst.type == InstrumentType.DRUMS) "PADS" else "KEYS", true, color, Modifier.width(40.dp)) {
-                        vm.openPlay(track.id)
-                    }
-                    Spacer(Modifier.width(4.dp))
-                }
-                LabelChip("FX", track.fx.isNotEmpty(), DawColors.Accent, Modifier.width(32.dp)) { vm.openFx(track.id) }
-                Spacer(Modifier.width(4.dp))
+                LabelChip("FX", track.fx.isNotEmpty(), DawColors.Accent, Modifier.width(28.dp)) { vm.openFx(track.id) }
+                Spacer(Modifier.width(3.dp))
                 // Automation: off, then the volume envelope, then the pan envelope.
                 val hasAutomation = track.volumeEnv.isNotEmpty() || track.panEnv.isNotEmpty()
                 LabelChip(
@@ -889,7 +941,7 @@ private fun TrackHeader(vm: DawViewModel, track: Track, folder: Boolean, withMic
                     },
                     envKind != null,
                     envKind?.let(::envelopeColor) ?: DawColors.Accent,
-                    Modifier.width(38.dp),
+                    Modifier.width(32.dp),
                 ) { vm.cycleEnvelope(track.id) }
             }
         }
@@ -903,6 +955,43 @@ private fun TrackHeader(vm: DawViewModel, track: Track, folder: Boolean, withMic
                 vm.renameTrack(track.id, it)
             },
         )
+    }
+}
+
+/** The ⋮ menu of a track: what REAPER's track context menu offers. */
+@Composable
+private fun TrackMenu(vm: DawViewModel, track: Track, folder: Boolean, onRename: () -> Unit) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Box {
+        Box(
+            Modifier.size(width = 22.dp, height = 22.dp).clickable { menuOpen = true },
+            contentAlignment = Alignment.Center,
+        ) { Text("⋮", color = DawColors.TextSecondary, fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            val close = { menuOpen = false }
+            MenuItem("Rename track") { close(); onRename() }
+            MenuItem("Routing and sends…") { close(); vm.openRouting(track.id) }
+            MenuItem("Duplicate track") { close(); vm.duplicateTrack(track.id) }
+            MenuItem("Move track up") { close(); vm.moveTrack(track.id, -1) }
+            MenuItem("Move track down") { close(); vm.moveTrack(track.id, 1) }
+            MenuItem("Put in a new folder") { close(); vm.newFolder(track.id) }
+            if (vm.canIndent(track.id)) {
+                MenuItem("Move into the track above (folder)") { close(); vm.indentTrack(track.id) }
+            }
+            if (track.indent > 0) {
+                MenuItem("Move out of folder") { close(); vm.outdentTrack(track.id) }
+            }
+            if (track.volumeEnv.isNotEmpty()) {
+                MenuItem("Clear volume automation") { close(); vm.clearEnvelope(track.id, EnvKind.Volume) }
+            }
+            if (track.panEnv.isNotEmpty()) {
+                MenuItem("Clear pan automation") { close(); vm.clearEnvelope(track.id, EnvKind.Pan) }
+            }
+            MenuItem(if (folder) "Delete folder track (keeps its tracks)" else "Delete track") {
+                close()
+                vm.deleteTrack(track.id)
+            }
+        }
     }
 }
 
@@ -923,45 +1012,29 @@ private fun RenameDialog(initial: String, onDismiss: () -> Unit, onRename: (Stri
     )
 }
 
+/** Text that reads on [background]: black on light colors, white on dark ones. */
+internal fun textOn(background: Color) = if (background.luminance() > 0.5f) Color.Black else Color.White
+
+/** A small labeled toggle: a raised gray button, filled with [onColor] when on. */
 @Composable
 internal fun LabelChip(label: String, on: Boolean, onColor: Color, modifier: Modifier, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(6.dp)
     Box(
         modifier
             .height(24.dp)
-            .clip(RoundedCornerShape(5.dp))
-            .background(if (on) onColor else DawColors.Background)
+            .clip(shape)
+            .background(if (on) SolidColor(onColor) else DawColors.button)
+            .border(1.dp, DawColors.Separator, shape)
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Text(label, color = if (on) Color.Black else DawColors.TextSecondary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-    }
-}
-
-@Composable
-private fun GlyphChip(glyph: Glyph, on: Boolean, onColor: Color, modifier: Modifier, onClick: () -> Unit) {
-    Box(
-        modifier
-            .height(24.dp)
-            .clip(RoundedCornerShape(5.dp))
-            .background(if (on) onColor else DawColors.Background)
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) {
-        GlyphIcon(glyph, if (on) Color.Black else DawColors.TextSecondary, size = 16.dp)
-    }
-}
-
-@Composable
-internal fun ToggleChip(label: String, on: Boolean, onColor: Color, onClick: () -> Unit) {
-    Box(
-        Modifier
-            .size(24.dp)
-            .clip(RoundedCornerShape(5.dp))
-            .background(if (on) onColor else DawColors.Background)
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(label, color = if (on) Color.Black else DawColors.TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Text(
+            label,
+            color = if (on) textOn(onColor) else DawColors.TextPrimary.copy(alpha = 0.75f),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+        )
     }
 }
 
@@ -972,9 +1045,14 @@ private fun TrackLane(vm: DawViewModel, track: Track, index: Int, modifier: Modi
     val color = DawColors.track(track.colorIndex)
     // With an envelope shown, touches edit its points instead of the items, as in REAPER's envelope lanes.
     val envKind = vm.envModes[track.id]
+    val lane = when {
+        vm.selectedTrackId == track.id -> DawColors.LaneSelected
+        index % 2 == 0 -> DawColors.Lane
+        else -> DawColors.LaneAlt
+    }
     Canvas(
         modifier
-            .background(if (index % 2 == 0) DawColors.Lane else DawColors.LaneAlt)
+            .background(lane)
             .pointerInput(track.id, envKind) {
                 if (envKind == null) {
                     var draggingItem = false
@@ -1010,12 +1088,12 @@ private fun TrackLane(vm: DawViewModel, track: Track, index: Int, modifier: Modi
                             if (hit != null) {
                                 val item = hit.first
                                 val selected = item.id in latestVm.selectedItems
-                                val lane = if (selected) takeLaneAt(item, pos.y, h) else null
+                                val takeLane = if (selected) takeLaneAt(item, pos.y, h) else null
                                 when {
                                     // Tapping a selected MIDI item again opens its notes.
                                     item.isMidi && selected -> latestVm.openNoteEditor(item.id)
                                     // Tapping a take's lane in a selected item plays that take, as in REAPER.
-                                    lane != null -> latestVm.selectTake(item.id, lane)
+                                    takeLane != null -> latestVm.selectTake(item.id, takeLane)
                                     else -> latestVm.selectItem(item.id, latestTrack.id)
                                 }
                             } else {
@@ -1036,7 +1114,7 @@ private fun TrackLane(vm: DawViewModel, track: Track, index: Int, modifier: Modi
             if (item.isMidi) {
                 drawMidiItem(vm, item, track, color, item.id in vm.selectedItems)
             } else {
-                drawItem(vm, item, vm.sources, color, item.id in vm.selectedItems, track.mute)
+                drawItem(vm, item, track, vm.sources, color, item.id in vm.selectedItems)
             }
         }
         if (vm.isRecordingInto(track)) {
@@ -1095,14 +1173,12 @@ private fun DrawScope.drawEnvelope(vm: DawViewModel, track: Track, kind: EnvKind
 @Composable
 private fun RecordingRow(vm: DawViewModel, index: Int) {
     Row(Modifier.fillMaxWidth().height(TrackHeight)) {
-        Box(
-            Modifier.width(HeaderWidth).fillMaxHeight().background(DawColors.Panel),
-            contentAlignment = Alignment.CenterStart,
+        Row(
+            Modifier.width(HeaderWidth).fillMaxHeight().background(DawColors.Panel).padding(start = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 12.dp)) {
-                Box(Modifier.size(10.dp).clip(CircleShape).background(DawColors.Record))
-                Text("  Recording…", color = DawColors.TextPrimary, fontSize = 13.sp)
-            }
+            InstrumentTile(Glyph.Microphone, DawColors.Record, 48.dp)
+            Text("  Recording…", color = DawColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
         }
         Canvas(
             Modifier
@@ -1117,7 +1193,7 @@ private fun RecordingRow(vm: DawViewModel, index: Int) {
     }
 }
 
-/** While recording: a red box over what this take has covered, from the loop start once it has gone round. */
+/** While recording: a red region over what this take has covered, from the loop start once it has gone round. */
 private fun DrawScope.drawRecording(vm: DawViewModel) {
     // Counting in: nothing is on the timeline yet.
     if (vm.countInBeats > 0) return
@@ -1127,17 +1203,9 @@ private fun DrawScope.drawRecording(vm: DawViewModel) {
     val w = vm.screenX(vm.position) - x0
     if (w <= 0f) return
     val pad = ItemPad.toPx()
-    drawRoundRect(
-        DawColors.Record.copy(alpha = 0.45f), Offset(x0, pad), Size(w, size.height - pad * 2),
-        CornerRadius(6.dp.toPx()),
-    )
     // Each pass round the loop is a take of its own.
-    if (looped && w > 50.dp.toPx()) {
-        drawContext.canvas.nativeCanvas.drawText(
-            "Take ${vm.recordPasses}", max(x0, 0f) + 6.dp.toPx(), pad + 12.dp.toPx(),
-            textPaint(11.dp.toPx(), android.graphics.Color.WHITE, bold = true),
-        )
-    }
+    val name = if (looped) "Recording · Take ${vm.recordPasses}" else "Recording"
+    drawRegion(x0, pad, w, size.height - pad * 2, DawColors.Record, 0.85f, selected = false, name = name)
 }
 
 /** While notes are recorded: a red band over what this pass has covered. */
@@ -1151,6 +1219,39 @@ private fun DrawScope.drawMidiRecording(vm: DawViewModel) {
 }
 
 /**
+ * A region as GarageBand draws one: a rounded block in the track's color
+ * with a darker name bar along its top. A selected region is lighter.
+ */
+private fun DrawScope.drawRegion(
+    x0: Float,
+    top: Float,
+    width: Float,
+    height: Float,
+    color: Color,
+    alpha: Float,
+    selected: Boolean,
+    name: String?,
+    nameInset: Float = 0f,
+) {
+    val radius = CornerRadius(5.dp.toPx())
+    val titleH = ItemTitle.toPx()
+    val body = if (selected) DawColors.tint(color, 0.18f) else color
+    drawRoundRect(body.copy(alpha = alpha), Offset(x0, top), Size(width, height), radius)
+    val bar = DawColors.shade(color, if (selected) 0.12f else 0.28f).copy(alpha = alpha)
+    drawRoundRect(bar, Offset(x0, top), Size(width, titleH), radius)
+    drawRect(bar, Offset(x0, top + titleH / 2), Size(width, titleH / 2))
+    if (name != null && width > 24.dp.toPx()) {
+        // The name stays inside its region, and in view while the region starts off screen.
+        clipRect(x0, top, x0 + width - 3.dp.toPx(), top + titleH) {
+            drawContext.canvas.nativeCanvas.drawText(
+                name, max(x0, 0f) + 6.dp.toPx() + nameInset, top + titleH * 0.74f,
+                textPaint(10.dp.toPx(), android.graphics.Color.WHITE, bold = true),
+            )
+        }
+    }
+}
+
+/**
  * A MIDI item: its notes as small bars, a line at each repeat of its
  * pattern (REAPER draws the same notches on looped items), and its name.
  */
@@ -1161,23 +1262,18 @@ private fun DrawScope.drawMidiItem(vm: DawViewModel, item: Item, track: Track, c
     val pad = ItemPad.toPx()
     val top = pad
     val height = size.height - pad * 2
-    val radius = CornerRadius(6.dp.toPx())
-    val alpha = if (item.mute || track.mute) 0.3f else 1f
+    val alpha = if (item.mute || track.mute) 0.35f else 1f
     val titleH = ItemTitle.toPx()
 
-    drawRoundRect(color.copy(alpha = 0.3f * alpha), Offset(x0, top), Size(width, height), radius)
-    drawRoundRect(color.copy(alpha = 0.9f * alpha), Offset(x0, top), Size(width, titleH), radius)
-    drawRect(color.copy(alpha = 0.9f * alpha), Offset(x0, top + titleH / 2), Size(width, titleH / 2))
-    if (width > 40.dp.toPx()) {
-        val label = if (item.mute) "muted" else if (item.notes.isNullOrEmpty()) "empty · tap again" else ""
-        val name = if (track.instrument?.type == InstrumentType.DRUMS) "Pattern" else "MIDI"
-        drawContext.canvas.nativeCanvas.drawText(
-            "$name  $label".trim(), max(x0, 0f) + 6.dp.toPx(), top + titleH * 0.78f,
-            textPaint(10.dp.toPx(), android.graphics.Color.WHITE, bold = true),
-        )
+    val label = when {
+        item.mute -> "muted"
+        item.notes.isNullOrEmpty() -> "empty · tap again"
+        else -> null
     }
+    drawRegion(x0, top, width, height, color, alpha, selected, listOfNotNull(track.name, label).joinToString("  ·  "))
 
     // Repeats of the pattern.
+    val ink = DawColors.shade(color, 0.62f).copy(alpha = alpha)
     val loop = item.loopLength
     if (loop > 0) {
         var k = Math.floorDiv(item.offset, loop) + 1
@@ -1186,7 +1282,7 @@ private fun DrawScope.drawMidiItem(vm: DawViewModel, item: Item, track: Track, c
             if (f >= item.end) break
             val x = vm.screenX(f)
             if (x > size.width) break
-            if (x >= 0f) drawLine(Color.Black.copy(alpha = 0.35f), Offset(x, top + titleH), Offset(x, top + height), 1.dp.toPx())
+            if (x >= 0f) drawLine(ink.copy(alpha = 0.45f * alpha), Offset(x, top + titleH), Offset(x, top + height), 1.dp.toPx())
             k++
         }
     }
@@ -1201,23 +1297,25 @@ private fun DrawScope.drawMidiItem(vm: DawViewModel, item: Item, track: Track, c
         val areaH = height - titleH - 4.dp.toPx()
         val rowH = areaH / (high - low + 1)
         val noteH = rowH.coerceIn(1.5f, 6.dp.toPx())
-        val noteColor = Color.Black.copy(alpha = 0.6f * alpha + 0.1f)
         for (n in notes) {
             val nx = vm.screenX(n.start)
             if (nx > size.width) break
             val nw = vm.framesToPx(n.length).coerceAtLeast(2.dp.toPx())
             if (nx + nw < 0f) continue
             val y = areaTop + (high - n.pitch) * rowH + (rowH - noteH) / 2
-            drawRect(noteColor, Offset(nx, y), Size(nw, noteH))
+            drawRoundRect(ink, Offset(nx, y), Size(nw, noteH), CornerRadius(noteH / 3))
         }
     }
 
-    if (selected) {
-        drawRoundRect(Color.White, Offset(x0, top), Size(width, height), radius, style = Stroke(2.dp.toPx()))
-        val edge = 3.dp.toPx()
-        drawRect(Color.White.copy(alpha = 0.7f), Offset(x0, top + height * 0.35f), Size(edge, height * 0.3f))
-        drawRect(Color.White.copy(alpha = 0.7f), Offset(x0 + width - edge, top + height * 0.35f), Size(edge, height * 0.3f))
-    }
+    if (selected) drawSelection(x0, top, width, height)
+}
+
+/** The outline and trim edges of a selected region. */
+private fun DrawScope.drawSelection(x0: Float, top: Float, width: Float, height: Float) {
+    drawRoundRect(Color.White, Offset(x0, top), Size(width, height), CornerRadius(5.dp.toPx()), style = Stroke(1.5.dp.toPx()))
+    val edge = 3.dp.toPx()
+    drawRect(Color.White.copy(alpha = 0.8f), Offset(x0, top + height * 0.35f), Size(edge, height * 0.3f))
+    drawRect(Color.White.copy(alpha = 0.8f), Offset(x0 + width - edge, top + height * 0.35f), Size(edge, height * 0.3f))
 }
 
 /** Which take lane of [item] the height [y] in a track lane [laneH] high falls on, when it has several takes. */
@@ -1231,17 +1329,18 @@ private fun Density.takeLaneAt(item: Item, y: Float, laneH: Float): Int? {
 }
 
 /**
- * An audio item: its waveform, fades and gain. A selected item with several
- * takes shows each in a lane of its own, the one playing lit up, as REAPER
- * shows takes in lanes; tapping a lane plays that take.
+ * An audio item: its waveform in a darker shade of its color, fades and
+ * gain. A selected item with several takes shows each in a lane of its own,
+ * the one playing lit up, as REAPER shows takes in lanes; tapping a lane
+ * plays that take.
  */
 private fun DrawScope.drawItem(
     vm: DawViewModel,
     item: Item,
+    track: Track,
     sources: Map<Int, SourceInfo>,
     color: Color,
     selected: Boolean,
-    trackMuted: Boolean,
 ) {
     val x0 = vm.screenX(item.position)
     val width = vm.framesToPx(item.length)
@@ -1251,85 +1350,69 @@ private fun DrawScope.drawItem(
     val top = pad
     val height = size.height - pad * 2
     val bottom = top + height
-    val radius = CornerRadius(6.dp.toPx())
-    val alpha = if (item.mute || trackMuted) 0.3f else 1f
+    val alpha = if (item.mute || track.mute) 0.35f else 1f
     val titleH = ItemTitle.toPx()
     val takes = Takes.all(item)
     val active = Takes.active(item)
 
-    drawRoundRect(color.copy(alpha = 0.35f * alpha), Offset(x0, top), Size(width, height), radius)
-    drawRoundRect(color.copy(alpha = 0.9f * alpha), Offset(x0, top), Size(width, titleH), radius)
-    drawRect(color.copy(alpha = 0.9f * alpha), Offset(x0, top + titleH / 2), Size(width, titleH / 2))
-    if (width > 40.dp.toPx()) {
-        val label = listOfNotNull(
-            if (takes.size > 1) "Take ${active + 1}/${takes.size}" else null,
-            if (item.mute) "muted" else null,
-            if (item.gain != 1f) "%+.1f dB".format(20 * kotlin.math.log10(item.gain.coerceAtLeast(1e-4f))) else null,
-        ).joinToString("  ")
-        if (label.isNotEmpty()) {
-            drawContext.canvas.nativeCanvas.drawText(
-                label, max(x0, 0f) + 6.dp.toPx(), top + titleH * 0.78f,
-                textPaint(10.dp.toPx(), android.graphics.Color.WHITE, bold = true),
-            )
-        }
-    }
+    val name = listOfNotNull(
+        track.name,
+        if (takes.size > 1) "Take ${active + 1}/${takes.size}" else null,
+        if (item.mute) "muted" else null,
+        if (item.gain != 1f) "%+.1f dB".format(20 * kotlin.math.log10(item.gain.coerceAtLeast(1e-4f))) else null,
+    ).joinToString("  ·  ")
+    // A selected item's name starts after its fade-in handle.
+    val handleR = 5.dp.toPx()
+    val inset = if (selected) max(0f, x0 + vm.framesToPx(item.fadeIn) + handleR - max(x0, 0f)) else 0f
+    drawRegion(x0, top, width, height, color, alpha, selected, name, inset)
 
     val waveTop = top + titleH
     val waveH = height - titleH
-    val waveColor = Color.Black.copy(alpha = 0.5f * alpha + 0.1f)
+    val waveColor = DawColors.shade(color, 0.6f).copy(alpha = alpha)
     if (selected && takes.size > 1) {
         val laneH = waveH / takes.size
         takes.forEachIndexed { k, take ->
             val y = waveTop + k * laneH
-            if (k == active) drawRect(Color.White.copy(alpha = 0.22f), Offset(x0, y), Size(width, laneH))
-            if (k > 0) drawLine(Color.Black.copy(alpha = 0.35f), Offset(x0, y), Offset(x0 + width, y), 1f)
+            if (k == active) drawRect(Color.White.copy(alpha = 0.28f), Offset(x0, y), Size(width, laneH))
+            if (k > 0) drawLine(waveColor.copy(alpha = 0.5f), Offset(x0, y), Offset(x0 + width, y), 1f)
             drawWave(vm, sources[take.sourceId]?.peaks, take.offset, take.gain, x0, width, y, laneH, waveColor)
         }
     } else {
         drawWave(vm, sources[item.sourceId]?.peaks, item.offset, item.gain, x0, width, waveTop, waveH, waveColor)
     }
 
-    // Fades: shade the area above each fade curve.
-    val shade = Color.Black.copy(alpha = 0.35f)
-    if (item.fadeIn > 0) {
-        val fw = vm.framesToPx(item.fadeIn)
-        val path = Path().apply {
-            moveTo(x0, top)
-            lineTo(x0 + fw, top)
-            for (i in 10 downTo 0) {
-                val t = i / 10f
-                val g = t * t * (3 - 2 * t)
-                lineTo(x0 + fw * t, bottom - g * height)
-            }
+    // Fades: shade the area above each fade curve, and draw the curve.
+    val shade = Color.Black.copy(alpha = 0.3f)
+    val curve = Color.White.copy(alpha = 0.7f)
+    fun fade(fromX: Float, dir: Float, frames: Long) {
+        val fw = vm.framesToPx(frames)
+        val edge = Path()
+        for (i in 0..10) {
+            val t = i / 10f
+            val g = t * t * (3 - 2 * t)
+            val x = fromX + dir * fw * t
+            val y = bottom - g * height
+            if (i == 0) edge.moveTo(x, y) else edge.lineTo(x, y)
+        }
+        val area = Path().apply {
+            addPath(edge)
+            lineTo(fromX, top)
             close()
         }
-        drawPath(path, shade)
+        drawPath(area, shade)
+        drawPath(edge, curve, style = Stroke(1.dp.toPx()))
     }
-    if (item.fadeOut > 0) {
-        val fw = vm.framesToPx(item.fadeOut)
-        val x1 = x0 + width
-        val path = Path().apply {
-            moveTo(x1, top)
-            lineTo(x1 - fw, top)
-            for (i in 10 downTo 0) {
-                val t = i / 10f
-                val g = t * t * (3 - 2 * t)
-                lineTo(x1 - fw * t, bottom - g * height)
-            }
-            close()
-        }
-        drawPath(path, shade)
-    }
+    if (item.fadeIn > 0) fade(x0, 1f, item.fadeIn)
+    if (item.fadeOut > 0) fade(x0 + width, -1f, item.fadeOut)
 
     if (selected) {
-        drawRoundRect(Color.White, Offset(x0, top), Size(width, height), radius, style = Stroke(2.dp.toPx()))
-        // Fade handles and trim edges
-        val r = 6.dp.toPx()
-        drawCircle(Color.White, r, Offset(x0 + vm.framesToPx(item.fadeIn), top + r))
-        drawCircle(Color.White, r, Offset(x0 + width - vm.framesToPx(item.fadeOut), top + r))
-        val edge = 3.dp.toPx()
-        drawRect(Color.White.copy(alpha = 0.7f), Offset(x0, top + height * 0.35f), Size(edge, height * 0.3f))
-        drawRect(Color.White.copy(alpha = 0.7f), Offset(x0 + width - edge, top + height * 0.35f), Size(edge, height * 0.3f))
+        drawSelection(x0, top, width, height)
+        // Fade handles, ringed so they stand out on the name bar.
+        val r = handleR
+        for (hx in listOf(x0 + vm.framesToPx(item.fadeIn), x0 + width - vm.framesToPx(item.fadeOut))) {
+            drawCircle(Color.Black.copy(alpha = 0.45f), r + 1.dp.toPx(), Offset(hx, top + r + 1.dp.toPx()))
+            drawCircle(Color.White, r, Offset(hx, top + r + 1.dp.toPx()))
+        }
     }
 }
 
@@ -1363,7 +1446,7 @@ private fun DrawScope.drawWave(
             val b1 = (f1 / PEAK_BUCKET).toInt().coerceIn(b0 + 1, peaks.size)
             var pk = 0f
             for (b in b0 until b1) pk = max(pk, peaks[b])
-            val h = ((pk * gain).coerceAtMost(1f) * height / 2).coerceAtLeast(0.5f)
+            val h = ((pk * gain).coerceAtMost(1f) * height * 0.46f).coerceAtLeast(0.5f)
             drawLine(color, Offset(col.toFloat(), mid - h), Offset(col.toFloat(), mid + h), step.toFloat())
         }
         col += step

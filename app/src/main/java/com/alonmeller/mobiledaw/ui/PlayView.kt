@@ -8,6 +8,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -34,15 +36,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.alonmeller.mobiledaw.DawViewModel
@@ -55,6 +60,7 @@ import com.alonmeller.mobiledaw.model.FIRST_PAD_NOTE
 import com.alonmeller.mobiledaw.model.InstrumentType
 import com.alonmeller.mobiledaw.model.PAD_COUNT
 import com.alonmeller.mobiledaw.model.Pad
+import com.alonmeller.mobiledaw.model.ParamSpec
 import com.alonmeller.mobiledaw.model.Scales
 import com.alonmeller.mobiledaw.model.Track
 import kotlin.math.max
@@ -114,12 +120,29 @@ private fun PlayHeader(vm: DawViewModel, track: Track) {
             .fillMaxWidth()
             .height(48.dp)
             .background(DawColors.Panel)
+            .drawBehind { drawLine(Color.Black, Offset(0f, size.height - 0.5f), Offset(size.width, size.height - 0.5f), 1f) }
             .padding(horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        // The instrument with its tile, like GarageBand's instrument button: tap it for another one.
         Box {
-            PillButton("${track.name}  ▾", DawColors.track(track.colorIndex)) { picking = true }
+            ToolButton(onClick = { picking = true }, modifier = Modifier.height(38.dp)) {
+                Row(Modifier.padding(start = 4.dp, end = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    InstrumentTile(trackGlyph(track, folder = false, bus = false), DawColors.track(track.colorIndex), 30.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        track.name,
+                        color = DawColors.TextPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 150.dp),
+                    )
+                    Text("  ▾", color = DawColors.TextSecondary, fontSize = 12.sp)
+                }
+            }
             DropdownMenu(expanded = picking, onDismissRequest = { picking = false }) {
                 vm.project.tracks.filter { it.instrument != null }.forEach { t ->
                     MenuItem(t.name) {
@@ -129,16 +152,19 @@ private fun PlayHeader(vm: DawViewModel, track: Track) {
                 }
             }
         }
-        ToggleChip("R", armed, DawColors.Record) { vm.toggleArm(track.id) }
+        IconToggle(Glyph.Record, armed, DawColors.Record, size = 30.dp, offColor = DawColors.shade(DawColors.Record, 0.3f)) {
+            vm.toggleArm(track.id)
+        }
         Text(
             when {
                 vm.recordingMidi && armed -> "● מקליט: נגן עכשיו"
                 armed -> "לחץ על ● כדי להקליט את מה שאתה מנגן"
-                else -> "לחץ R כדי להקליט לערוץ הזה"
+                else -> "לחץ על ● שמשמאל כדי להקליט לערוץ הזה"
             },
             color = if (vm.recordingMidi && armed) DawColors.Record else DawColors.TextSecondary,
             fontSize = 12.sp,
             maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
         LabelChip("Q 1/16", vm.settings.quantizeRecording, DawColors.Accent, Modifier.width(58.dp), onClick = vm::toggleQuantizeRecording)
@@ -215,34 +241,66 @@ private fun PadGrid(vm: DawViewModel, track: Track, selected: Int, onSelect: (In
         val gap = 8.dp.toPx()
         val cellW = (size.width - gap * 3) / 4
         val cellH = (size.height - gap * 3) / 4
-        val corner = CornerRadius(12.dp.toPx())
+        val radius = 10.dp.toPx()
+        val corner = CornerRadius(radius)
+        val glow = 3.dp.toPx()
+        val nameSize = if (cellW < 80.dp.toPx()) 11.dp.toPx() else 13.dp.toPx()
         for (i in 0 until PAD_COUNT) {
             val row = i / 4
             val col = i % 4
             val topLeft = Offset(col * (cellW + gap), row * (cellH + gap))
+            val cell = Size(cellW, cellH)
             val pad = pads[i]
             val base = PadRowColors[row]
-            val fill = when {
-                pad.sourceId < 0 -> DawColors.PanelRaised
-                i in pressed -> base
-                else -> base.copy(alpha = 0.55f)
+            val empty = pad.sourceId < 0
+            val hit = i in pressed
+            // Pads glow dimly in their row's color and light up when hit, like a pad controller's.
+            if (hit) drawRoundRect(base.copy(alpha = 0.4f), topLeft - Offset(glow, glow), Size(cellW + glow * 2, cellH + glow * 2), CornerRadius(radius + glow))
+            val face = when {
+                empty -> listOf(Color(0xFF34343A), Color(0xFF26262B))
+                hit -> listOf(DawColors.tint(base, 0.4f), base)
+                else -> listOf(DawColors.shade(base, 0.3f), DawColors.shade(base, 0.58f))
             }
-            drawRoundRect(fill, topLeft, Size(cellW, cellH), corner)
-            if (i in pressed) drawRoundRect(Color.White.copy(alpha = 0.35f), topLeft, Size(cellW, cellH), corner)
-            if (i == selected) drawRoundRect(Color.White, topLeft, Size(cellW, cellH), corner, style = Stroke(2.5.dp.toPx()))
+            drawRoundRect(Brush.verticalGradient(face, startY = topLeft.y, endY = topLeft.y + cellH), topLeft, cell, corner)
+            drawRoundRect(
+                if (empty) Color(0xFF48484E) else base.copy(alpha = if (hit) 1f else 0.75f),
+                topLeft, cell, corner, style = Stroke(1.5.dp.toPx()),
+            )
+            if (i == selected) {
+                drawRoundRect(Color.White, topLeft, cell, corner, style = Stroke(2.5.dp.toPx()))
+            }
             val canvas = drawContext.canvas.nativeCanvas
             canvas.drawText(
-                "${i + 1}", topLeft.x + 8.dp.toPx(), topLeft.y + 16.dp.toPx(),
-                textPaint(11.dp.toPx(), android.graphics.Color.argb(0xB0, 0, 0, 0), bold = true),
+                "${i + 1}", topLeft.x + 7.dp.toPx(), topLeft.y + 14.dp.toPx(),
+                textPaint(10.dp.toPx(), android.graphics.Color.argb(if (hit) 0xC0 else 0x99, 0xFF, 0xFF, 0xFF), bold = true),
             )
-            val name = if (pad.sourceId < 0) "+" else pad.name.ifEmpty { "Sound" }
-            val paint = textPaint(12.dp.toPx(), if (pad.sourceId < 0) android.graphics.Color.GRAY else android.graphics.Color.BLACK, bold = true)
-            val textW = paint.measureText(name)
-            canvas.drawText(
-                name, topLeft.x + max(6.dp.toPx(), (cellW - textW) / 2), topLeft.y + cellH * 0.62f, paint,
-            )
+            val name = if (empty) "+" else pad.name.ifEmpty { "Sound" }
+            val paint = textPaint(nameSize, if (empty) android.graphics.Color.GRAY else android.graphics.Color.WHITE, bold = true)
+            val lines = padNameLines(name, paint, cellW - 10.dp.toPx())
+            val lineH = nameSize * 1.15f
+            var y = topLeft.y + cellH - 9.dp.toPx() - lineH * (lines.size - 1)
+            for (line in lines) {
+                canvas.drawText(line, topLeft.x + (cellW - paint.measureText(line)) / 2, y, paint)
+                y += lineH
+            }
         }
     }
+}
+
+/** A pad's name on one line, or on two when it is too wide, each cut short with "…" if it must be. */
+private fun padNameLines(name: String, paint: android.graphics.Paint, width: Float): List<String> {
+    if (paint.measureText(name) <= width) return listOf(name)
+    val space = name.indexOf(' ')
+    if (space < 0) return listOf(fitted(name, paint, width))
+    return listOf(fitted(name.substring(0, space), paint, width), fitted(name.substring(space + 1), paint, width))
+}
+
+/** [text] cut to [width], ending in "…" when it had to be cut. */
+private fun fitted(text: String, paint: android.graphics.Paint, width: Float): String {
+    if (paint.measureText(text) <= width) return text
+    var n = text.length
+    while (n > 1 && paint.measureText(text.take(n) + "…") > width) n--
+    return text.take(n) + "…"
 }
 
 /** Koala's pad screen: the sound, sampling from the mic, its region and its settings. */
@@ -315,60 +373,56 @@ private fun PadEditor(
         }
         val source = vm.sources[pad.sourceId]
         if (source != null) {
-            SampleRegion(vm, track.id, index, pad, source, Modifier.fillMaxWidth().height(64.dp))
+            SampleRegion(vm, track.id, index, pad, source, Modifier.fillMaxWidth().height(56.dp))
         }
-        PadSlider("Volume", Scales.gainToPosition(pad.gain), Scales.gainLabel(pad.gain), DawColors.MeterGreen,
-            onChange = { p -> vm.updatePad(track.id, index, live = true) { it.copy(gain = Scales.positionToGain(p)) } },
-            onEnd = vm::endGesture,
-            onReset = { vm.updatePad(track.id, index) { it.copy(gain = 1f) } },
-        )
-        PadSlider("Pitch", (pad.pitch + 24f) / 48f, "%+d st".format(pad.pitch.roundToInt()), DawColors.Accent,
-            onChange = { p -> vm.updatePad(track.id, index, live = true) { it.copy(pitch = (p * 48f - 24f).roundToInt().toFloat()) } },
-            onEnd = vm::endGesture,
-            onReset = { vm.updatePad(track.id, index) { it.copy(pitch = 0f) } },
-        )
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            LabelChip("Reverse", pad.reverse, DawColors.Accent, Modifier.width(70.dp)) {
-                vm.updatePad(track.id, index) { it.copy(reverse = !it.reverse) }
-            }
-            // One shot plays the whole sound; gate stops it when the pad is let go.
-            LabelChip(if (pad.oneShot) "One shot" else "Gate", true, DawColors.Solo, Modifier.width(70.dp)) {
-                vm.updatePad(track.id, index) { it.copy(oneShot = !it.oneShot) }
-            }
-            Text("Choke", color = DawColors.TextSecondary, fontSize = 12.sp, modifier = Modifier.padding(start = 6.dp))
-            for (group in 0..3) {
-                LabelChip(if (group == 0) "Off" else "$group", pad.chokeGroup == group, DawColors.Mute, Modifier.width(34.dp)) {
-                    vm.updatePad(track.id, index) { it.copy(chokeGroup = group) }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            LabeledKnob(
+                "Volume", Scales.gainLabel(pad.gain), Scales.gainToPosition(pad.gain), DawColors.MeterGreen,
+                onChange = { p -> vm.updatePad(track.id, index, live = true) { it.copy(gain = Scales.positionToGain(p)) } },
+                onEnd = vm::endGesture,
+                onReset = { vm.updatePad(track.id, index) { it.copy(gain = 1f) } },
+                modifier = Modifier.width(62.dp),
+            )
+            LabeledKnob(
+                "Pitch", "%+d st".format(pad.pitch.roundToInt()), (pad.pitch + 24f) / 48f, DawColors.Accent,
+                onChange = { p -> vm.updatePad(track.id, index, live = true) { it.copy(pitch = (p * 48f - 24f).roundToInt().toFloat()) } },
+                onEnd = vm::endGesture,
+                onReset = { vm.updatePad(track.id, index) { it.copy(pitch = 0f) } },
+                modifier = Modifier.width(62.dp),
+                origin = 0.5f,
+            )
+            val volume = track.instrument?.values?.getOrNull(0) ?: 0f
+            val spec = InstrumentType.DRUMS.params[0]
+            ParamKnob(
+                spec.copy(name = "Kit volume"), volume, DawColors.TextSecondary,
+                onChange = { vm.setInstrumentParam(track.id, 0, it) },
+                onEnd = vm::endGesture,
+                onReset = {
+                    vm.setInstrumentParam(track.id, 0, spec.default)
+                    vm.endGesture()
+                },
+                modifier = Modifier.width(62.dp),
+            )
+            Column(Modifier.padding(start = 4.dp, top = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    LabelChip("Reverse", pad.reverse, DawColors.Accent, Modifier.width(70.dp)) {
+                        vm.updatePad(track.id, index) { it.copy(reverse = !it.reverse) }
+                    }
+                    // One shot plays the whole sound; gate stops it when the pad is let go.
+                    LabelChip(if (pad.oneShot) "One shot" else "Gate", true, DawColors.Solo, Modifier.width(70.dp)) {
+                        vm.updatePad(track.id, index) { it.copy(oneShot = !it.oneShot) }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Choke", color = DawColors.TextSecondary, fontSize = 11.sp, modifier = Modifier.padding(end = 2.dp))
+                    for (group in 0..3) {
+                        LabelChip(if (group == 0) "Off" else "$group", pad.chokeGroup == group, DawColors.Mute, Modifier.width(32.dp)) {
+                            vm.updatePad(track.id, index) { it.copy(chokeGroup = group) }
+                        }
+                    }
                 }
             }
         }
-        val volume = track.instrument?.values?.getOrNull(0) ?: 0f
-        val spec = InstrumentType.DRUMS.params[0]
-        PadSlider("Kit volume", spec.toPosition(volume), spec.format(volume), DawColors.TextSecondary,
-            onChange = { vm.setInstrumentParam(track.id, 0, spec.fromPosition(it)) },
-            onEnd = vm::endGesture,
-            onReset = {
-                vm.setInstrumentParam(track.id, 0, spec.default)
-                vm.endGesture()
-            },
-        )
-    }
-}
-
-@Composable
-private fun PadSlider(
-    label: String,
-    position: Float,
-    valueText: String,
-    color: Color,
-    onChange: (Float) -> Unit,
-    onEnd: () -> Unit,
-    onReset: () -> Unit,
-) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = DawColors.TextSecondary, fontSize = 13.sp, modifier = Modifier.width(78.dp))
-        MiniSlider(position, color, onChange, onEnd, Modifier.weight(1f).height(32.dp), onReset = onReset)
-        Text(valueText, color = DawColors.TextPrimary, fontSize = 12.sp, modifier = Modifier.width(70.dp).padding(start = 8.dp))
     }
 }
 
@@ -435,48 +489,86 @@ private fun SampleRegion(vm: DawViewModel, trackId: Long, index: Int, pad: Pad, 
 
 // ---------------------------------------------------------------- Synth
 
-/** ReaSynth-style controls: the waveform, the envelope, the filter and the level. */
+/** The pictures on the synth's wave switch, in the order of its choices. */
+private val WaveGlyphs = listOf(Glyph.WaveSine, Glyph.WaveTriangle, Glyph.WaveSaw, Glyph.WaveSquare)
+
+/** The synth's knobs that end a group (the envelope, then the filter), with a line after each. */
+private val SynthGroupEnds = setOf("Release", "Filter env")
+
+/**
+ * ReaSynth's controls as a row of knobs, like the sound controls over
+ * GarageBand's keyboard: the wave switch, the envelope, the filter, the
+ * detune and the level.
+ */
 @Composable
 private fun SynthPanel(vm: DawViewModel, track: Track, modifier: Modifier) {
     val inst = track.instrument ?: return
     val color = DawColors.track(track.colorIndex)
-    Column(modifier.background(DawColors.Panel).padding(horizontal = 12.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        val waveSpec = inst.type.params[0]
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Wave", color = DawColors.TextSecondary, fontSize = 13.sp, modifier = Modifier.width(48.dp))
-            waveSpec.choices?.forEachIndexed { k, name ->
-                LabelChip(name, inst.values[0].roundToInt() == k, color, Modifier.width(72.dp)) {
-                    vm.setInstrumentParam(track.id, 0, k.toFloat())
-                    vm.endGesture()
-                }
+    BoxWithConstraints(
+        modifier
+            .background(DawColors.Panel)
+            .drawBehind { drawLine(Color.Black, Offset(0f, size.height - 0.5f), Offset(size.width, size.height - 0.5f), 1f) }
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+    ) {
+        val knobs = inst.type.params.drop(1)
+        // The knobs share what the wave switch, the group lines and the reset button leave.
+        val small = (maxWidth - 260.dp) / knobs.size < 62.dp
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            val waveSpec = inst.type.params[0]
+            WaveSwitch(waveSpec, inst.values[0].roundToInt(), color) { k ->
+                vm.setInstrumentParam(track.id, 0, k.toFloat())
+                vm.endGesture()
             }
-            Spacer(Modifier.weight(1f))
+            GroupLine()
+            knobs.forEachIndexed { k, spec ->
+                val i = k + 1
+                ParamKnob(
+                    spec, inst.values.getOrElse(i) { spec.default }, color,
+                    onChange = { vm.setInstrumentParam(track.id, i, it) },
+                    onEnd = vm::endGesture,
+                    onReset = {
+                        vm.setInstrumentParam(track.id, i, spec.default)
+                        vm.endGesture()
+                    },
+                    modifier = Modifier.weight(1f),
+                    knobSize = if (small) 36.dp else 40.dp,
+                )
+                if (spec.name in SynthGroupEnds) GroupLine()
+            }
+            Spacer(Modifier.width(8.dp))
             PillButton("Reset", DawColors.PanelRaised) { vm.resetInstrument(track.id) }
         }
-        inst.type.params.withIndex().drop(1).chunked(3).forEach { row ->
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                row.forEach { (i, spec) ->
-                    val value = inst.values.getOrElse(i) { spec.default }
-                    Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-                        Text(spec.name, color = DawColors.TextSecondary, fontSize = 12.sp, maxLines = 1, modifier = Modifier.width(70.dp))
-                        MiniSlider(
-                            position = spec.toPosition(value),
-                            color = color,
-                            onChange = { vm.setInstrumentParam(track.id, i, spec.fromPosition(it)) },
-                            onEnd = vm::endGesture,
-                            onReset = {
-                                vm.setInstrumentParam(track.id, i, spec.default)
-                                vm.endGesture()
-                            },
-                            modifier = Modifier.weight(1f).height(28.dp),
-                        )
-                        Text(spec.format(value), color = DawColors.TextPrimary, fontSize = 11.sp, maxLines = 1, modifier = Modifier.width(56.dp))
+    }
+}
+
+/** A hairline between groups of knobs. */
+@Composable
+private fun GroupLine() {
+    Box(Modifier.padding(horizontal = 6.dp).width(1.dp).height(52.dp).background(Color(0xFF3A3A40)))
+}
+
+/** The waveform as a row of wave pictures, lit on the one playing. */
+@Composable
+private fun WaveSwitch(spec: ParamSpec, value: Int, color: Color, onPick: (Int) -> Unit) {
+    val choices = spec.choices ?: return
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(spec.name, color = DawColors.TextSecondary, fontSize = 10.sp, maxLines = 1)
+        Spacer(Modifier.height(3.dp))
+        ToolGroup(Modifier.height(34.dp)) {
+            choices.forEachIndexed { k, name ->
+                val on = k == value
+                ToolSegment(32.dp, onClick = { onPick(k) }, active = on, activeColor = color, first = k == 0) {
+                    val glyph = WaveGlyphs.getOrNull(k)
+                    if (glyph != null) {
+                        GlyphIcon(glyph, toolColor(on, color), size = 22.dp)
+                    } else {
+                        Text(name.take(3), color = toolColor(on, color), fontSize = 10.sp, fontWeight = FontWeight.Bold)
                     }
                 }
-                // Keep the last row's sliders as wide as the others.
-                repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
+        Spacer(Modifier.height(2.dp))
+        Text(choices.getOrElse(value) { "" }, color = DawColors.TextPrimary, fontSize = 10.sp, maxLines = 1)
     }
 }
 
@@ -489,17 +581,29 @@ private fun Keyboard(vm: DawViewModel, track: Track, modifier: Modifier) {
     val latestLowest by rememberUpdatedState(lowest)
     val trackId = track.id
     val color = DawColors.track(track.colorIndex)
-    Column(modifier.padding(8.dp)) {
+    Column(modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp, bottom = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            PillButton("◀ Octave", DawColors.PanelRaised) { lowest = (lowest - 12).coerceAtLeast(24) }
-            Text(pitchName(lowest), color = DawColors.TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            PillButton("Octave ▶", DawColors.PanelRaised) { lowest = (lowest + 12).coerceAtMost(84) }
+            // GarageBand's octave buttons, with the lowest C between them; tapping it goes back to C3.
+            ToolGroup(Modifier.height(30.dp)) {
+                ToolSegment(40.dp, onClick = { lowest = (lowest - 12).coerceAtLeast(24) }, first = true) {
+                    Text("◀", color = DawColors.TextPrimary, fontSize = 13.sp)
+                }
+                ToolSegment(52.dp, onClick = { lowest = 48 }) {
+                    Text(pitchName(lowest), color = DawColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+                ToolSegment(40.dp, onClick = { lowest = (lowest + 12).coerceAtMost(84) }) {
+                    Text("▶", color = DawColors.TextPrimary, fontSize = 13.sp)
+                }
+            }
+            Text("Octave", color = DawColors.TextSecondary, fontSize = 12.sp)
         }
         Spacer(Modifier.height(6.dp))
         Canvas(
             Modifier
                 .fillMaxWidth()
                 .weight(1f)
+                .clip(RoundedCornerShape(6.dp))
+                .background(Color(0xFF0B0B0C))
                 .pointerInput(trackId) {
                     awaitPointerEventScope {
                         val down = HashMap<PointerId, Int>()
@@ -535,22 +639,41 @@ private fun Keyboard(vm: DawViewModel, track: Track, modifier: Modifier) {
                 }
         ) {
             val layout = KeyLayout(size.width, size.height, lowest, 44.dp.toPx())
-            val corner = CornerRadius(5.dp.toPx())
+            val radius = 5.dp.toPx()
+            val gap = 1.5.dp.toPx()
+            // White keys: lit from above, square at the top where they go under the case.
+            val ivory = Brush.verticalGradient(listOf(Color.White, Color(0xFFEDEDF0), Color(0xFFD2D2D7)), startY = 0f, endY = size.height)
+            val pressed = Brush.verticalGradient(listOf(DawColors.tint(color, 0.5f), color), startY = 0f, endY = size.height)
             layout.whiteKeys.forEachIndexed { i, pitch ->
-                val x = i * layout.whiteW
-                drawRoundRect(if (pitch in held) color else Color(0xFFF2F2F7), Offset(x + 1, 0f), Size(layout.whiteW - 2, size.height), corner)
+                val x = i * layout.whiteW + gap / 2
+                val w = layout.whiteW - gap
+                val face = if (pitch in held) pressed else ivory
+                drawRoundRect(face, Offset(x, 0f), Size(w, size.height), CornerRadius(radius))
+                drawRect(face, Offset(x, 0f), Size(w, radius * 2))
                 if (pitch % 12 == 0) {
                     drawContext.canvas.nativeCanvas.drawText(
-                        pitchName(pitch), x + 6.dp.toPx(), size.height - 10.dp.toPx(),
-                        textPaint(11.dp.toPx(), android.graphics.Color.DKGRAY, bold = true),
+                        pitchName(pitch), x + 6.dp.toPx(), size.height - 9.dp.toPx(),
+                        textPaint(11.dp.toPx(), android.graphics.Color.rgb(0x6E, 0x6E, 0x73), bold = true),
                     )
                 }
             }
+            // The shadow of the case's lip over the tops of the keys.
+            val lip = 10.dp.toPx()
+            drawRect(Brush.verticalGradient(listOf(Color.Black.copy(alpha = 0.5f), Color.Transparent), startY = 0f, endY = lip), size = Size(size.width, lip))
+            // Black keys: glossy, with their front edge catching the light.
+            val ebony = Brush.verticalGradient(listOf(Color(0xFF2C2C30), Color(0xFF121214)), startY = 0f, endY = layout.blackH)
+            val blackPressed = Brush.verticalGradient(listOf(DawColors.shade(color, 0.25f), color), startY = 0f, endY = layout.blackH)
             layout.blackKeys.forEach { (pitch, x) ->
-                drawRoundRect(
-                    if (pitch in held) color else Color(0xFF1C1C1E), Offset(x, 0f),
-                    Size(layout.blackW, layout.blackH), corner,
-                )
+                val down = pitch in held
+                drawRoundRect(Color.Black.copy(alpha = 0.6f), Offset(x - gap, 0f), Size(layout.blackW + gap * 2, layout.blackH + 2.dp.toPx()), CornerRadius(radius))
+                drawRoundRect(if (down) blackPressed else ebony, Offset(x, 0f), Size(layout.blackW, layout.blackH), CornerRadius(radius))
+                if (!down) {
+                    val edge = 6.dp.toPx()
+                    drawRoundRect(
+                        Color(0xFF4A4A50), Offset(x + 2.dp.toPx(), layout.blackH - edge - 2.dp.toPx()),
+                        Size(layout.blackW - 4.dp.toPx(), edge), CornerRadius(2.dp.toPx()),
+                    )
+                }
             }
         }
     }
