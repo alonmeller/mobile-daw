@@ -41,6 +41,22 @@ data class Item(
     fun contains(frame: Long) = frame > position && frame < end
 }
 
+/**
+ * A copy of a track's sound sent to another track, such as a reverb bus, as
+ * in REAPER's routing window. A post-fader send follows the track's fader and
+ * pan; a pre-fader one leaves before them, so it keeps its level when the
+ * track is turned down.
+ */
+data class Send(
+    val id: Long,
+    /** The receiving track's id. */
+    val target: Long,
+    /** Linear gain; the default is -6 dB. */
+    val gain: Float = 0.5f,
+    val preFader: Boolean = false,
+    val mute: Boolean = false,
+)
+
 data class Track(
     val id: Long,
     val name: String,
@@ -55,6 +71,11 @@ data class Track(
     val panEnv: List<EnvPoint> = emptyList(),
     /** Set on instrument tracks, which play their MIDI items through it. */
     val instrument: Instrument? = null,
+    /** Folder depth, as REAPER keeps it: see [Routing]. */
+    val indent: Int = 0,
+    /** A folder whose tracks are hidden in the timeline. */
+    val collapsed: Boolean = false,
+    val sends: List<Send> = emptyList(),
 ) {
     fun envelope(kind: EnvKind) = if (kind == EnvKind.Volume) volumeEnv else panEnv
     fun withEnvelope(kind: EnvKind, points: List<EnvPoint>) =

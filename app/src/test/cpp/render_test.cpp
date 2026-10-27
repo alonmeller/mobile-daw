@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 static int failures = 0;
@@ -57,10 +59,27 @@ static Item item(std::shared_ptr<const Samples> src, int64_t position, int64_t o
     return it;
 }
 
-static void finish(Arrangement &arr) {
-    arr.anySolo = false;
-    for (auto &t : arr.tracks) arr.anySolo = arr.anySolo || t.solo;
+static void finish(Arrangement &arr) { arr.prepare(); }
+
+static Send send(int target, float gain, bool preFader = false) {
+    Send s;
+    s.target = target;
+    s.gain = gain;
+    s.preFader = preFader;
+    return s;
 }
+
+// The first left and right samples of a render, straight from the mixer.
+static std::pair<float, float> firstFrame(Arrangement &arr) {
+    finish(arr);
+    auto copy = arr.cloneForRender();
+    Mixer mixer;
+    std::vector<float> out(2 * kBlock, 0.0f);
+    mixer.renderBlock(*copy, out.data(), kBlock, 0, true);
+    return {out[0], out[1]};
+}
+
+static bool near(float a, float b) { return std::fabs(a - b) < 1e-5f; }
 
 static RenderResult run(Arrangement &arr, RenderJob job) {
     job.sampleRate = SR;
@@ -164,9 +183,192 @@ int main() {
         arr.tracks[1].solo = true;
         finish(arr);
         run(arr, job);
-        Wav soloMix = readWav(job.mixPath), solo0 = readWav(job.stemPaths[0]), solo1 = readWav(job.stemPaths[1]);
+        Wav soloMix = readWav(job.mixPath), solo1 = readWav(job.stemPaths[1]);
         CHECK(maxDiff(soloMix, solo1) < 1e-6f, "with a solo, the mix is the soloed track");
-        CHECK(maxDiff(solo0, s0) < 1e-6f, "with a solo, other stems are still rendered");
+        job.ignoreSolo = true;
+        run(arr, job);
+        Wav wholeMix = readWav(job.mixPath), whole0 = readWav(job.stemPaths[0]);
+        CHECK(maxDiff(whole0, s0) < 1e-6f && maxDiff(wholeMix, mix) < 1e-6f,
+              "a render that ignores solo has every stem whole");
+        CHECK(arr.tracks[1].solo, "ignoring solo leaves the playing arrangement soloed");
+    }
+
+    // Folders: tracks play into the folder above them, which mixes them through its own fader.
+    {
+        Arrangement arr;
+        arr.tracks.resize(4);
+        arr.tracks[0].gain = 0.5f;  // the folder
+        arr.tracks[1].parent = 0;
+        arr.tracks[1].items.push_back(item(constant(4000, 0.4f), 0, 0, 4000));
+        arr.tracks[2].parent = 0;
+        arr.tracks[2].items.push_back(item(constant(4000, 0.2f), 0, 0, 4000));
+        arr.tracks[3].items.push_back(item(constant(4000, 0.1f), 0, 0, 4000));  // outside the folder
+        auto [l, r] = firstFrame(arr);
+        CHECK(near(l, 0.4f) && near(r, 0.4f), "a folder sums its tracks through its fader");
+
+        RenderJob job;
+        job.end = 4000;
+        job.mixPath = tmp("folder_mix");
+        job.stemPaths = {tmp("folder_stem0"), "", "", tmp("folder_stem3")};
+        run(arr, job);
+        Wav mix = readWav(job.mixPath), folder = readWav(job.stemPaths[0]), other = readWav(job.stemPaths[3]);
+        Wav sum = folder;
+        for (size_t i = 0; i < sum.samples.size(); ++i) sum.samples[i] += other.samples[i];
+        CHECK(near(folder.at(10), 0.3f) && maxDiff(sum, mix) < 1e-6f, "a folder's stem holds its tracks, and top-level stems sum to the mix");
+
+        // The folder's own items play along with its tracks.
+        arr.tracks[0].items.push_back(item(constant(4000, 0.2f), 0, 0, 4000));
+        std::tie(l, r) = firstFrame(arr);
+        CHECK(near(l, 0.5f), "a folder's own items play too");
+
+        // Muting the folder silences everything in it.
+        arr.tracks[0].mute = true;
+        std::tie(l, r) = firstFrame(arr);
+        CHECK(near(l, 0.1f), "a muted folder silences its tracks");
+        arr.tracks[0].mute = false;
+
+        // Folders nest: a folder inside a folder.
+        arr.tracks[2].parent = 1;
+        arr.tracks[1].gain = 0.5f;
+        std::tie(l, r) = firstFrame(arr);
+        // (0.4 + 0.2) * 0.5 inside, plus the folder's own 0.2, all * 0.5, plus 0.1 outside.
+        CHECK(near(l, 0.35f), "folders nest");
+    }
+
+    // Sends: post-fader sends follow the fader and pan, pre-fader sends do not.
+    {
+        Arrangement arr;
+        arr.tracks.resize(2);
+        arr.tracks[0].items.push_back(item(constant(4000, 0.5f), 0, 0, 4000));
+        arr.tracks[0].gain = 0.5f;
+        arr.tracks[0].sends.push_back(send(1, 1.0f));
+        auto [l, r] = firstFrame(arr);
+        CHECK(near(l, 0.5f) && near(r, 0.5f), "a post-fader send adds the track again after its fader");
+
+        arr.tracks[0].sends[0].preFader = true;
+        std::tie(l, r) = firstFrame(arr);
+        CHECK(near(l, 0.75f), "a pre-fader send ignores the fader");
+
+        arr.tracks[0].pan = -1.0f;
+        arr.tracks[0].sends[0].preFader = false;
+        std::tie(l, r) = firstFrame(arr);
+        CHECK(near(r, 0.0f), "a post-fader send carries the track's pan");
+        arr.tracks[0].sends[0].preFader = true;
+        std::tie(l, r) = firstFrame(arr);
+        CHECK(near(r, 0.5f), "a pre-fader send leaves before the pan");
+        arr.tracks[0].pan = 0.0f;
+
+        arr.tracks[0].sends[0].mute = true;
+        std::tie(l, r) = firstFrame(arr);
+        CHECK(near(l, 0.25f), "a muted send sends nothing");
+        arr.tracks[0].sends[0].mute = false;
+
+        // The bus's own fader and effects work on what it receives.
+        arr.tracks[0].sends[0].preFader = false;
+        arr.tracks[1].gain = 0.0f;
+        std::tie(l, r) = firstFrame(arr);
+        CHECK(near(l, 0.25f), "a bus's fader sets its level");
+        arr.tracks[1].gain = 1.0f;
+
+        // A send to a track above it still arrives in the same block.
+        Arrangement up;
+        up.tracks.resize(2);
+        up.tracks[1].items.push_back(item(constant(4000, 0.5f), 0, 0, 4000));
+        up.tracks[1].sends.push_back(send(0, 0.5f));
+        up.tracks[0].gain = 0.5f;
+        std::tie(l, r) = firstFrame(up);
+        CHECK(near(l, 0.625f), "a send can go to a track above it");
+        CHECK(up.order.size() == 2 && up.order[0] == 1 && up.order[1] == 0, "the sending track runs first");
+
+        // Muting a track mutes its sends too; muting the bus keeps the track itself.
+        arr.tracks[0].mute = true;
+        std::tie(l, r) = firstFrame(arr);
+        CHECK(near(l, 0.0f), "a muted track sends nothing");
+        arr.tracks[0].mute = false;
+        arr.tracks[1].mute = true;
+        std::tie(l, r) = firstFrame(arr);
+        CHECK(near(l, 0.25f), "a muted bus leaves the track's own sound");
+        arr.tracks[1].mute = false;
+
+        // A reverb bus keeps ringing after the track has stopped.
+        auto reverb = Effect::create(EffectKind::Reverb, SR);
+        reverb->setParam(0, 0.6f);
+        reverb->setParam(1, 0.5f);
+        reverb->setParam(2, 1.0f);
+        reverb->setParam(3, 1.0f);
+        reverb->setParam(4, 0.0f);
+        arr.tracks[1].fx.push_back(reverb);
+        arr.tracks[0].items[0] = item(constant(2400, 0.5f), 0, 0, 2400);
+        finish(arr);
+        RenderJob job;
+        job.end = 4800;
+        job.maxTail = 4 * SR;
+        job.mixPath = tmp("bus_tail");
+        RenderResult res = run(arr, job);
+        Wav w = readWav(job.mixPath);
+        float tail = 0;
+        for (size_t f = 4800; f < std::min<size_t>(w.frames(), 4800 + SR / 10); ++f) tail = std::max(tail, std::fabs(w.at(f)));
+        CHECK(res.frames > 4800 + SR / 4 && tail > 1e-3f, "a reverb bus rings out after its tracks stop");
+    }
+
+    // Solo in place: soloing a track plays it through its folders and sends.
+    {
+        // 0 folder (with its own item) > 1, 2 in it; 3 a reverb bus; 1 and 4 send to it.
+        Arrangement arr;
+        arr.tracks.resize(5);
+        arr.tracks[0].items.push_back(item(constant(4000, 0.01f), 0, 0, 4000));
+        arr.tracks[0].gain = 0.5f;
+        arr.tracks[1].parent = 0;
+        arr.tracks[1].items.push_back(item(constant(4000, 0.2f), 0, 0, 4000));
+        arr.tracks[1].sends.push_back(send(3, 0.5f));
+        arr.tracks[2].parent = 0;
+        arr.tracks[2].items.push_back(item(constant(4000, 0.4f), 0, 0, 4000));
+        arr.tracks[4].items.push_back(item(constant(4000, 0.08f), 0, 0, 4000));
+        arr.tracks[4].sends.push_back(send(3, 0.5f));
+        arr.tracks[3].gain = 0.5f;
+        auto [all, unusedR] = firstFrame(arr);
+        // Folder (0.01 + 0.2 + 0.4) * 0.5, bus (0.1 + 0.04) * 0.5, and 0.08.
+        CHECK(near(all, 0.305f + 0.07f + 0.08f), "routing adds up with nothing soloed");
+
+        arr.tracks[1].solo = true;
+        float l = firstFrame(arr).first;
+        // The track through its folder (0.1) and through the bus (0.05), nothing else.
+        CHECK(near(l, 0.15f), "a soloed track is heard through its folder and its sends");
+        CHECK(!arr.tracks[0].ownHeard && arr.tracks[0].mainOpen, "its folder passes it on but keeps its own items quiet");
+        arr.tracks[1].solo = false;
+
+        arr.tracks[0].solo = true;
+        l = firstFrame(arr).first;
+        // The whole folder, and the bus hears track 1's send.
+        CHECK(near(l, 0.305f + 0.05f), "soloing a folder plays every track in it");
+        arr.tracks[0].solo = false;
+
+        arr.tracks[3].solo = true;
+        l = firstFrame(arr).first;
+        CHECK(near(l, 0.07f), "soloing a bus plays only what is sent to it");
+        arr.tracks[3].solo = false;
+
+        arr.tracks[4].solo = true;
+        arr.tracks[2].solo = true;
+        l = firstFrame(arr).first;
+        CHECK(near(l, 0.08f + 0.02f + 0.2f), "two solos play both, each through its own path");
+    }
+
+    // A loop that slips through is cut instead of hanging the mixer.
+    {
+        Arrangement arr;
+        arr.tracks.resize(3);
+        arr.tracks[0].parent = 1;
+        arr.tracks[1].sends.push_back(send(0, 1.0f));
+        arr.tracks[2].parent = 2;              // itself
+        arr.tracks[2].sends.push_back(send(7, 1.0f));  // nowhere
+        arr.tracks[0].items.push_back(item(constant(4000, 0.25f), 0, 0, 4000));
+        auto [l, r] = firstFrame(arr);
+        std::vector<int> sorted = arr.order;
+        std::sort(sorted.begin(), sorted.end());
+        CHECK(sorted == std::vector<int>({0, 1, 2}), "every track is in the order once");
+        CHECK(arr.tracks[2].parent == -1 && arr.tracks[2].sends.empty(), "routing that points nowhere is dropped");
+        CHECK(std::isfinite(l) && near(l, 0.25f), "a loop is cut and the sound still plays once");
     }
 
     // Effect tails ring out past the end, then the render stops by itself.

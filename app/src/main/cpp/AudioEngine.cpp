@@ -245,8 +245,7 @@ std::vector<float> AudioEngine::sourceSamples(int id) {
 }
 
 void AudioEngine::setArrangement(std::unique_ptr<Arrangement> arrangement) {
-    arrangement->anySolo = false;
-    for (auto &t : arrangement->tracks) arrangement->anySolo = arrangement->anySolo || t.solo;
+    arrangement->prepare();
     std::lock_guard<std::mutex> lock(arrangementMutex_);
     // The old arrangement is destroyed here on the UI thread, never on the audio thread.
     arrangement_.swap(arrangement);

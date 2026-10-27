@@ -12,6 +12,8 @@ import com.alonmeller.mobiledaw.model.Note
 import com.alonmeller.mobiledaw.model.PAD_COUNT
 import com.alonmeller.mobiledaw.model.Pad
 import com.alonmeller.mobiledaw.model.Project
+import com.alonmeller.mobiledaw.model.Routing
+import com.alonmeller.mobiledaw.model.Send
 import com.alonmeller.mobiledaw.model.Track
 import org.json.JSONArray
 import org.json.JSONObject
@@ -57,6 +59,8 @@ class ProjectStore(val dir: File) {
             fun source(file: String) = sourceIds.getOrPut(file) { loadSource(file) }
 
             val arr = json.getJSONArray("tracks")
+            // Track ids are new on every load, so sends name their track by its place in the list.
+            val ids = List(arr.length()) { Ids.next() }
             val tracks = (0 until arr.length()).map { i ->
                 val t = arr.getJSONObject(i)
                 val items = mutableListOf<Item>()
@@ -106,7 +110,7 @@ class ProjectStore(val dir: File) {
                     }
                 }
                 Track(
-                    id = Ids.next(),
+                    id = ids[i],
                     name = t.getString("name"),
                     colorIndex = t.optInt("color", i),
                     gain = t.optDouble("gain", 1.0).toFloat(),
@@ -118,6 +122,9 @@ class ProjectStore(val dir: File) {
                     volumeEnv = readEnvelope(t.optJSONArray("volumeEnv"), ::frames),
                     panEnv = readEnvelope(t.optJSONArray("panEnv"), ::frames),
                     instrument = t.optJSONObject("instrument")?.let { readInstrument(it, ::frames, ::source) },
+                    indent = t.optInt("indent", 0),
+                    collapsed = t.optBoolean("collapsed", false),
+                    sends = readSends(t.optJSONArray("sends"), ids),
                 )
             }
             val markers = json.optJSONArray("markers")?.let { m ->
@@ -127,7 +134,7 @@ class ProjectStore(val dir: File) {
                 }
             } ?: emptyList()
             val loop = json.optJSONObject("loop")
-            val project = Project(
+            val project = Routing.normalize(Project(
                 tracks = tracks,
                 markers = markers,
                 tempo = json.optDouble("tempo", 120.0),
@@ -136,7 +143,7 @@ class ProjectStore(val dir: File) {
                 loopOn = loop?.optBoolean("on", false) ?: false,
                 masterFx = readEffects(json.optJSONArray("masterFx")),
                 masterGain = json.optDouble("masterGain", 1.0).toFloat(),
-            )
+            ))
             val settings = ProjectSettings(
                 metronome = json.optBoolean("metronome", false),
                 snap = json.optBoolean("snap", true),
@@ -152,6 +159,7 @@ class ProjectStore(val dir: File) {
 
     @Synchronized
     fun save(project: Project, settings: ProjectSettings, sampleRate: Int, fileOf: (Int) -> String?) {
+        val indexOf = project.tracks.withIndex().associate { it.value.id to it.index }
         val tracks = JSONArray()
         project.tracks.forEach { t ->
             val items = JSONArray()
@@ -194,13 +202,16 @@ class ProjectStore(val dir: File) {
                     .put("fx", writeEffects(t.fx))
                     .put("volumeEnv", writeEnvelope(t.volumeEnv))
                     .put("panEnv", writeEnvelope(t.panEnv))
+                    .put("indent", t.indent)
+                    .put("collapsed", t.collapsed)
+                    .put("sends", writeSends(t.sends, indexOf))
                     .apply { t.instrument?.let { put("instrument", writeInstrument(it, fileOf)) } }
             )
         }
         val markers = JSONArray()
         project.markers.forEach { markers.put(JSONObject().put("position", it.position).put("name", it.name)) }
         val json = JSONObject()
-            .put("version", 4)
+            .put("version", 5)
             .put("tempo", project.tempo)
             .put("sampleRate", sampleRate)
             .put("metronome", settings.metronome)
@@ -240,6 +251,30 @@ class ProjectStore(val dir: File) {
             val values = JSONArray()
             e.values.forEach { values.put(it.toDouble()) }
             arr.put(JSONObject().put("type", e.type.code).put("values", values).put("bypass", e.bypass))
+        }
+        return arr
+    }
+
+    private fun readSends(arr: JSONArray?, ids: List<Long>): List<Send> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.getJSONObject(i)
+            val target = ids.getOrNull(o.optInt("to", -1)) ?: return@mapNotNull null
+            Send(
+                id = Ids.next(),
+                target = target,
+                gain = o.optDouble("gain", 0.5).toFloat(),
+                preFader = o.optBoolean("pre", false),
+                mute = o.optBoolean("mute", false),
+            )
+        }
+    }
+
+    private fun writeSends(sends: List<Send>, indexOf: Map<Long, Int>): JSONArray {
+        val arr = JSONArray()
+        sends.forEach { s ->
+            val to = indexOf[s.target] ?: return@forEach
+            arr.put(JSONObject().put("to", to).put("gain", s.gain.toDouble()).put("pre", s.preFader).put("mute", s.mute))
         }
         return arr
     }

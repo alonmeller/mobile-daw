@@ -89,6 +89,13 @@ int main() {
       int at = 0; float best = 0; for (int i = 1; i < SR; ++i) if (std::fabs(l[i]) > best) { best = std::fabs(l[i]); at = i; }
       std::printf("  echo at %d samples (%.1f ms), %.3f\n", at, at * 1000.0 / SR, best);
       CHECK(std::abs(at - 4800) <= 2 && best > 0.9f, "Delay echo at 100 ms"); }
+    // Delay on a bus: with no dry signal only the echo comes out
+    { auto e = make(EffectKind::Delay, {100, 0, 1, 20000, 0, 0});
+      std::vector<float> l(SR, 0.f), r(SR, 0.f); l[0] = r[0] = 1.f; run(*e, l, r);
+      CHECK(l[0] == 0.f && std::fabs(l[4800]) > 0.9f, "Delay with dry 0 gives only the echo");
+      auto older = make(EffectKind::Delay, {100, 0, 1, 20000, 0});
+      std::vector<float> l2(64, 0.f), r2(64, 0.f); l2[0] = r2[0] = 1.f; run(*older, l2, r2);
+      CHECK(l2[0] == 1.f, "Delay set without a dry level keeps the dry signal"); }
     // Delay with feedback stays finite and decays
     { auto e = make(EffectKind::Delay, {50, 0.9f, 1, 5000, 1});
       auto l = sine(300, 0.5f, SR), r = l; l.resize(SR * 6, 0.f); r.resize(SR * 6, 0.f); run(*e, l, r);

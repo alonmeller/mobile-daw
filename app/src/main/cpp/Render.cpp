@@ -164,6 +164,10 @@ RenderResult renderOffline(Arrangement &arr, const RenderJob &job, std::atomic<f
     RenderResult result;
     const int64_t length = job.end - job.start;
     if (length <= 0 || job.sampleRate <= 0) return result;
+    if (job.ignoreSolo) {
+        for (TrackMix &t : arr.tracks) t.solo = false;
+        arr.prepare();
+    }
 
     // Open every file first, so a full disk fails before any time is spent.
     const size_t numTracks = arr.tracks.size();

@@ -11,11 +11,13 @@ import kotlin.math.roundToLong
 /**
  * Writes a project as a REAPER project file (.rpp), the plain-text format
  * REAPER opens directly. Audio items keep their place, trims, fades, gain and
- * mute; tracks keep their volume, pan, mute, solo, color and automation; the
- * tempo, markers and loop come along. REAPER cannot play the app's effects or
- * instruments, so effects are listed in the project notes and each
- * instrument track arrives as rendered audio, with its notes as MIDI items on
- * a track of its own right below it.
+ * mute; tracks keep their volume, pan, mute, solo, color, automation, folders
+ * and sends; the tempo, markers and loop come along. REAPER cannot play the
+ * app's effects or instruments, so effects are listed in the project notes
+ * and each instrument track arrives as rendered audio, with its notes as MIDI
+ * items on a track of its own right below it. A send into a track with
+ * effects (a reverb bus) arrives muted, since without the effect it would
+ * only add a second copy of the dry sound.
  */
 object ReaperProject {
     /** An instrument track's sound, rendered to [file] (next to the .rpp), [length] frames from the start. */
@@ -65,12 +67,41 @@ object ReaperProject {
             out.line("MARKER ${i + 1} ${num(sec(m.position))} ${quote(m.name)} 0 0 1")
         }
 
+        // The tracks REAPER gets, in order: every track of the song, and below
+        // each rendered instrument track, a track with its notes.
+        class Slot(val track: Track, val notes: Boolean, val indent: Int)
+        val slots = mutableListOf<Slot>()
+        val slotOf = mutableMapOf<Long, Int>()
+        project.tracks.forEachIndexed { i, track ->
+            slotOf[track.id] = slots.size
+            slots += Slot(track, false, track.indent)
+            if (track.instrument != null && rendered[track.id] != null && track.items.any { it.isMidi }) {
+                // A folder's notes go inside it, so the tracks after it stay in the folder.
+                slots += Slot(track, true, track.indent + if (Routing.isFolder(project.tracks, i)) 1 else 0)
+            }
+        }
+        // REAPER keeps each send on the track that receives it.
+        val receives = project.tracks.flatMap { from -> from.sends.map { from to it } }.groupBy { it.second.target }
+        fun placement(k: Int): Placement {
+            val slot = slots[k]
+            val depthChange = (slots.getOrNull(k + 1)?.indent ?: 0) - slot.indent
+            val auxRecv = if (slot.notes) emptyList() else receives[slot.track.id].orEmpty().mapNotNull { (from, send) ->
+                val source = slotOf[from.id] ?: return@mapNotNull null
+                val mute = send.mute || slot.track.fx.isNotEmpty()
+                // Source, mode (0 post-fader, 3 pre-fader), volume, pan, mute, mono, phase,
+                // source and destination channels (1/2), pan law, MIDI (all channels), automation mode.
+                "AUXRECV $source ${if (send.preFader) 3 else 0} ${num(send.gain.toDouble())} 0 ${if (mute) 1 else 0} 0 0 0 0 -1 0 -1"
+            }
+            return Placement(depthChange, auxRecv)
+        }
+
+        var k = 0
         for (track in project.tracks) {
             val audio = rendered[track.id]
             val midiItems = track.items.filter { it.isMidi }
             if (track.instrument != null && audio != null) {
                 // What the instrument played, as audio, with the track's mix settings.
-                out.track(track.name, track, colors[track.id], sec) {
+                out.track(track.name, track, colors[track.id], sec, placement(k++)) {
                     out.item(
                         name = track.name, position = 0.0, length = sec(audio.length), mute = false,
                         loop = false, offset = 0.0, gain = 1.0, fadeIn = 0.0, fadeOut = 0.0,
@@ -82,12 +113,12 @@ object ReaperProject {
                 }
                 // Its notes on their own track, ready for an instrument chosen in REAPER.
                 if (midiItems.isNotEmpty()) {
-                    out.track("${track.name} MIDI", null, colors[track.id], sec) {
+                    out.track("${track.name} MIDI", null, colors[track.id], sec, placement(k++)) {
                         midiItems.forEach { out.midiItem(it, track, drumNotes[track.id], framesPerBeat, sec) }
                     }
                 }
             } else {
-                out.track(track.name, track, colors[track.id], sec) {
+                out.track(track.name, track, colors[track.id], sec, placement(k++)) {
                     for (item in track.items) {
                         if (item.isMidi) {
                             out.midiItem(item, track, drumNotes[track.id], framesPerBeat, sec)
@@ -111,8 +142,15 @@ object ReaperProject {
         return out.text()
     }
 
+    /**
+     * Where a track sits among REAPER's folders and what it receives:
+     * [depthChange] is REAPER's folder depth change (1 starts a folder, -n
+     * closes n of them), and [auxRecv] holds its AUXRECV lines.
+     */
+    private class Placement(val depthChange: Int, val auxRecv: List<String>)
+
     /** Writes a track; [mix] carries volume, pan, mute, solo and automation, or null for defaults. */
-    private fun Rpp.track(name: String, mix: Track?, color: Int?, sec: (Long) -> Double, items: () -> Unit) {
+    private fun Rpp.track(name: String, mix: Track?, color: Int?, sec: (Long) -> Double, placement: Placement, items: () -> Unit) {
         val guid = guid()
         open("TRACK $guid")
         line("NAME ${quote(name)}")
@@ -128,10 +166,13 @@ object ReaperProject {
         line("VOLPAN ${num((mix?.gain ?: 1f).toDouble())} ${num(pan)} -1 -1 1")
         line("MUTESOLO ${if (mix?.mute == true) 1 else 0} ${if (mix?.solo == true) 2 else 0} 0")
         line("IPHASE 0")
-        line("ISBUS 0 0")
+        val depth = placement.depthChange
+        line(if (depth > 0) "ISBUS 1 1" else if (depth < 0) "ISBUS 2 $depth" else "ISBUS 0 0")
         line("NCHAN 2")
         line("TRACKID $guid")
+        // To the folder above it, or the master.
         line("MAINSEND 1 0")
+        placement.auxRecv.forEach { line(it) }
         if (mix != null && mix.volumeEnv.isNotEmpty()) {
             envelope("VOLENV2", volumePoints(mix.volumeEnv).map { (frame, gain) -> sec(frame) to gain })
         }

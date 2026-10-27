@@ -259,21 +259,27 @@ struct DelayLine {
         const float size = static_cast<float>(buf.size());
         float pos = static_cast<float>(w) - std::clamp(delay, 1.0f, size - 2);
         if (pos < 0) pos += size;
-        const auto i0 = static_cast<size_t>(pos);
+        auto i0 = static_cast<size_t>(pos);
+        float frac = pos - static_cast<float>(i0);
+        // A position a hair below 0 can round up to the size itself, which is 0 again.
+        if (i0 >= buf.size()) {
+            i0 = 0;
+            frac = 0.0f;
+        }
         const size_t i1 = (i0 + 1) % buf.size();
-        const float frac = pos - static_cast<float>(i0);
         return buf[i0] * (1 - frac) + buf[i1] * frac;
     }
 };
 
 // ---------------------------------------------------------------- Delay
-// Params: time ms, feedback, mix, high cut Hz, ping-pong (0/1).
+// Params: time ms, feedback, mix, high cut Hz, ping-pong (0/1), dry.
 class Delay : public Effect {
 public:
-    explicit Delay(int sr) : Effect(sr, 5) {
+    explicit Delay(int sr) : Effect(sr, 6) {
         const auto size = static_cast<size_t>(sr * 2.1);
         lineL_.init(size);
         lineR_.init(size);
+        setParam(5, 1.0f);  // settings saved before there was a dry level play it in full
     }
 
     void process(float *l, float *r, int n) override {
@@ -282,6 +288,7 @@ public:
         const float mix = param(2);
         const float lp = std::exp(-2 * kPi * std::clamp(param(3), 200.0f, 20000.0f) / static_cast<float>(sampleRate_));
         const bool pingPong = param(4) > 0.5f;
+        const float dry = param(5);  // 0 on a delay bus, which adds only the echoes
         if (delay_ <= 0) delay_ = target;
         for (int i = 0; i < n; ++i) {
             delay_ += (target - delay_) * 0.0005f;  // glide instead of zipper noise on time changes
@@ -296,8 +303,8 @@ public:
                 lineL_.push(l[i] + fbL_ * feedback);
                 lineR_.push(r[i] + fbR_ * feedback);
             }
-            l[i] += yL * mix;
-            r[i] += yR * mix;
+            l[i] = l[i] * dry + yL * mix;
+            r[i] = r[i] * dry + yR * mix;
         }
     }
 

@@ -67,6 +67,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -82,6 +83,7 @@ import com.alonmeller.mobiledaw.model.InstrumentType
 import com.alonmeller.mobiledaw.model.Item
 import com.alonmeller.mobiledaw.model.Midi
 import com.alonmeller.mobiledaw.model.PAD_COUNT
+import com.alonmeller.mobiledaw.model.Routing
 import com.alonmeller.mobiledaw.model.Scales
 import com.alonmeller.mobiledaw.model.Track
 import kotlin.math.floor
@@ -130,6 +132,7 @@ fun DawScreen(
         }
     }
     vm.fxTarget?.let { FxDialog(vm, it) }
+    vm.routingTrackId?.let { RoutingDialog(vm, it) }
     vm.noteEditorItemId?.let { NoteEditor(vm, it) }
     if (vm.showSongs) SongsDialog(vm)
     if (vm.exportOpen) ExportDialog(vm, exportActions)
@@ -160,8 +163,14 @@ private fun ArrangeView(vm: DawViewModel, trackScroll: ScrollState, pickAudio: (
         }
         Box(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize().verticalScroll(trackScroll)) {
-                vm.project.tracks.forEachIndexed { index, track ->
-                    key(track.id) { TrackRow(vm, track, index) }
+                val tracks = vm.project.tracks
+                val hidden = vm.hiddenTracks
+                var shown = 0
+                tracks.forEachIndexed { index, track ->
+                    // Tracks in a collapsed folder are hidden, as in REAPER, unless a take is going into one.
+                    if (track.id in hidden && !vm.isRecordingInto(track)) return@forEachIndexed
+                    val row = shown++
+                    key(track.id) { TrackRow(vm, track, row, folder = Routing.isFolder(tracks, index)) }
                 }
                 if (vm.recording && vm.project.tracks.none { vm.isRecordingInto(it) }) {
                     RecordingRow(vm, vm.project.tracks.size)
@@ -197,6 +206,8 @@ private fun AddTrackButton(vm: DawViewModel, pickAudio: ((ImportedAudio) -> Unit
             MenuItem("🎤  Audio (voice, guitar)") { add(TrackKind.Audio) }
             MenuItem("🥁  Drum pads") { add(TrackKind.Drums) }
             MenuItem("🎹  Synth keyboard") { add(TrackKind.Synth) }
+            MenuItem("🌊  Reverb bus (tracks send to it)") { add(TrackKind.ReverbBus) }
+            MenuItem("🔁  Delay bus (tracks send to it)") { add(TrackKind.DelayBus) }
             MenuItem("📂  Import audio file (MP3, WAV…)") {
                 open = false
                 pickAudio(vm::importAudio)
@@ -654,17 +665,22 @@ private fun DrawScope.drawGrid(vm: DawViewModel) {
 
 // ---------------------------------------------------------------- Tracks
 
+/** [row] counts the tracks shown, for the lanes' alternating shades; [folder] is true when tracks play into this one. */
 @Composable
-private fun TrackRow(vm: DawViewModel, track: Track, index: Int) {
+private fun TrackRow(vm: DawViewModel, track: Track, row: Int, folder: Boolean) {
     Row(Modifier.fillMaxWidth().height(TrackHeight)) {
-        TrackHeader(vm, track)
-        TrackLane(vm, track, index, Modifier.weight(1f).fillMaxHeight())
+        TrackHeader(vm, track, folder)
+        TrackLane(vm, track, row, Modifier.weight(1f).fillMaxHeight())
     }
     Box(Modifier.fillMaxWidth().height(1.dp).background(Color.Black))
 }
 
+/** How far a track's header steps in per folder level; deeper levels stop stepping in. */
+private val FolderStep = 10.dp
+private const val MAX_SHOWN_DEPTH = 3
+
 @Composable
-private fun TrackHeader(vm: DawViewModel, track: Track) {
+private fun TrackHeader(vm: DawViewModel, track: Track, folder: Boolean) {
     val color = DawColors.track(track.colorIndex)
     var menuOpen by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
@@ -677,18 +693,40 @@ private fun TrackHeader(vm: DawViewModel, track: Track) {
             .background(if (selected) DawColors.PanelRaised else DawColors.Panel)
             .clickable { vm.selectItem(null, track.id) }
     ) {
+        // Tracks in a folder step in under it, as in REAPER's track list.
+        if (track.indent > 0) {
+            Box(
+                Modifier
+                    .width(FolderStep * minOf(track.indent, MAX_SHOWN_DEPTH))
+                    .fillMaxHeight()
+                    .background(DawColors.Background)
+            )
+        }
         Box(Modifier.width(5.dp).fillMaxHeight().background(color))
         Column(
             Modifier.padding(horizontal = 8.dp, vertical = 6.dp).fillMaxSize(),
             verticalArrangement = Arrangement.SpaceBetween,
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                if (folder) {
+                    // A folder: show or hide its tracks.
+                    Box(
+                        Modifier
+                            .size(width = 22.dp, height = 24.dp)
+                            .clip(RoundedCornerShape(5.dp))
+                            .background(DawColors.Background)
+                            .clickable { vm.toggleCollapsed(track.id) },
+                        contentAlignment = Alignment.Center,
+                    ) { Text(if (track.collapsed) "▸" else "▾", color = DawColors.TextPrimary, fontSize = 14.sp) }
+                    Spacer(Modifier.width(4.dp))
+                }
                 Text(
                     track.name,
                     color = DawColors.TextPrimary,
                     fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    fontWeight = if (folder) FontWeight.Bold else FontWeight.SemiBold,
                     maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )
                 ToggleChip("R", vm.armedTrackId == track.id, DawColors.Record) { vm.toggleArm(track.id) }
@@ -704,16 +742,27 @@ private fun TrackHeader(vm: DawViewModel, track: Track) {
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                         val close = { menuOpen = false }
                         MenuItem("Rename track") { close(); renaming = true }
+                        MenuItem("Routing and sends…") { close(); vm.openRouting(track.id) }
                         MenuItem("Duplicate track") { close(); vm.duplicateTrack(track.id) }
                         MenuItem("Move track up") { close(); vm.moveTrack(track.id, -1) }
                         MenuItem("Move track down") { close(); vm.moveTrack(track.id, 1) }
+                        MenuItem("Put in a new folder") { close(); vm.newFolder(track.id) }
+                        if (vm.canIndent(track.id)) {
+                            MenuItem("Move into the track above (folder)") { close(); vm.indentTrack(track.id) }
+                        }
+                        if (track.indent > 0) {
+                            MenuItem("Move out of folder") { close(); vm.outdentTrack(track.id) }
+                        }
                         if (track.volumeEnv.isNotEmpty()) {
                             MenuItem("Clear volume automation") { close(); vm.clearEnvelope(track.id, EnvKind.Volume) }
                         }
                         if (track.panEnv.isNotEmpty()) {
                             MenuItem("Clear pan automation") { close(); vm.clearEnvelope(track.id, EnvKind.Pan) }
                         }
-                        MenuItem("Delete track") { close(); vm.deleteTrack(track.id) }
+                        MenuItem(if (folder) "Delete folder track (keeps its tracks)" else "Delete track") {
+                            close()
+                            vm.deleteTrack(track.id)
+                        }
                     }
                 }
             }

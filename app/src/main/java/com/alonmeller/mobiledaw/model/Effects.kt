@@ -92,6 +92,7 @@ enum class EffectType(val code: Int, val title: String, val params: List<ParamSp
             ParamSpec("Mix", 0f, 1f, 0.3f, "%"),
             ParamSpec("High cut", 500f, 20000f, 8000f, "Hz", log = true),
             ParamSpec("Ping-pong", 0f, 1f, 0f, toggle = true),
+            ParamSpec("Dry", 0f, 1f, 1f, "%"),
         )
     ),
     CHORUS(
@@ -128,6 +129,9 @@ enum class EffectType(val code: Int, val title: String, val params: List<ParamSp
     );
 
     fun defaults(): List<Float> = params.map { it.default }
+
+    /** Index of the parameter called [name]. */
+    fun paramIndex(name: String): Int = params.indexOfFirst { it.name == name }.also { require(it >= 0) { "no $name in $title" } }
 
     companion object {
         fun fromCode(code: Int) = entries.firstOrNull { it.code == code }

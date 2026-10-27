@@ -50,6 +50,10 @@ object NativeEngine {
         noteCounts: IntArray,
         noteTimes: LongArray,
         noteValues: FloatArray,
+        parents: IntArray,
+        sendCounts: IntArray,
+        sendTargets: IntArray,
+        sendParams: FloatArray,
         masterGain: Float,
     )
     external fun trackPeak(index: Int): Float
@@ -72,6 +76,7 @@ object NativeEngine {
      * Renders what the engine plays now, faster than real time, into 32-bit
      * float WAV files (plain ASCII paths; empty ones are skipped): the stereo
      * mix, a stereo stem per track and the mono pre-effect output per track.
+     * With [ignoreSolo] it renders as if no track were soloed, so every stem is whole.
      * Blocks until done and returns [ok, cancelled, frames, peak, loudness in LUFS].
      */
     external fun render(
@@ -81,6 +86,7 @@ object NativeEngine {
         mixPath: String,
         stemPaths: Array<String>,
         dryPaths: Array<String>,
+        ignoreSolo: Boolean,
     ): DoubleArray
     external fun renderProgress(): Float
     external fun cancelRender()

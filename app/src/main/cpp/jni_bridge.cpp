@@ -116,12 +116,17 @@ JNIEXPORT jfloatArray JNICALL JNI_FN(sourceSamples)(JNIEnv *env, jobject, jint i
 //   instIds      the track's instrument id, or -1 for an audio track
 //   noteCounts   MIDI notes per track; noteTimes [start, length] in
 //                timeline frames and noteValues [pitch, velocity] per note
+//   parents      the index of the folder track each track plays into, or -1
+//   sendCounts   sends per track; sendTargets the receiving track's index
+//                and sendParams [gain, preFader, mute] per send
 JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray trackParams,
                                               jintArray itemCounts, jlongArray itemParams,
                                               jfloatArray itemGains, jintArray fxCounts, jlongArray fxIds,
                                               jintArray envCounts, jlongArray envFrames,
                                               jfloatArray envValues, jlongArray instIds, jintArray noteCounts,
-                                              jlongArray noteTimes, jfloatArray noteValues, jfloat masterGain) {
+                                              jlongArray noteTimes, jfloatArray noteValues, jintArray parents,
+                                              jintArray sendCounts, jintArray sendTargets, jfloatArray sendParams,
+                                              jfloat masterGain) {
     const jsize numTracks = env->GetArrayLength(itemCounts);
     jfloat *tp = env->GetFloatArrayElements(trackParams, nullptr);
     jint *counts = env->GetIntArrayElements(itemCounts, nullptr);
@@ -136,6 +141,10 @@ JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray 
     jint *nc = env->GetIntArrayElements(noteCounts, nullptr);
     jlong *nt = env->GetLongArrayElements(noteTimes, nullptr);
     jfloat *nv = env->GetFloatArrayElements(noteValues, nullptr);
+    jint *pa = env->GetIntArrayElements(parents, nullptr);
+    jint *sc = env->GetIntArrayElements(sendCounts, nullptr);
+    jint *st = env->GetIntArrayElements(sendTargets, nullptr);
+    jfloat *sp = env->GetFloatArrayElements(sendParams, nullptr);
 
     auto arrangement = std::make_unique<Arrangement>();
     arrangement->tracks.resize(static_cast<size_t>(numTracks));
@@ -143,6 +152,7 @@ JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray 
     size_t fx = 0;
     size_t point = 0;
     size_t note = 0;
+    size_t send = 0;
     auto readEnvelope = [&](std::vector<EnvPoint> &out, jint count) {
         out.reserve(static_cast<size_t>(count));
         for (jint k = 0; k < count; ++k, ++point) out.push_back({ef[point], ev[point]});
@@ -187,6 +197,17 @@ JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray 
         }
         std::stable_sort(mix.notes.begin(), mix.notes.end(),
                          [](const MidiNote &a, const MidiNote &b) { return a.start < b.start; });
+        // Routing: the folder it plays into, and its sends (level, pre-fader, mute).
+        mix.parent = pa[t];
+        mix.sends.reserve(static_cast<size_t>(sc[t]));
+        for (jint i = 0; i < sc[t]; ++i, ++send) {
+            Send s;
+            s.target = st[send];
+            s.gain = sp[send * 3];
+            s.preFader = sp[send * 3 + 1] > 0.5f;
+            s.mute = sp[send * 3 + 2] > 0.5f;
+            mix.sends.push_back(s);
+        }
     }
     for (jint i = 0; i < fc[numTracks]; ++i, ++fx) {
         if (auto e = engine().effect(fi[fx])) arrangement->masterFx.push_back(std::move(e));
@@ -206,6 +227,10 @@ JNIEXPORT void JNICALL JNI_FN(setArrangement)(JNIEnv *env, jobject, jfloatArray 
     env->ReleaseIntArrayElements(noteCounts, nc, JNI_ABORT);
     env->ReleaseLongArrayElements(noteTimes, nt, JNI_ABORT);
     env->ReleaseFloatArrayElements(noteValues, nv, JNI_ABORT);
+    env->ReleaseIntArrayElements(parents, pa, JNI_ABORT);
+    env->ReleaseIntArrayElements(sendCounts, sc, JNI_ABORT);
+    env->ReleaseIntArrayElements(sendTargets, st, JNI_ABORT);
+    env->ReleaseFloatArrayElements(sendParams, sp, JNI_ABORT);
     engine().setArrangement(std::move(arrangement));
 }
 
@@ -281,8 +306,10 @@ JNIEXPORT void JNICALL JNI_FN(setTempo)(JNIEnv *, jobject, jdouble bpm) { engine
 // path in dryPaths (empty strings skip a track). Paths should be plain ASCII.
 // Blocks until done; returns [ok, cancelled, frames, peak, loudness in LUFS].
 JNIEXPORT jdoubleArray JNICALL JNI_FN(render)(JNIEnv *env, jobject, jlong start, jlong end, jlong maxTail,
-                                              jstring mixPath, jobjectArray stemPaths, jobjectArray dryPaths) {
+                                              jstring mixPath, jobjectArray stemPaths, jobjectArray dryPaths,
+                                              jboolean ignoreSolo) {
     RenderJob job;
+    job.ignoreSolo = ignoreSolo;
     job.start = start;
     job.end = end;
     job.maxTail = maxTail;

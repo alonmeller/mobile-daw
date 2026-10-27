@@ -30,11 +30,29 @@ struct EnvPoint {
 // in blocks of at most this many frames.
 constexpr int kBlock = 256;
 
+// A copy of a track's sound sent to another track, such as a reverb bus, as
+// in REAPER's routing window.
+struct Send {
+    int target = -1;         // index of the receiving track
+    float gain = 1.0f;
+    bool preFader = false;   // leaves after the effects, before the fader and pan
+    bool mute = false;
+    bool open = true;        // set by Arrangement::prepare(): false while solo keeps it silent
+};
+
 struct TrackMix {
     float gain = 1.0f;
     float pan = 0.0f;
     bool mute = false;
     bool solo = false;
+    // The folder track this one plays into (REAPER's parent send), or -1 for the master.
+    int parent = -1;
+    std::vector<Send> sends;
+    // Set by Arrangement::prepare() from the solo buttons: whether the track's
+    // own items and instrument are heard, and whether its output reaches its
+    // folder or the master.
+    bool ownHeard = true;
+    bool mainOpen = true;
     std::vector<Item> items;
     std::vector<std::shared_ptr<Effect>> fx;  // pre-fader insert chain, as in REAPER
     std::vector<EnvPoint> volumeEnv;          // multiplies the fader gain
@@ -45,9 +63,13 @@ struct TrackMix {
     int64_t instrumentId = -1;
     std::vector<PadConfig> pads;
     std::vector<MidiNote> notes;
-    // Scratch buffers, allocated with the snapshot on the UI thread.
+    // Scratch buffers, allocated with the snapshot on the UI thread: the
+    // track's signal, and what its children and sends bring it this block.
     std::vector<float> left = std::vector<float>(kBlock);
     std::vector<float> right = std::vector<float>(kBlock);
+    std::vector<float> inLeft = std::vector<float>(kBlock);
+    std::vector<float> inRight = std::vector<float>(kBlock);
+    bool received = false;
 };
 
 // Snapshot of everything the audio thread needs to render. The UI builds a
@@ -58,6 +80,14 @@ struct Arrangement {
     std::vector<std::shared_ptr<Effect>> masterFx;
     float masterGain = 1.0f;
     bool anySolo = false;
+    // The order the mixer runs the tracks in: each one before the tracks it plays into.
+    std::vector<int> order;
+
+    // Checks the routing (folders and sends that point nowhere go, and so does
+    // anything that would feed a track's sound back into itself), puts the
+    // tracks in `order`, and works out what the solo buttons let through.
+    // Must run, on the UI thread, before the mixer sees the arrangement.
+    void prepare();
 
     // A copy for an offline render: the same items, notes and settings, with
     // fresh effects and instruments, so the render shares no state with playback.
@@ -82,14 +112,17 @@ public:
     // Adds n (at most kBlock) frames of `arr` from `pos` to `out`, interleaved
     // stereo. With `playing` false items and notes stay silent, and only
     // sounding voices and effect tails are heard. `peaks`, when given, gets
-    // each track's post-fader peak (kMaxMeters entries). A track with a tap
-    // is rendered even while another track is soloed, so every stem is whole,
-    // and a muted track still fills its dry tap.
+    // each track's post-fader peak (kMaxMeters entries). Tracks play into
+    // their folders and sends before the master hears them, and a track's
+    // stem is what it passes on. A muted track still fills its dry tap.
     // Returns true while an instrument is still sounding.
     bool renderBlock(Arrangement &arr, float *out, int n, int64_t pos, bool playing,
                      std::atomic<float> *peaks = nullptr, const TrackTaps *taps = nullptr);
 
 private:
+    // Adds a stereo signal, scaled by `gain`, to what `t` receives this block.
+    static void receive(TrackMix &t, const float *l, const float *r, int n, float gain);
+
     std::array<float, kBlock> mono_{};
     std::array<float, kBlock> masterL_{};
     std::array<float, kBlock> masterR_{};

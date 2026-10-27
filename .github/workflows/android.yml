@@ -21,15 +21,19 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      # Built with the address and undefined-behaviour sanitizers, so a read
+      # past the end of a buffer fails the build instead of clicking on a phone.
       - name: Test effect, instrument and render DSP
+        env:
+          CXXFLAGS: -std=c++17 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -Wall -Wextra
         run: |
-          g++ -std=c++17 -O2 -Wall -Wextra -I app/src/main/cpp \
+          g++ $CXXFLAGS -I app/src/main/cpp \
             app/src/test/cpp/effects_test.cpp app/src/main/cpp/Effects.cpp -o effects_test
           ./effects_test
-          g++ -std=c++17 -O2 -Wall -Wextra -I app/src/main/cpp \
+          g++ $CXXFLAGS -I app/src/main/cpp \
             app/src/test/cpp/instruments_test.cpp app/src/main/cpp/Instruments.cpp -o instruments_test
           ./instruments_test
-          g++ -std=c++17 -O2 -Wall -Wextra -I app/src/main/cpp \
+          g++ $CXXFLAGS -I app/src/main/cpp \
             app/src/test/cpp/render_test.cpp app/src/main/cpp/Render.cpp app/src/main/cpp/Mixer.cpp \
             app/src/main/cpp/Effects.cpp app/src/main/cpp/Instruments.cpp -o render_test
           ./render_test

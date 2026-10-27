@@ -41,7 +41,9 @@ import com.alonmeller.mobiledaw.model.PAD_COUNT
 import com.alonmeller.mobiledaw.model.Pad
 import com.alonmeller.mobiledaw.model.Project
 import com.alonmeller.mobiledaw.model.ReaperProject
+import com.alonmeller.mobiledaw.model.Routing
 import com.alonmeller.mobiledaw.model.Scales
+import com.alonmeller.mobiledaw.model.Send
 import com.alonmeller.mobiledaw.model.Track
 import com.alonmeller.mobiledaw.ui.DawColors
 import kotlinx.coroutines.Dispatchers
@@ -73,8 +75,8 @@ val GRID_DIVISIONS = listOf(1, 2, 4, 8, 16)
 /** What fills the screen under the transport bar. */
 enum class MainView { Arrange, Mixer, Play }
 
-/** Kinds of track that "+ Track" adds. */
-enum class TrackKind { Audio, Synth, Drums }
+/** Kinds of track that "+ Track" adds; a bus is an empty track with an effect that other tracks send to. */
+enum class TrackKind { Audio, Synth, Drums, ReverbBus, DelayBus }
 
 /** How fast meters fall back after a peak. */
 private const val METER_FALL_DB_PER_SECOND = 24f
@@ -170,6 +172,9 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         private set
     /** Track id (or [MASTER]) whose effect chain is open, or null. */
     var fxTarget by mutableStateOf<Long?>(null)
+        private set
+    /** Track whose routing window (its folder and sends) is open, or null. */
+    var routingTrackId by mutableStateOf<Long?>(null)
         private set
     /** Tracks showing an automation envelope over their lane. */
     var envModes by mutableStateOf(mapOf<Long, EnvKind>())
@@ -348,11 +353,22 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             noteValues[n * 2 + 1] = note.velocity
             n++
         }
+        // Routing: the folder each track plays into, and its sends by the receiving track's index.
+        val indexOf = p.tracks.withIndex().associate { it.value.id to it.index }
+        val sends = p.tracks.map { t -> t.sends.filter { it.target in indexOf } }
+        val sendTargets = sends.flatten().map { indexOf.getValue(it.target) }.toIntArray()
+        val sendParams = FloatArray(sendTargets.size * 3)
+        sends.flatten().forEachIndexed { k, send ->
+            sendParams[k * 3] = send.gain
+            sendParams[k * 3 + 1] = if (send.preFader) 1f else 0f
+            sendParams[k * 3 + 2] = if (send.mute) 1f else 0f
+        }
         NativeEngine.setArrangement(
             trackParams, counts, itemParams, itemGains,
             fxCounts, fxIds,
             envCounts, points.map { it.frame }.toLongArray(), points.map { it.value }.toFloatArray(),
             LongArray(p.tracks.size) { p.tracks[it].instrument?.id ?: -1L }, noteCounts, noteTimes, noteValues,
+            Routing.parents(p.tracks), IntArray(p.tracks.size) { sends[it].size }, sendTargets, sendParams,
             p.masterGain,
         )
         NativeEngine.setTempo(p.tempo)
@@ -374,6 +390,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         if (selectedItems.any { it !in itemIds }) selectedItems = selectedItems.intersect(itemIds)
         if (p.tracks.none { it.id == armedTrackId }) armedTrackId = -1
         if (p.tracks.none { it.id == selectedTrackId }) selectedTrackId = -1
+        if (p.tracks.none { it.id == routingTrackId }) routingTrackId = null
         if (noteEditorItemId != null && noteEditorItemId !in itemIds) {
             if (auditioning) toggleAudition()
             noteEditorItemId = null
@@ -832,6 +849,13 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
      * at the playhead, ready for the step sequencer.
      */
     fun addTrack(kind: TrackKind = TrackKind.Audio) {
+        if (kind == TrackKind.ReverbBus || kind == TrackKind.DelayBus) {
+            val bus = newBus(kind)
+            commit(project.copy(tracks = project.tracks + bus))
+            selectedTrackId = bus.id
+            message = "Send tracks to ${bus.name} from their mixer strip: tap ROUTE"
+            return
+        }
         val t = when (kind) {
             TrackKind.Audio -> newTrack()
             TrackKind.Synth -> {
@@ -847,6 +871,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
                     instrument = Instrument(Ids.next(), InstrumentType.DRUMS, pads = List(PAD_COUNT) { kitPad(it) }),
                 )
             }
+            TrackKind.ReverbBus, TrackKind.DelayBus -> error("buses are added above")
         }
         commit(project.copy(tracks = project.tracks + t))
         armedTrackId = t.id
@@ -855,39 +880,156 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         playTrackId = if (t.instrument != null) t.id else playTrackId
     }
 
-    fun deleteTrack(id: Long) = commit(project.copy(tracks = project.tracks.filterNot { it.id == id }))
+    /**
+     * An effects bus: an empty track whose effect gives back only the effect
+     * (no dry sound), so tracks can send it as much or as little as they like.
+     */
+    private fun newBus(kind: TrackKind): Track {
+        val number = nextTrackNumber++
+        val reverb = kind == TrackKind.ReverbBus
+        val type = if (reverb) EffectType.REVERB else EffectType.DELAY
+        val values = type.defaults().toMutableList()
+        if (reverb) {
+            values[type.paramIndex("Wet")] = 1f
+            values[type.paramIndex("Dry")] = 0f
+        } else {
+            values[type.paramIndex("Mix")] = 1f
+            values[type.paramIndex("Dry")] = 0f
+        }
+        val name = if (reverb) "Reverb bus" else "Delay bus"
+        val taken = project.tracks.map { it.name }.toSet()
+        val unique = if (name !in taken) name else (2..99).map { "$name $it" }.firstOrNull { it !in taken } ?: name
+        return Track(Ids.next(), unique, number - 1, fx = listOf(Effect(Ids.next(), type, values)))
+    }
+
+    /** Deletes a track; the tracks in its folder stay, one level up. */
+    fun deleteTrack(id: Long) = commit(Routing.removeTrack(project, id))
 
     fun renameTrack(id: Long, name: String) {
         val clean = name.trim()
         if (clean.isNotEmpty()) commit(project.updateTrack(id) { it.copy(name = clean) })
     }
 
-    /** Copies a track with its items, effects and automation right below it. */
+    /** Copies a track with its items, effects, automation and sends, right below it (and its folder). */
     fun duplicateTrack(id: Long) {
-        val index = project.tracks.indexOfFirst { it.id == id }
-        if (index < 0) return
-        val t = project.tracks[index]
+        val t = project.tracks.firstOrNull { it.id == id } ?: return
         val copy = t.copy(
             id = Ids.next(),
             name = "${t.name} copy",
             solo = false,
+            collapsed = false,
             items = t.items.map { it.copy(id = Ids.next()) },
             fx = t.fx.map { it.copy(id = Ids.next()) },
             // Its own instrument, so the two tracks never share voices.
             instrument = t.instrument?.copy(id = Ids.next()),
+            sends = t.sends.map { it.copy(id = Ids.next()) },
         )
-        commit(project.copy(tracks = project.tracks.toMutableList().apply { add(index + 1, copy) }))
+        commit(Routing.insertAfter(project, id, copy))
         selectedTrackId = copy.id
     }
 
+    /** Moves a track, with the tracks in its folder, past the next track up or down in the same folder. */
     fun moveTrack(id: Long, direction: Int) {
-        val tracks = project.tracks.toMutableList()
-        val i = tracks.indexOfFirst { it.id == id }
-        val j = i + direction
-        if (i < 0 || j !in tracks.indices) return
-        tracks[i] = tracks[j].also { tracks[j] = tracks[i] }
-        commit(project.copy(tracks = tracks))
+        val moved = Routing.move(project, id, direction)
+        if (moved == null) {
+            val t = project.tracks.firstOrNull { it.id == id } ?: return
+            message = if (t.indent > 0) "It is at the edge of its folder: use \"Move out of folder\"" else "It is already at the ${if (direction < 0) "top" else "bottom"}"
+            return
+        }
+        commit(moved)
     }
+
+    // ------------------------------------------------------------ folders (REAPER's track folders)
+
+    /** Puts a track in a new folder track, which takes its place and mixes it. */
+    fun newFolder(id: Long) {
+        if (project.tracks.none { it.id == id }) return
+        val number = nextTrackNumber++
+        val folder = Track(Ids.next(), "Folder $number", number - 1)
+        Routing.wrapInFolder(project, id, folder)?.let {
+            commit(it)
+            selectedTrackId = folder.id
+        }
+    }
+
+    /** True when the track above can take this one into its folder. */
+    fun canIndent(id: Long): Boolean {
+        val i = project.tracks.indexOfFirst { it.id == id }
+        return i > 0 && project.tracks[i - 1].indent >= project.tracks[i].indent
+    }
+
+    /** Moves a track into the folder of the track above it (that track becomes a folder if it was not one). */
+    fun indentTrack(id: Long) {
+        if (!canIndent(id)) return
+        val next = Routing.indent(project, id)
+        if (next == null) {
+            message = "That would send the track's sound back into itself"
+            return
+        }
+        // The new folder shows what went into it.
+        val parent = Routing.parents(next.tracks)[next.tracks.indexOfFirst { it.id == id }]
+        commit(if (parent >= 0) next.updateTrack(next.tracks[parent].id) { it.copy(collapsed = false) } else next)
+    }
+
+    /** Moves a track out of its folder, to just below the folder. */
+    fun outdentTrack(id: Long) {
+        val next = Routing.outdent(project, id)
+        if (next == null) message = "That would send the track's sound back into itself" else commit(next)
+    }
+
+    /** Shows or hides the tracks in a folder (REAPER's folder collapse). */
+    fun toggleCollapsed(id: Long) {
+        // Saved with the song, and undone like any other change.
+        commit(project.updateTrack(id) { it.copy(collapsed = !it.collapsed) })
+        val hidden = Routing.hidden(project.tracks)
+        if (selectedTrackId in hidden) selectedTrackId = id
+        if (selectedItems.isNotEmpty() && project.tracks.any { it.id in hidden && it.items.any { item -> item.id in selectedItems } }) {
+            selectedItems = emptySet()
+        }
+    }
+
+    /** Tracks the timeline hides inside collapsed folders. */
+    val hiddenTracks: Set<Long> get() = Routing.hidden(project.tracks)
+
+    // ------------------------------------------------------------ sends (REAPER's routing window)
+
+    fun openRouting(trackId: Long) {
+        routingTrackId = trackId
+    }
+
+    fun closeRouting() {
+        endGesture()
+        routingTrackId = null
+    }
+
+    /** Tracks that [trackId] can send to without its sound coming back to it. */
+    fun sendTargets(trackId: Long): List<Track> = Routing.sendTargets(project, trackId)
+
+    fun addSend(from: Long, to: Long) {
+        val next = Routing.addSend(project, from, to)
+        if (next == null) message = "That would send the track's sound back into itself" else commit(next)
+    }
+
+    /** Makes a new reverb or delay bus and sends [from] to it. */
+    fun sendToNewBus(from: Long, kind: TrackKind) {
+        val bus = newBus(kind)
+        Routing.addSend(project.copy(tracks = project.tracks + bus), from, bus.id)?.let { commit(it) }
+    }
+
+    /** Live send level change; [endGesture] makes it one undo step. */
+    fun setSendGain(trackId: Long, sendId: Long, gain: Float) =
+        preview(Routing.updateSend(project, trackId, sendId) { it.copy(gain = gain) })
+
+    fun resetSendGain(trackId: Long, sendId: Long) =
+        commit(Routing.updateSend(project, trackId, sendId) { it.copy(gain = Send(0, 0).gain) })
+
+    fun toggleSendPreFader(trackId: Long, sendId: Long) =
+        commit(Routing.updateSend(project, trackId, sendId) { it.copy(preFader = !it.preFader) })
+
+    fun toggleSendMute(trackId: Long, sendId: Long) =
+        commit(Routing.updateSend(project, trackId, sendId) { it.copy(mute = !it.mute) })
+
+    fun removeSend(trackId: Long, sendId: Long) = commit(Routing.removeSend(project, trackId, sendId))
 
     fun toggleArm(id: Long) {
         if (recording) return
@@ -1186,9 +1328,16 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     fun moveSelectedToTrack(direction: Int) {
         if (selectedItems.isEmpty()) return
         val tracks = project.tracks.toMutableList()
+        val hidden = hiddenTracks
+        // The next track shown, skipping those hidden in collapsed folders.
+        fun next(i: Int): Int {
+            var j = i + direction
+            while (j in tracks.indices && tracks[j].id in hidden) j += direction
+            return j
+        }
         val moves = mutableListOf<Pair<Int, Item>>()
         tracks.forEachIndexed { i, t ->
-            t.items.filter { it.id in selectedItems }.forEach { moves += (i + direction) to it }
+            t.items.filter { it.id in selectedItems }.forEach { moves += next(i) to it }
         }
         if (moves.any { it.first !in tracks.indices }) return
         for (i in tracks.indices) tracks[i] = tracks[i].copy(items = tracks[i].items.filterNot { it.id in selectedItems })
@@ -1673,7 +1822,10 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     private class RenderStats(val frames: Long, val peak: Float, val loudness: Double)
 
-    /** Runs the engine's offline render into float WAV files; null when cancelled. */
+    /**
+     * Runs the engine's offline render into float WAV files; null when cancelled.
+     * With [ignoreSolo] it renders as if nothing were soloed, so every stem is whole.
+     */
     private fun render(
         start: Long,
         end: Long,
@@ -1681,8 +1833,9 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         mixPath: String = "",
         stemPaths: Array<String> = emptyArray(),
         dryPaths: Array<String> = emptyArray(),
+        ignoreSolo: Boolean = false,
     ): RenderStats? {
-        val r = NativeEngine.render(start, end, if (tails) sampleRate * 10L else 0L, mixPath, stemPaths, dryPaths)
+        val r = NativeEngine.render(start, end, if (tails) sampleRate * 10L else 0L, mixPath, stemPaths, dryPaths, ignoreSolo)
         if (r[1] > 0.5) return null
         check(r[0] > 0.5) { "could not write the audio (is the phone full?)" }
         return RenderStats(r[2].toLong(), r[3].toFloat(), r[4])
@@ -1721,13 +1874,18 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         return ExportResult(out, mime, details)
     }
 
+    /**
+     * One file per top-level track: a folder's file holds the tracks in it,
+     * and a bus's file its effect, so the files add up to the song.
+     */
     private fun exportStems(job: ExportJob, dir: File): ExportResult? {
         val p = job.project
-        val tracks = p.tracks.withIndex().filter { (_, t) -> !t.mute && t.items.any { !it.mute } }
+        val audible = Routing.audible(p)
+        val tracks = p.tracks.withIndex().filter { (i, t) -> t.indent == 0 && audible[i] }
         check(tracks.isNotEmpty()) { "no unmuted track has anything to play" }
         val raw = Array(p.tracks.size) { "" }
         tracks.forEach { (i, _) -> raw[i] = File(dir, "stem$i.raw.wav").path }
-        val stats = render(job.start, job.end, job.options.tails, stemPaths = raw) ?: return null
+        val stats = render(job.start, job.end, job.options.tails, stemPaths = raw, ignoreSolo = true) ?: return null
         val bits = if (job.options.format == ExportFormat.Wav16) 16 else 24
         val folder = AudioExport.safeFileName("${job.title} stems", "Stems")
         val taken = mutableSetOf<String>()
@@ -1741,7 +1899,8 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val readme = File(dir, "README.txt")
         readme.writeText(
             """
-            ${job.title}: one WAV file per track, from Mobile DAW.
+            ${job.title}: one WAV file per track, from Mobile DAW. A folder's file holds the tracks
+            in it and a bus's file its effect, so together the files make the whole song.
             Tempo ${num(p.tempo)} BPM, 4/4, ${sampleRate} Hz. Every file starts at the same moment
             (${if (job.start == 0L) "the start of the song, bar 1" else "the start of the loop"}), so they line up when placed at the same point.
 
@@ -1797,7 +1956,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         if (instrumentTracks.isNotEmpty()) {
             val dry = Array(p.tracks.size) { "" }
             instrumentTracks.forEach { (i, _) -> dry[i] = File(dir, "dry$i.wav").path }
-            val stats = render(0, p.endFrame, true, dryPaths = dry) ?: return null
+            val stats = render(0, p.endFrame, true, dryPaths = dry, ignoreSolo = true) ?: return null
             instrumentTracks.forEachIndexed { n, (i, t) ->
                 val name = AudioExport.unique(AudioExport.asciiFileName(t.name, "Instrument ${n + 1}") + " (instrument)", taken, ".wav")
                 val file = File(dir, name)
@@ -1837,6 +1996,14 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             lines += "Effects are not included, because REAPER uses its own plug-ins (ReaEQ, ReaComp, ReaVerbate, ReaDelay...). They were:"
             withFx.forEach { t -> lines += "- ${t.name}: " + t.fx.joinToString("; ") { describe(it) } }
             if (p.masterFx.isNotEmpty()) lines += "- Master: " + p.masterFx.joinToString("; ") { describe(it) }
+            lines += ""
+        }
+        // ReaperProject mutes these sends, or they would add a second copy of the dry sound.
+        val buses = p.tracks.filter { t -> t.fx.isNotEmpty() && p.tracks.any { s -> s.sends.any { it.target == t.id && !it.mute } } }
+        if (buses.isNotEmpty()) {
+            lines += "The sends into ${buses.joinToString { "\"${it.name}\"" }} arrive muted, because the effects there are not included."
+            lines += "Add a REAPER effect on that track (ReaVerbate for a reverb, ReaDelay for a delay) set to all wet and no dry,"
+            lines += "then unmute its receives: the track's routing button (IO), or the mixer's sends."
             lines += ""
         }
         if (p.tracks.any { it.instrument != null }) {
