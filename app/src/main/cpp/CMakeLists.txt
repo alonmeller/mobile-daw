@@ -7,6 +7,8 @@ add_library(mobiledaw SHARED
         AudioEngine.cpp
         Effects.cpp
         Instruments.cpp
+        Mixer.cpp
+        Render.cpp
         jni_bridge.cpp)
 
 target_compile_options(mobiledaw PRIVATE -Wall -Wextra -O3)

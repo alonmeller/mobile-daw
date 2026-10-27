@@ -21,6 +21,11 @@ class History<T>(private val limit: Int = 200) {
         return prev
     }
 
+    fun clear() {
+        past.clear()
+        future.clear()
+    }
+
     fun redo(current: T): T? {
         val next = future.removeLastOrNull() ?: return null
         past.addLast(current)

@@ -29,13 +29,16 @@ data class ProjectSettings(
 data class LoadedProject(val project: Project, val settings: ProjectSettings)
 
 /**
- * Stores the project as project.json plus one WAV file per audio source.
- * Items and drum pads refer to sources by file name on disk and by engine
- * source id in memory.
+ * Stores one song in [dir] as project.json plus one WAV file per audio
+ * source. Items and drum pads refer to sources by file name on disk and by
+ * engine source id in memory.
  */
-class ProjectStore(root: File) {
-    val dir: File = File(root, "projects/default").apply { mkdirs() }
+class ProjectStore(val dir: File) {
     private val projectFile = File(dir, "project.json")
+
+    init {
+        dir.mkdirs()
+    }
 
     fun audioFile(fileName: String) = File(dir, fileName)
 
@@ -209,9 +212,12 @@ class ProjectStore(root: File) {
             .put("masterGain", project.masterGain.toDouble())
             .put("masterFx", writeEffects(project.masterFx))
             .put("tracks", tracks)
+        // A song deleted while this save was on its way stays deleted.
+        if (!dir.isDirectory) return
         val tmp = File(dir, "project.json.tmp")
         tmp.writeText(json.toString(2))
         tmp.renameTo(projectFile)
+        ProjectMeta.update(dir) { it.copy(seconds = project.endFrame.toDouble() / sampleRate) }
     }
 
     private fun readEffects(arr: JSONArray?): List<Effect> {

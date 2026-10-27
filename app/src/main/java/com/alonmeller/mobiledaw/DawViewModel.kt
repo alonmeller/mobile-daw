@@ -8,8 +8,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.compose.ui.graphics.toArgb
 import com.alonmeller.mobiledaw.audio.NativeEngine
+import com.alonmeller.mobiledaw.data.AacEncoder
+import com.alonmeller.mobiledaw.data.AudioExport
 import com.alonmeller.mobiledaw.data.ImportedAudio
+import com.alonmeller.mobiledaw.data.ProjectInfo
+import com.alonmeller.mobiledaw.data.ProjectLibrary
+import com.alonmeller.mobiledaw.data.ProjectMeta
 import com.alonmeller.mobiledaw.data.ProjectSettings
 import com.alonmeller.mobiledaw.data.ProjectStore
 import com.alonmeller.mobiledaw.data.WavFile
@@ -26,22 +32,28 @@ import com.alonmeller.mobiledaw.model.Instrument
 import com.alonmeller.mobiledaw.model.InstrumentType
 import com.alonmeller.mobiledaw.model.Item
 import com.alonmeller.mobiledaw.model.MASTER
+import com.alonmeller.mobiledaw.model.FIRST_PAD_NOTE
 import com.alonmeller.mobiledaw.model.Marker
 import com.alonmeller.mobiledaw.model.Midi
+import com.alonmeller.mobiledaw.model.MidiFile
 import com.alonmeller.mobiledaw.model.Note
 import com.alonmeller.mobiledaw.model.PAD_COUNT
 import com.alonmeller.mobiledaw.model.Pad
 import com.alonmeller.mobiledaw.model.Project
+import com.alonmeller.mobiledaw.model.ReaperProject
 import com.alonmeller.mobiledaw.model.Scales
 import com.alonmeller.mobiledaw.model.Track
+import com.alonmeller.mobiledaw.ui.DawColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.IdentityHashMap
 import java.util.UUID
 import kotlin.math.abs
+import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.roundToLong
@@ -67,8 +79,33 @@ enum class TrackKind { Audio, Synth, Drums }
 /** How fast meters fall back after a peak. */
 private const val METER_FALL_DB_PER_SECOND = 24f
 
+/** What "Export" makes, as in REAPER's Render to File and GarageBand's Share. */
+enum class ExportKind { Song, Stems, Midi, Reaper }
+
+enum class ExportFormat(val label: String) { Wav24("WAV 24-bit"), Wav16("WAV 16-bit"), M4a("M4A (AAC)") }
+
+data class ExportOptions(
+    val kind: ExportKind = ExportKind.Song,
+    val format: ExportFormat = ExportFormat.Wav24,
+    /** Only the loop range instead of the whole song (REAPER's "time selection" bounds). */
+    val loopOnly: Boolean = false,
+    /** Brings the loudest peak to -1 dB. */
+    val normalize: Boolean = true,
+    /** Lets reverb, delay and notes ring out after the end (REAPER's render tail). */
+    val tails: Boolean = true,
+)
+
+/** A finished export: the file to share and a line about it. */
+class ExportResult(val file: File, val mime: String, val details: String)
+
+/** Peak level that "Normalize" aims for: -1 dB, so encoders never clip. */
+private const val NORMALIZE_PEAK = 0.891f
+
 class DawViewModel(app: Application) : AndroidViewModel(app) {
-    private val store = ProjectStore(app.filesDir)
+    private val library = ProjectLibrary(app.filesDir)
+    /** Folder name of the open song, and its store. */
+    private var songId = library.current()
+    private var store = ProjectStore(library.folder(songId))
     private val engineStarted = NativeEngine.start()
     val sampleRate: Int = NativeEngine.sampleRate()
 
@@ -139,6 +176,15 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var message by mutableStateOf<String?>(if (engineStarted) null else "Audio engine failed to start")
 
+    /** Name of the open song. */
+    var songName by mutableStateOf(ProjectLibrary.DEFAULT_NAME)
+        private set
+    /** The song list, while it is showing. */
+    var songs by mutableStateOf(listOf<ProjectInfo>())
+        private set
+    var showSongs by mutableStateOf(false)
+        private set
+
     /** Timeline zoom in dp per second, and horizontal scroll in px. */
     var zoomDp by mutableFloatStateOf(60f)
         private set
@@ -148,6 +194,8 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     private val history = History<Project>()
     private var gestureBase: Project? = null
     private var saveJob: Job? = null
+    /** True once [project] holds the open song, so a save can never write an empty project over it. */
+    private var songLoaded = false
     private var nextTrackNumber = 1
 
     init {
@@ -157,27 +205,28 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------ load / save / sync
 
     private suspend fun loadProject() {
+        val target = store
         val loaded = withContext(Dispatchers.IO) {
             val newSources = mutableMapOf<Int, SourceInfo>()
-            store.sourceLengthOf = { id -> NativeEngine.sourceLength(id) }
-            val result = store.load(sampleRate) { file ->
-                val audio = WavFile.read(store.audioFile(file)) ?: return@load null
+            target.sourceLengthOf = { id -> NativeEngine.sourceLength(id) }
+            val result = target.load(sampleRate) { file ->
+                val audio = WavFile.read(target.audioFile(file)) ?: return@load null
                 val samples = WavFile.resample(audio.samples, audio.sampleRate, sampleRate)
                 val id = NativeEngine.createSource(samples)
                 newSources[id] = SourceInfo(file, samples.size.toLong(), NativeEngine.sourcePeaks(id, PEAK_BUCKET))
                 id
             }
-            if (result != null) store.deleteUnused(newSources.values.map { it.fileName }.toSet())
-            result to newSources
+            if (result != null) target.deleteUnused(newSources.values.map { it.fileName }.toSet())
+            Triple(result, newSources, ProjectMeta.read(target.dir)?.name ?: ProjectLibrary.DEFAULT_NAME)
         }
-        val (result, newSources) = loaded
+        val (result, newSources, name) = loaded
         sources = newSources
-        if (result != null) {
-            settings = result.settings
-            NativeEngine.setMetronome(settings.metronome)
-            applyProject(result.project)
-            nextTrackNumber = result.project.tracks.size + 1
-        }
+        songName = name
+        settings = result?.settings ?: ProjectSettings()
+        NativeEngine.setMetronome(settings.metronome)
+        applyProject(result?.project ?: Project())
+        nextTrackNumber = (result?.project?.tracks?.size ?: 0) + 1
+        songLoaded = true
         loading = false
     }
 
@@ -348,10 +397,29 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun saveNow() {
+        if (!songLoaded) return
         val p = project
         val s = settings
         val files = sources.mapValues { it.value.fileName }
-        viewModelScope.launch(Dispatchers.IO) { store.save(p, s, sampleRate) { files[it] } }
+        val target = store
+        viewModelScope.launch(Dispatchers.IO) { runCatching { target.save(p, s, sampleRate) { files[it] } } }
+    }
+
+    /** Saves the open song now and waits until it is on disk. */
+    private suspend fun saveAndWait() {
+        saveJob?.cancel()
+        if (!songLoaded) return
+        val p = project
+        val s = settings
+        val files = sources.mapValues { it.value.fileName }
+        val target = store
+        withContext(Dispatchers.IO) { runCatching { target.save(p, s, sampleRate) { files[it] } } }
+    }
+
+    /** Writes a new source's WAV file into the open song's folder, off the main thread. */
+    private fun writeSource(fileName: String, samples: FloatArray) {
+        val file = store.audioFile(fileName)
+        viewModelScope.launch(Dispatchers.IO) { runCatching { WavFile.writeFloatMono(file, samples, sampleRate) } }
     }
 
     fun undo() {
@@ -376,6 +444,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         fun meter(shown: Float, peak: Float) = max(peak, shown * fall).let { if (it < 1e-4f) 0f else it }
 
         position = NativeEngine.position()
+        if (exportProgress != null) exportProgress = NativeEngine.renderProgress()
         masterLevel = meter(masterLevel, NativeEngine.masterPeak())
         if (recording || samplingPad != null) {
             recordedFrames = NativeEngine.recordedFrames()
@@ -603,9 +672,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val length = NativeEngine.sourceLength(sourceId)
         val info = SourceInfo("take_${UUID.randomUUID()}.wav", length, NativeEngine.sourcePeaks(sourceId, PEAK_BUCKET))
         sources = sources + (sourceId to info)
-        viewModelScope.launch(Dispatchers.IO) {
-            WavFile.writeFloatMono(store.audioFile(info.fileName), NativeEngine.sourceSamples(sourceId), sampleRate)
-        }
+        writeSource(info.fileName, NativeEngine.sourceSamples(sourceId))
 
         val item = Item(Ids.next(), sourceId, NativeEngine.lastTakeStart(), 0, length)
         var p = project
@@ -1183,7 +1250,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val samples = DrumKit.render(index, sampleRate)
         val id = NativeEngine.createSource(samples)
         sources = sources + (id to SourceInfo(sound.file, samples.size.toLong(), NativeEngine.sourcePeaks(id, PEAK_BUCKET)))
-        viewModelScope.launch(Dispatchers.IO) { WavFile.writeFloatMono(store.audioFile(sound.file), samples, sampleRate) }
+        writeSource(sound.file, samples)
         return id
     }
 
@@ -1236,7 +1303,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val samples = NativeEngine.sourceSamples(id)
         val info = SourceInfo("sample_${UUID.randomUUID()}.wav", samples.size.toLong(), NativeEngine.sourcePeaks(id, PEAK_BUCKET))
         sources = sources + (id to info)
-        viewModelScope.launch(Dispatchers.IO) { WavFile.writeFloatMono(store.audioFile(info.fileName), samples, sampleRate) }
+        writeSource(info.fileName, samples)
         // Skip the silence before and after the sound, as Koala trims a fresh sample.
         val (start, end) = Edits.soundRegion(samples, sampleRate)
         updatePad(trackId, index) { Pad(sourceId = id, name = "Sample", start = start, end = end) }
@@ -1245,14 +1312,21 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------ importing audio files
 
     /** Turns decoded audio into an engine source saved with the project, off the main thread. */
-    private suspend fun importSource(audio: ImportedAudio, prefix: String): Int? = withContext(Dispatchers.Default) {
-        val samples = WavFile.resample(audio.samples, audio.sampleRate, sampleRate)
-        if (samples.isEmpty()) return@withContext null
-        val id = NativeEngine.createSource(samples)
-        val info = SourceInfo("${prefix}_${UUID.randomUUID()}.wav", samples.size.toLong(), NativeEngine.sourcePeaks(id, PEAK_BUCKET))
-        withContext(Dispatchers.IO) { WavFile.writeFloatMono(store.audioFile(info.fileName), samples, sampleRate) }
-        withContext(Dispatchers.Main) { sources = sources + (id to info) }
-        id
+    private suspend fun importSource(audio: ImportedAudio, prefix: String): Int? {
+        val song = songId
+        val target = store
+        val (id, info) = withContext(Dispatchers.Default) {
+            val samples = WavFile.resample(audio.samples, audio.sampleRate, sampleRate)
+            if (samples.isEmpty()) return@withContext null
+            val id = NativeEngine.createSource(samples)
+            val info = SourceInfo("${prefix}_${UUID.randomUUID()}.wav", samples.size.toLong(), NativeEngine.sourcePeaks(id, PEAK_BUCKET))
+            withContext(Dispatchers.IO) { runCatching { WavFile.writeFloatMono(target.audioFile(info.fileName), samples, sampleRate) } }
+            id to info
+        } ?: return null
+        // Another song was opened meanwhile: this import belonged to the old one.
+        if (song != songId) return null
+        sources = sources + (id to info)
+        return id
     }
 
     /** Puts an imported file on a new track at the playhead, like REAPER's Insert > Media file. */
@@ -1354,7 +1428,8 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         return if (item.loopLength > 0) Math.floorMod(local, loop) else local
     }
 
-    fun onAppBackground() {
+    /** Ends recording, sampling, auditioning and playback. */
+    private fun stopAll() {
         if (recording) stopRecording()
         if (recordingMidi) stopMidiRecording()
         if (samplingPad != null) stopSampling()
@@ -1364,7 +1439,410 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             playing = false
             NativeEngine.setPlaying(false)
         }
+    }
+
+    fun onAppBackground() {
+        stopAll()
         saveJob?.cancel()
         saveNow()
+    }
+
+    // ------------------------------------------------------------ songs (GarageBand's "My Songs")
+
+    fun openSongs() {
+        if (recording || recordingMidi || samplingPad != null) return
+        showSongs = true
+        refreshSongs()
+    }
+
+    fun closeSongs() {
+        showSongs = false
+    }
+
+    private fun refreshSongs() {
+        viewModelScope.launch {
+            // The open song's length is saved with it, so save first for an up-to-date list.
+            saveAndWait()
+            songs = withContext(Dispatchers.IO) { library.list() }
+        }
+    }
+
+    val currentSongId: String get() = songId
+
+    fun openSong(id: String) {
+        if (id == songId) {
+            showSongs = false
+            return
+        }
+        switchSong { id }
+    }
+
+    fun newSong() = switchSong { library.create(ProjectLibrary.DEFAULT_NAME) }
+
+    fun renameSong(id: String, name: String) {
+        val clean = name.trim().take(60)
+        if (clean.isEmpty()) return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { library.rename(id, clean) }
+            if (id == songId) songName = clean
+            refreshSongs()
+        }
+    }
+
+    fun duplicateSong(id: String) {
+        viewModelScope.launch {
+            if (id == songId) saveAndWait()
+            val copy = withContext(Dispatchers.IO) { library.duplicate(id) }
+            if (copy == null) message = "Could not copy the song (is the phone full?)"
+            refreshSongs()
+        }
+    }
+
+    /** Deletes a song; deleting the open one opens the newest other song, or a new one. */
+    fun deleteSong(id: String) {
+        if (id == songId) {
+            switchSong {
+                // Deleted first, so a new song made to replace the last one is plain "My Song".
+                library.delete(id)
+                library.list().firstOrNull()?.id ?: library.create(ProjectLibrary.DEFAULT_NAME)
+            }
+        } else {
+            viewModelScope.launch {
+                withContext(Dispatchers.IO) { library.delete(id) }
+                refreshSongs()
+            }
+        }
+    }
+
+    /** Saves the open song, then opens the one [target] picks (on a background thread). */
+    private fun switchSong(target: () -> String) {
+        if (loading || exportProgress != null) return
+        loading = true
+        stopAll()
+        viewModelScope.launch {
+            saveAndWait()
+            val id = withContext(Dispatchers.IO) { target().also { library.setCurrent(it) } }
+            resetSession()
+            songId = id
+            store = ProjectStore(library.folder(id))
+            loadProject()
+            showSongs = false
+            message = "Opened $songName"
+        }
+    }
+
+    /** Forgets everything about the open song, in the engine and here. */
+    private fun resetSession() {
+        saveJob?.cancel()
+        songLoaded = false
+        NativeEngine.clearSession()
+        pushedEffects.clear()
+        pushedInstruments.clear()
+        noteCache = IdentityHashMap()
+        history.clear()
+        gestureBase = null
+        clipboard = null
+        dragItem = null
+        liveHeld.clear()
+        heldNotes.clear()
+        sources = emptyMap()
+        project = Project()
+        settings = ProjectSettings()
+        selectedItems = emptySet()
+        selectedTrackId = -1
+        armedTrackId = -1
+        playTrackId = -1
+        noteEditorItemId = null
+        fxTarget = null
+        envModes = emptyMap()
+        envDrag = null
+        view = MainView.Arrange
+        canUndo = false
+        canRedo = false
+        nextTrackNumber = 1
+        trackLevels = emptyMap()
+        scrollPx = 0f
+        seekFrames(0)
+    }
+
+    // ------------------------------------------------------------ export (REAPER's Render to File)
+
+    var exportOpen by mutableStateOf(false)
+        private set
+    var exportOptions by mutableStateOf(ExportOptions())
+        private set
+    /** 0..1 while an export renders, null otherwise. */
+    var exportProgress by mutableStateOf<Float?>(null)
+        private set
+    var exportResult by mutableStateOf<ExportResult?>(null)
+        private set
+    private var exportJob: Job? = null
+
+    private val exportDir: File get() = File(getApplication<Application>().cacheDir, "exports")
+
+    fun openExport() {
+        if (recording || recordingMidi || samplingPad != null) return
+        exportResult = null
+        exportOpen = true
+    }
+
+    fun closeExport() {
+        cancelExport()
+        exportOpen = false
+    }
+
+    fun changeExportOptions(change: (ExportOptions) -> ExportOptions) {
+        exportOptions = change(exportOptions)
+        exportResult = null
+    }
+
+    fun cancelExport() {
+        if (exportJob?.isActive == true) NativeEngine.cancelRender()
+    }
+
+    /** True when the song has a loop range to export on its own. */
+    val hasLoopRange: Boolean get() = project.loopEnd > project.loopStart
+
+    /** Renders and writes the chosen export, like REAPER's Render button. */
+    fun startExport() {
+        if (exportJob?.isActive == true || loading) return
+        val p = project
+        val options = exportOptions
+        val (start, end) = when {
+            options.loopOnly && p.loopEnd > p.loopStart -> p.loopStart to p.loopEnd
+            p.endFrame > 0 -> 0L to p.endFrame
+            else -> {
+                message = "Record or add something first: the song is empty"
+                return
+            }
+        }
+        stopAll()
+        // Everything the export needs, read here on the main thread.
+        val job = ExportJob(
+            project = p,
+            title = songName,
+            start = start,
+            end = end,
+            options = options,
+            files = sources.mapValues { it.value.fileName },
+            songDir = store.dir,
+            drumNotes = p.tracks.filter { it.instrument?.type == InstrumentType.DRUMS }.associate { t ->
+                t.id to DrumKit.midiNotes(t.instrument!!.pads.map { pad ->
+                    val file = sources[pad.sourceId]?.fileName
+                    DrumKit.sounds.indexOfFirst { it.file == file }.takeIf { it >= 0 }
+                })
+            },
+            colors = p.tracks.associate { it.id to (DawColors.track(it.colorIndex).toArgb() and 0xFFFFFF) },
+        )
+        exportResult = null
+        exportProgress = 0f
+        exportJob = viewModelScope.launch {
+            val result = runCatching {
+                withContext(Dispatchers.Default) {
+                    val dir = exportDir.apply {
+                        deleteRecursively()
+                        mkdirs()
+                    }
+                    when (options.kind) {
+                        ExportKind.Song -> exportSong(job, dir)
+                        ExportKind.Stems -> exportStems(job, dir)
+                        ExportKind.Midi -> exportMidi(job, dir)
+                        ExportKind.Reaper -> exportReaper(job, dir)
+                    }
+                }
+            }
+            exportProgress = null
+            result.onSuccess { r ->
+                exportResult = r
+                if (r == null) message = "Export cancelled"
+            }.onFailure { message = "Export failed: ${it.message}" }
+        }
+    }
+
+    private class ExportJob(
+        val project: Project,
+        val title: String,
+        val start: Long,
+        val end: Long,
+        val options: ExportOptions,
+        val files: Map<Int, String>,
+        val songDir: File,
+        val drumNotes: Map<Long, IntArray>,
+        val colors: Map<Long, Int>,
+    )
+
+    private class RenderStats(val frames: Long, val peak: Float, val loudness: Double)
+
+    /** Runs the engine's offline render into float WAV files; null when cancelled. */
+    private fun render(
+        start: Long,
+        end: Long,
+        tails: Boolean,
+        mixPath: String = "",
+        stemPaths: Array<String> = emptyArray(),
+        dryPaths: Array<String> = emptyArray(),
+    ): RenderStats? {
+        val r = NativeEngine.render(start, end, if (tails) sampleRate * 10L else 0L, mixPath, stemPaths, dryPaths)
+        if (r[1] > 0.5) return null
+        check(r[0] > 0.5) { "could not write the audio (is the phone full?)" }
+        return RenderStats(r[2].toLong(), r[3].toFloat(), r[4])
+    }
+
+    private fun duration(frames: Long): String {
+        val seconds = frames / sampleRate
+        return "%d:%02d".format(seconds / 60, seconds % 60)
+    }
+
+    private fun exportSong(job: ExportJob, dir: File): ExportResult? {
+        val o = job.options
+        val raw = File(dir, "mix.raw.wav")
+        val stats = render(job.start, job.end, o.tails, mixPath = raw.path) ?: return null
+        val gain = if (o.normalize && stats.peak > 1e-4f) NORMALIZE_PEAK / stats.peak else 1f
+        val name = AudioExport.safeFileName(job.title, "Song")
+        val out: File
+        val mime: String
+        if (o.format == ExportFormat.M4a) {
+            out = File(dir, "$name.m4a")
+            check(AacEncoder.encode(raw, out, gain)) { "this phone could not make an M4A file" }
+            mime = "audio/mp4"
+        } else {
+            out = File(dir, "$name.wav")
+            AudioExport.toPcm(raw, out, if (o.format == ExportFormat.Wav16) 16 else 24, gain)
+            mime = "audio/wav"
+        }
+        raw.delete()
+        val peak = stats.peak * gain
+        val details = buildString {
+            append("${duration(stats.frames)} · ${o.format.label}")
+            if (peak > 0f) append(" · peak %+.1f dB".format(20 * log10(peak)))
+            if (stats.loudness.isFinite()) append(" · %.1f LUFS".format(stats.loudness + 20 * log10(gain)))
+            if (peak > 1f) append(" · clipped: turn on Normalize")
+        }
+        return ExportResult(out, mime, details)
+    }
+
+    private fun exportStems(job: ExportJob, dir: File): ExportResult? {
+        val p = job.project
+        val tracks = p.tracks.withIndex().filter { (_, t) -> !t.mute && t.items.any { !it.mute } }
+        check(tracks.isNotEmpty()) { "no unmuted track has anything to play" }
+        val raw = Array(p.tracks.size) { "" }
+        tracks.forEach { (i, _) -> raw[i] = File(dir, "stem$i.raw.wav").path }
+        val stats = render(job.start, job.end, job.options.tails, stemPaths = raw) ?: return null
+        val bits = if (job.options.format == ExportFormat.Wav16) 16 else 24
+        val folder = AudioExport.safeFileName("${job.title} stems", "Stems")
+        val taken = mutableSetOf<String>()
+        val entries = tracks.mapIndexed { n, (i, t) ->
+            val base = "%02d %s".format(n + 1, AudioExport.safeFileName(t.name, "Track"))
+            val wav = File(dir, AudioExport.unique(base, taken, ".wav"))
+            AudioExport.toPcm(File(raw[i]), wav, bits)
+            File(raw[i]).delete()
+            "$folder/${wav.name}" to wav
+        }
+        val readme = File(dir, "README.txt")
+        readme.writeText(
+            """
+            ${job.title}: one WAV file per track, from Mobile DAW.
+            Tempo ${num(p.tempo)} BPM, 4/4, ${sampleRate} Hz. Every file starts at the same moment
+            (${if (job.start == 0L) "the start of the song, bar 1" else "the start of the loop"}), so they line up when placed at the same point.
+
+            GarageBand: set the song's tempo to ${num(p.tempo)}, then drag each file onto its own track at bar 1.
+            REAPER: Insert > Media file, pick all the files and choose "one per track".
+
+            כל הקבצים מתחילים באותו רגע. בגראג'בנד: קבעו טמפו ${num(p.tempo)} וגררו כל קובץ לערוץ משלו בתחילת השיר.
+            """.trimIndent() + "\n"
+        )
+        val zip = File(dir, "$folder.zip")
+        AudioExport.zip(zip, entries + ("$folder/README.txt" to readme))
+        entries.forEach { it.second.delete() }
+        return ExportResult(zip, "application/zip", "${entries.size} tracks · WAV $bits-bit · ${duration(stats.frames)}")
+    }
+
+    private fun num(v: Double) = if (v == v.toLong().toDouble()) v.toLong().toString() else "%.2f".format(v)
+
+    /** Notes of the instrument tracks, drums mapped to General MIDI. */
+    private fun midiParts(job: ExportJob): List<MidiFile.Part> = job.project.tracks.mapNotNull { t ->
+        val inst = t.instrument ?: return@mapNotNull null
+        val drums = inst.type == InstrumentType.DRUMS
+        val map = job.drumNotes[t.id]
+        val notes = t.items.filter { it.isMidi && !it.mute }.flatMap { Midi.timelineNotes(it) }.map { n ->
+            if (map != null && n.pitch - FIRST_PAD_NOTE in map.indices) n.copy(pitch = map[n.pitch - FIRST_PAD_NOTE]) else n
+        }
+        if (notes.isEmpty()) null else MidiFile.Part(t.name, if (drums) MidiFile.DRUM_CHANNEL else 0, notes)
+    }
+
+    private fun exportMidi(job: ExportJob, dir: File): ExportResult {
+        val parts = midiParts(job)
+        check(parts.isNotEmpty()) { "there are no drum or synth notes yet" }
+        val file = File(dir, AudioExport.safeFileName(job.title, "Song") + ".mid")
+        file.writeBytes(MidiFile.write(job.title, job.project.tempo, sampleRate, job.project.markers, parts))
+        return ExportResult(file, "audio/midi", "${parts.size} tracks · ${num(job.project.tempo)} BPM")
+    }
+
+    private fun exportReaper(job: ExportJob, dir: File): ExportResult? {
+        val p = job.project
+        val folder = AudioExport.asciiFileName(job.title, "Mobile DAW song")
+        val entries = mutableListOf<Pair<String, File>>()
+        val taken = mutableSetOf("$folder.rpp".lowercase())
+        // The recordings, imports and samples the items play, as they are.
+        val media = p.tracks.flatMap { it.items }.filter { !it.isMidi }.mapNotNull { job.files[it.sourceId] }.toSet()
+            .filter { File(job.songDir, it).exists() }
+        media.forEach {
+            entries += "$folder/$it" to File(job.songDir, it)
+            taken += it.lowercase()
+        }
+        // REAPER cannot play the app's instruments: render each one's sound to a file.
+        val instrumentTracks = p.tracks.withIndex().filter { (_, t) -> t.instrument != null && t.items.any { it.isMidi } }
+        val rendered = mutableMapOf<Long, ReaperProject.RenderedTrack>()
+        val renders = mutableListOf<File>()
+        if (instrumentTracks.isNotEmpty()) {
+            val dry = Array(p.tracks.size) { "" }
+            instrumentTracks.forEach { (i, _) -> dry[i] = File(dir, "dry$i.wav").path }
+            val stats = render(0, p.endFrame, true, dryPaths = dry) ?: return null
+            instrumentTracks.forEachIndexed { n, (i, t) ->
+                val name = AudioExport.unique(AudioExport.asciiFileName(t.name, "Instrument ${n + 1}") + " (instrument)", taken, ".wav")
+                val file = File(dir, name)
+                File(dry[i]).renameTo(file)
+                rendered[t.id] = ReaperProject.RenderedTrack(name, stats.frames)
+                entries += "$folder/$name" to file
+                renders += file
+            }
+        }
+        val rpp = ReaperProject.write(
+            project = p,
+            sampleRate = sampleRate,
+            mediaFile = { item -> job.files[item.sourceId]?.takeIf { it in media } },
+            rendered = rendered,
+            drumNotes = job.drumNotes,
+            colors = job.colors,
+            notes = reaperNotes(job),
+            timestamp = System.currentTimeMillis() / 1000,
+        )
+        val rppFile = File(dir, "$folder.rpp").apply { writeText(rpp) }
+        entries.add(0, "$folder/$folder.rpp" to rppFile)
+        val zip = File(dir, "$folder (REAPER).zip")
+        AudioExport.zip(zip, entries)
+        rppFile.delete()
+        renders.forEach { it.delete() }
+        return ExportResult(zip, "application/zip", "${p.tracks.size} tracks · ${media.size + rendered.size} audio files")
+    }
+
+    /** REAPER's project notes: what could not come along, and how to add it back. */
+    private fun reaperNotes(job: ExportJob): List<String> {
+        val p = job.project
+        fun describe(e: Effect) = e.type.title + (if (e.bypass) " (off)" else "") + ": " +
+            e.type.params.mapIndexed { i, spec -> "${spec.name} ${spec.format(e.values.getOrElse(i) { spec.default })}" }.joinToString(", ")
+        val lines = mutableListOf("${job.title} - from Mobile DAW", "")
+        val withFx = p.tracks.filter { it.fx.isNotEmpty() }
+        if (withFx.isNotEmpty() || p.masterFx.isNotEmpty()) {
+            lines += "Effects are not included, because REAPER uses its own plug-ins (ReaEQ, ReaComp, ReaVerbate, ReaDelay...). They were:"
+            withFx.forEach { t -> lines += "- ${t.name}: " + t.fx.joinToString("; ") { describe(it) } }
+            if (p.masterFx.isNotEmpty()) lines += "- Master: " + p.masterFx.joinToString("; ") { describe(it) }
+            lines += ""
+        }
+        if (p.tracks.any { it.instrument != null }) {
+            lines += "Drum and synth tracks were rendered to audio. Their notes are on the \"MIDI\" track below each one:"
+            lines += "add an instrument there (Insert virtual instrument on new track, or the track's FX button) to play them with another sound."
+        }
+        return lines
     }
 }

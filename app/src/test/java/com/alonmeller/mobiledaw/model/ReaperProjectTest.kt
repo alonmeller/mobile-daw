@@ -1,0 +1,232 @@
+package com.alonmeller.mobiledaw.model
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ReaperProjectTest {
+    // 48 kHz at 120 BPM: a second is 48000 frames, a beat 24000.
+    private val rate = 48_000
+
+    private val vocal = Track(
+        id = 1, name = "Vocal", colorIndex = 0, gain = 0.5f, pan = -0.25f, solo = true,
+        items = listOf(
+            Item(10, sourceId = 3, position = 48_000, offset = 24_000, length = 96_000, fadeIn = 4_800, fadeOut = 9_600, gain = 0.8f, mute = true),
+            // No file for this source: it is left out.
+            Item(11, sourceId = 4, position = 0, offset = 0, length = 1_000),
+        ),
+    )
+    private val pattern = Midi.newItem(position = 0, length = 48_000, notes = listOf(Note(0, 12_000, 36), Note(24_000, 12_000, 38, 1f)))
+        .copy(length = 96_000)
+    private val drums = Track(
+        id = 2, name = "Drums", colorIndex = 1,
+        items = listOf(pattern),
+        instrument = Instrument(5, InstrumentType.DRUMS),
+    )
+    private val project = Project(
+        tracks = listOf(vocal, drums),
+        markers = listOf(Marker(7, 96_000, "Chorus \"big\"")),
+        tempo = 120.0,
+        loopStart = 0,
+        loopEnd = 192_000,
+        loopOn = true,
+    )
+
+    private fun write(p: Project = project, rendered: Map<Long, ReaperProject.RenderedTrack> = emptyMap(), seed: Long = 1) =
+        ReaperProject.write(
+            project = p,
+            sampleRate = rate,
+            mediaFile = { if (it.sourceId == 3) "take 1.wav" else null },
+            rendered = rendered,
+            drumNotes = mapOf(2L to IntArray(PAD_COUNT) { if (it == 2) 39 else 36 + it }),
+            colors = mapOf(1L to 0x3D9BFF),
+            notes = listOf("First line", "Second line"),
+            timestamp = 1_700_000_000,
+            seed = seed,
+        )
+
+    private fun lines(text: String) = text.lines().map { it.trim() }.filter { it.isNotEmpty() }
+
+    /** The lines of the first block that starts with [tag], up to its closing ">". */
+    private fun block(text: String, tag: String, nth: Int = 0): List<String> {
+        val all = lines(text)
+        var found = -1
+        var seen = 0
+        for (i in all.indices) {
+            if (all[i].startsWith("<$tag")) {
+                if (seen == nth) {
+                    found = i
+                    break
+                }
+                seen++
+            }
+        }
+        check(found >= 0) { "no <$tag #$nth" }
+        var depth = 0
+        for (i in found until all.size) {
+            if (all[i].startsWith("<")) depth++
+            if (all[i] == ">") depth--
+            if (depth == 0) return all.subList(found, i + 1)
+        }
+        error("<$tag is not closed")
+    }
+
+    @Test
+    fun blocksAreBalanced() {
+        val text = write()
+        var depth = 0
+        for (line in lines(text)) {
+            if (line.startsWith("<")) depth++
+            if (line == ">") depth--
+            assertTrue(depth >= 0)
+        }
+        assertEquals(0, depth)
+        assertTrue(text.startsWith("<REAPER_PROJECT 0.1 \"7.0/MobileDAW\" 1700000000\n"))
+        assertTrue(text.endsWith(">\n"))
+    }
+
+    @Test
+    fun projectSettings() {
+        val top = lines(write())
+        assertTrue("TEMPO 120 4 4" in top)
+        assertTrue("SELECTION 0 4" in top)
+        assertTrue("SELECTION2 0 4" in top)
+        assertTrue("LOOP 1" in top)
+        assertTrue("SAMPLERATE 48000 0 0" in top)
+        // REAPER has no escapes, so double quotes inside a name become single ones.
+        assertTrue("MARKER 1 2 \"Chorus 'big'\" 0 0 1" in top)
+        assertEquals(listOf("<NOTES 0 2", "|First line", "|Second line", ">"), block(write(), "NOTES"))
+    }
+
+    @Test
+    fun audioItemsKeepPlaceTrimFadesGainAndMute() {
+        val track = block(write(), "TRACK")
+        assertTrue("NAME \"Vocal\"" in track)
+        assertTrue("VOLPAN 0.5 -0.25 -1 -1 1" in track)
+        assertTrue("MUTESOLO 0 2 0" in track)
+        // 0x3D9BFF is stored as 0xBBGGRR with the custom-color flag.
+        assertTrue("PEAKCOL ${0x1000000 or 0xFF9B3D}" in track)
+        val item = block(write(), "ITEM")
+        assertTrue("POSITION 1" in item)
+        assertTrue("LENGTH 2" in item)
+        assertTrue("SOFFS 0.5" in item)
+        assertTrue("FADEIN 0 0.1 0 0 0 0 0" in item)
+        assertTrue("FADEOUT 0 0.2 0 0 0 0 0" in item)
+        assertTrue("MUTE 1 0" in item)
+        assertTrue("VOLPAN 0.8000000119 0 1 -1" in item)
+        assertEquals(listOf("<SOURCE WAVE", "FILE \"take 1.wav\"", ">"), block(write(), "SOURCE WAVE"))
+        // The item with no file is left out.
+        assertEquals(1, track.count { it == "<ITEM" })
+    }
+
+    @Test
+    fun midiItemsLoopTheirPatternInTicks() {
+        val item = block(write(), "ITEM", nth = 1)
+        assertTrue("POSITION 0" in item)
+        assertTrue("LENGTH 2" in item)
+        assertTrue("LOOP 1" in item)
+        val source = block(write(), "SOURCE MIDI")
+        assertEquals("HASDATA 1 960 QN", source[1])
+        // The kick, then the snare on pad 2, which the drum map sends to note 39.
+        assertEquals(
+            listOf(
+                "E 0 99 24 66", // kick on, channel 10, velocity 0.8 (102)
+                "E 480 89 24 00",
+                "E 480 99 27 7f",
+                "E 480 89 27 00",
+                "E 480 b0 7b 00", // the pattern is two beats: 1920 ticks
+            ),
+            source.subList(2, source.size - 1),
+        )
+    }
+
+    @Test
+    fun drumPadsAreMappedToTheirNotes() {
+        // A note on pad 2 (MIDI 38) plays the note the drum map gives pad 2.
+        val events = ReaperProject.midiEvents(listOf(Note(0, 100, 38)), 1000, 24_000.0, 9) { if (it == 38) 39 else it }
+        assertEquals("E 0 99 27 66", events[1])
+    }
+
+    @Test
+    fun panEnvelopesFlipSignAndReplaceTheKnob() {
+        val panned = project.copy(tracks = listOf(vocal.copy(panEnv = listOf(EnvPoint(0, -1f), EnvPoint(48_000, 0.5f)))))
+        val track = block(write(panned), "TRACK")
+        assertTrue("VOLPAN 0.5 0 -1 -1 1" in track)
+        val env = block(write(panned), "PANENV2")
+        assertTrue("PT 0 1 0" in env)
+        assertTrue("PT 1 -0.5 0" in env)
+    }
+
+    @Test
+    fun volumeMovesKeepTheirCurve() {
+        val points = ReaperProject.volumePoints(listOf(EnvPoint(0, 1f), EnvPoint(80_000, 0.01f)))
+        // The ends, and seven points between them on the fader's dB scale.
+        assertEquals(9, points.size)
+        assertEquals(0L to 1.0, points.first())
+        assertEquals(80_000L, points.last().first)
+        assertEquals(0.01, points.last().second, 1e-6)
+        assertTrue(points.zipWithNext().all { (a, b) -> b.first > a.first && b.second < a.second })
+        // Halfway through the move is halfway in dB (-20 dB), not halfway in amplitude.
+        val middle = points[4]
+        assertEquals(40_000L, middle.first)
+        assertEquals(0.1, middle.second, 0.002)
+        // A tiny move needs no extra points.
+        assertEquals(2, ReaperProject.volumePoints(listOf(EnvPoint(0, 1f), EnvPoint(1000, 0.99f))).size)
+    }
+
+    @Test
+    fun instrumentTracksArriveAsAudioWithTheirNotesBelow() {
+        val text = write(rendered = mapOf(2L to ReaperProject.RenderedTrack("Drums (instrument).wav", 96_000)))
+        val audio = block(text, "TRACK", nth = 1)
+        assertTrue("NAME \"Drums\"" in audio)
+        assertTrue("FILE \"Drums (instrument).wav\"" in audio)
+        assertTrue("LENGTH 2" in audio)
+        assertFalse(audio.any { it.startsWith("<SOURCE MIDI") })
+        val notes = block(text, "TRACK", nth = 2)
+        assertTrue("NAME \"Drums MIDI\"" in notes)
+        assertTrue(notes.any { it.startsWith("<SOURCE MIDI") })
+        // The notes track has default mix settings.
+        assertTrue("VOLPAN 1 0 -1 -1 1" in notes)
+    }
+
+    @Test
+    fun guidsAreWellFormedAndRepeatable() {
+        val guid = Regex("\\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\\}")
+        val text = write()
+        val ids = lines(text).filter { it.startsWith("<TRACK ") || it.startsWith("IGUID ") || it.startsWith("GUID ") }
+            .map { it.substringAfter(' ') }
+        assertTrue(ids.isNotEmpty())
+        assertTrue(ids.all { guid.matches(it) })
+        assertEquals(ids.size, ids.toSet().size)
+        assertEquals(text, write())
+        assertNotEquals(text, write(seed = 2))
+    }
+
+    @Test
+    fun numbersAreWrittenPlainly() {
+        assertEquals("0.1", ReaperProject.num(0.1))
+        assertEquals("2", ReaperProject.num(2.0))
+        assertEquals("0", ReaperProject.num(-0.0))
+        assertEquals("0", ReaperProject.num(1e-12))
+        assertEquals("0.3333333333", ReaperProject.num(1.0 / 3))
+        assertEquals("-1.5", ReaperProject.num(-1.5))
+        assertEquals("0", ReaperProject.num(Double.NaN))
+    }
+
+    @Test
+    fun midiEventsStopAtTheEndOfTheSource() {
+        val events = ReaperProject.midiEvents(
+            listOf(Note(0, 30_000, 60), Note(24_000, 1_000, 62), Note(10_000, 100, 64)),
+            length = 24_000,
+            framesPerBeat = 24_000.0,
+            channel = 0,
+        )
+        // The first note is cut at the end; the one starting at the end is dropped.
+        assertEquals(
+            listOf("HASDATA 1 960 QN", "E 0 90 3c 66", "E 400 90 40 66", "E 4 80 40 00", "E 556 80 3c 00", "E 0 b0 7b 00"),
+            events,
+        )
+    }
+}

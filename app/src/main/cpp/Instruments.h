@@ -64,6 +64,8 @@ public:
     virtual bool active() const = 0;
 
     static std::shared_ptr<Instrument> create(InstrumentKind kind, int sampleRate);
+    // A fresh copy with the same settings and no sounding voices, for offline renders.
+    std::shared_ptr<Instrument> clone() const;
 
 protected:
     float param(int index) const {
@@ -75,4 +77,5 @@ protected:
 private:
     std::unique_ptr<std::atomic<float>[]> params_;
     const int numParams_;
+    InstrumentKind kind_ = InstrumentKind::Synth;  // set by create()
 };

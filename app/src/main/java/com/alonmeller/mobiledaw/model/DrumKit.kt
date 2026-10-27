@@ -13,27 +13,48 @@ import kotlin.math.tanh
  * instrument gets sound i.
  */
 object DrumKit {
-    class Sound(val name: String, val file: String, val chokeGroup: Int = 0)
+    /** [gmNote] is the General MIDI drum note of the nearest sound, for exported MIDI. */
+    class Sound(val name: String, val file: String, val gmNote: Int, val chokeGroup: Int = 0)
 
     val sounds = listOf(
-        Sound("Kick", "kit_kick.wav"),
-        Sound("Snare", "kit_snare.wav"),
-        Sound("Clap", "kit_clap.wav"),
+        Sound("Kick", "kit_kick.wav", 36),
+        Sound("Snare", "kit_snare.wav", 38),
+        Sound("Clap", "kit_clap.wav", 39),
         // The hi-hats share a choke group, so closing the hat cuts the open one off.
-        Sound("Closed Hat", "kit_hat_closed.wav", chokeGroup = 1),
-        Sound("Open Hat", "kit_hat_open.wav", chokeGroup = 1),
-        Sound("Low Tom", "kit_tom_low.wav"),
-        Sound("Mid Tom", "kit_tom_mid.wav"),
-        Sound("High Tom", "kit_tom_high.wav"),
-        Sound("Rim", "kit_rim.wav"),
-        Sound("Cowbell", "kit_cowbell.wav"),
-        Sound("Crash", "kit_crash.wav"),
-        Sound("Shaker", "kit_shaker.wav"),
-        Sound("808 Bass", "kit_808.wav"),
-        Sound("Snap", "kit_snap.wav"),
-        Sound("Zap", "kit_zap.wav"),
-        Sound("Conga", "kit_conga.wav"),
+        Sound("Closed Hat", "kit_hat_closed.wav", 42, chokeGroup = 1),
+        Sound("Open Hat", "kit_hat_open.wav", 46, chokeGroup = 1),
+        Sound("Low Tom", "kit_tom_low.wav", 45),
+        Sound("Mid Tom", "kit_tom_mid.wav", 47),
+        Sound("High Tom", "kit_tom_high.wav", 50),
+        Sound("Rim", "kit_rim.wav", 37),
+        Sound("Cowbell", "kit_cowbell.wav", 56),
+        Sound("Crash", "kit_crash.wav", 49),
+        Sound("Shaker", "kit_shaker.wav", 70),
+        Sound("808 Bass", "kit_808.wav", 35),
+        Sound("Snap", "kit_snap.wav", 75),
+        Sound("Zap", "kit_zap.wav", 77),
+        Sound("Conga", "kit_conga.wav", 63),
     )
+
+    /**
+     * The MIDI note each pad becomes in an exported file. Pads holding a kit
+     * sound get its General MIDI note, so the beat plays right on any GM drum
+     * kit (GarageBand's included); other pads keep their own note (36 + pad)
+     * unless a kit sound already took it, in which case the next free note.
+     * [padSounds] holds the kit sound index of each pad, or null.
+     */
+    fun midiNotes(padSounds: List<Int?>): IntArray {
+        val notes = IntArray(PAD_COUNT) { i -> padSounds.getOrNull(i)?.let { sounds.getOrNull(it)?.gmNote } ?: -1 }
+        val used = notes.filter { it >= 0 }.toMutableSet()
+        for (i in 0 until PAD_COUNT) {
+            if (notes[i] >= 0) continue
+            var note = FIRST_PAD_NOTE + i
+            while (note in used) note = if (note < 127) note + 1 else FIRST_PAD_NOTE
+            notes[i] = note
+            used += note
+        }
+        return notes
+    }
 
     /** Renders sound [index] as mono samples at [sampleRate]. */
     fun render(index: Int, sampleRate: Int): FloatArray {

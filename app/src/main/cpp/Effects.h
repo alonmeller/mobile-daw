@@ -32,6 +32,8 @@ public:
     virtual void process(float *left, float *right, int numFrames) = 0;
 
     static std::shared_ptr<Effect> create(EffectKind kind, int sampleRate);
+    // A fresh copy with the same settings and no audio history, for offline renders.
+    std::shared_ptr<Effect> clone() const;
 
 protected:
     float param(int index) const { return params_[static_cast<size_t>(index)].load(std::memory_order_relaxed); }
@@ -42,4 +44,5 @@ private:
     std::unique_ptr<std::atomic<float>[]> params_;
     const int numParams_;
     std::atomic<bool> bypass_{false};
+    EffectKind kind_ = EffectKind::Eq;  // set by create()
 };

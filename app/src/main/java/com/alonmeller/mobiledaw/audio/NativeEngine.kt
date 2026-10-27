@@ -67,4 +67,24 @@ object NativeEngine {
 
     external fun setMetronome(enabled: Boolean)
     external fun setTempo(bpm: Double)
+
+    /**
+     * Renders what the engine plays now, faster than real time, into 32-bit
+     * float WAV files (plain ASCII paths; empty ones are skipped): the stereo
+     * mix, a stereo stem per track and the mono pre-effect output per track.
+     * Blocks until done and returns [ok, cancelled, frames, peak, loudness in LUFS].
+     */
+    external fun render(
+        start: Long,
+        end: Long,
+        maxTail: Long,
+        mixPath: String,
+        stemPaths: Array<String>,
+        dryPaths: Array<String>,
+    ): DoubleArray
+    external fun renderProgress(): Float
+    external fun cancelRender()
+
+    /** Forgets every source, effect and instrument, before another project opens. */
+    external fun clearSession()
 }
