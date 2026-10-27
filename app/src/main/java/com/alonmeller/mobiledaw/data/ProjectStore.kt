@@ -1,5 +1,8 @@
 package com.alonmeller.mobiledaw.data
 
+import com.alonmeller.mobiledaw.model.Effect
+import com.alonmeller.mobiledaw.model.EffectType
+import com.alonmeller.mobiledaw.model.EnvPoint
 import com.alonmeller.mobiledaw.model.Ids
 import com.alonmeller.mobiledaw.model.Item
 import com.alonmeller.mobiledaw.model.Marker
@@ -87,6 +90,9 @@ class ProjectStore(root: File) {
                     mute = t.optBoolean("mute", false),
                     solo = t.optBoolean("solo", false),
                     items = items,
+                    fx = readEffects(t.optJSONArray("fx")),
+                    volumeEnv = readEnvelope(t.optJSONArray("volumeEnv"), ::frames),
+                    panEnv = readEnvelope(t.optJSONArray("panEnv"), ::frames),
                 )
             }
             val markers = json.optJSONArray("markers")?.let { m ->
@@ -103,6 +109,8 @@ class ProjectStore(root: File) {
                 loopStart = frames(loop?.optLong("start", 0) ?: 0L),
                 loopEnd = frames(loop?.optLong("end", 0) ?: 0L),
                 loopOn = loop?.optBoolean("on", false) ?: false,
+                masterFx = readEffects(json.optJSONArray("masterFx")),
+                masterGain = json.optDouble("masterGain", 1.0).toFloat(),
             )
             val settings = ProjectSettings(
                 metronome = json.optBoolean("metronome", false),
@@ -144,12 +152,15 @@ class ProjectStore(root: File) {
                     .put("mute", t.mute)
                     .put("solo", t.solo)
                     .put("items", items)
+                    .put("fx", writeEffects(t.fx))
+                    .put("volumeEnv", writeEnvelope(t.volumeEnv))
+                    .put("panEnv", writeEnvelope(t.panEnv))
             )
         }
         val markers = JSONArray()
         project.markers.forEach { markers.put(JSONObject().put("position", it.position).put("name", it.name)) }
         val json = JSONObject()
-            .put("version", 2)
+            .put("version", 3)
             .put("tempo", project.tempo)
             .put("sampleRate", sampleRate)
             .put("metronome", settings.metronome)
@@ -157,10 +168,50 @@ class ProjectStore(root: File) {
             .put("grid", settings.gridDivision)
             .put("loop", JSONObject().put("start", project.loopStart).put("end", project.loopEnd).put("on", project.loopOn))
             .put("markers", markers)
+            .put("masterGain", project.masterGain.toDouble())
+            .put("masterFx", writeEffects(project.masterFx))
             .put("tracks", tracks)
         val tmp = File(dir, "project.json.tmp")
         tmp.writeText(json.toString(2))
         tmp.renameTo(projectFile)
+    }
+
+    private fun readEffects(arr: JSONArray?): List<Effect> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.getJSONObject(i)
+            val type = EffectType.fromCode(o.optInt("type", -1)) ?: return@mapNotNull null
+            val saved = o.optJSONArray("values")
+            // Parameters added in later versions fall back to their defaults.
+            val values = type.params.mapIndexed { k, spec ->
+                if (saved != null && k < saved.length()) saved.getDouble(k).toFloat() else spec.default
+            }
+            Effect(Ids.next(), type, values, o.optBoolean("bypass", false))
+        }
+    }
+
+    private fun writeEffects(effects: List<Effect>): JSONArray {
+        val arr = JSONArray()
+        effects.forEach { e ->
+            val values = JSONArray()
+            e.values.forEach { values.put(it.toDouble()) }
+            arr.put(JSONObject().put("type", e.type.code).put("values", values).put("bypass", e.bypass))
+        }
+        return arr
+    }
+
+    private fun readEnvelope(arr: JSONArray?, frames: (Long) -> Long): List<EnvPoint> {
+        if (arr == null) return emptyList()
+        return (0 until arr.length()).map { i ->
+            val p = arr.getJSONArray(i)
+            EnvPoint(frames(p.getLong(0)), p.getDouble(1).toFloat())
+        }.sortedBy { it.frame }
+    }
+
+    private fun writeEnvelope(points: List<EnvPoint>): JSONArray {
+        val arr = JSONArray()
+        points.forEach { arr.put(JSONArray().put(it.frame).put(it.value.toDouble())) }
+        return arr
     }
 
     /** Deletes WAV files that no saved item refers to any more. */

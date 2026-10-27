@@ -1,12 +1,15 @@
 package com.alonmeller.mobiledaw.ui
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitHorizontalTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.awaitTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
@@ -26,11 +29,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -48,6 +52,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
@@ -64,7 +69,9 @@ import androidx.compose.ui.unit.sp
 import com.alonmeller.mobiledaw.DawViewModel
 import com.alonmeller.mobiledaw.PEAK_BUCKET
 import com.alonmeller.mobiledaw.SourceInfo
+import com.alonmeller.mobiledaw.model.EnvKind
 import com.alonmeller.mobiledaw.model.Item
+import com.alonmeller.mobiledaw.model.Scales
 import com.alonmeller.mobiledaw.model.Track
 import kotlin.math.floor
 import kotlin.math.max
@@ -84,12 +91,33 @@ fun DawScreen(vm: DawViewModel, onRecordPressed: () -> Unit) {
         }
     }
 
+    // Kept here so the track list stays where it was after a visit to the mixer.
+    val trackScroll = rememberScrollState()
     Column(
         Modifier
             .fillMaxSize()
             .background(DawColors.Background)
     ) {
         TransportBar(vm, onRecordPressed)
+        if (vm.showMixer) {
+            MixerView(vm, Modifier.fillMaxSize())
+        } else {
+            ArrangeView(vm, trackScroll)
+        }
+    }
+    vm.fxTarget?.let { FxDialog(vm, it) }
+    vm.message?.let { msg ->
+        LaunchedEffect(msg) {
+            kotlinx.coroutines.delay(2500)
+            vm.message = null
+        }
+    }
+}
+
+/** The timeline: edit tools, ruler and track lanes. */
+@Composable
+private fun ArrangeView(vm: DawViewModel, trackScroll: ScrollState) {
+    Column(Modifier.fillMaxSize()) {
         EditBar(vm)
         Row(Modifier.fillMaxWidth().height(RulerHeight)) {
             Box(
@@ -115,7 +143,7 @@ fun DawScreen(vm: DawViewModel, onRecordPressed: () -> Unit) {
             Ruler(vm, Modifier.weight(1f).fillMaxHeight())
         }
         Box(Modifier.fillMaxSize()) {
-            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+            Column(Modifier.fillMaxSize().verticalScroll(trackScroll)) {
                 vm.project.tracks.forEachIndexed { index, track ->
                     key(track.id) { TrackRow(vm, track, index) }
                 }
@@ -124,12 +152,6 @@ fun DawScreen(vm: DawViewModel, onRecordPressed: () -> Unit) {
                 }
                 if (vm.project.tracks.isEmpty() && !vm.recording && !vm.loading) EmptyHint()
             }
-        }
-    }
-    vm.message?.let { msg ->
-        LaunchedEffect(msg) {
-            kotlinx.coroutines.delay(2500)
-            vm.message = null
         }
     }
 }
@@ -170,22 +192,22 @@ private fun TransportBar(vm: DawViewModel, onRecordPressed: () -> Unit) {
         RoundButton(onClick = vm::toggleLoop, active = vm.project.loopOn, activeColor = DawColors.Loop) {
             Text("⟳", color = DawColors.TextPrimary, fontSize = 20.sp)
         }
-
-        Spacer(Modifier.width(4.dp))
         TimeDisplay(vm)
-        Spacer(Modifier.width(4.dp))
-
         TempoControl(vm)
         RoundButton(onClick = vm::toggleMetronome, active = vm.settings.metronome, activeColor = DawColors.Accent) {
             GlyphIcon(Glyph.Metronome, DawColors.TextPrimary, size = 20.dp)
+        }
+        // Switches between the timeline and the mixer, like REAPER's View > Mixer.
+        RoundButton(onClick = vm::toggleMixer, active = vm.showMixer, activeColor = DawColors.Accent) {
+            Text("MIX", color = DawColors.TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
         }
 
         Spacer(Modifier.weight(1f))
 
         vm.message?.let { Text(it, color = DawColors.Solo, fontSize = 12.sp, maxLines = 1) }
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (vm.recording) LevelMeter(vm.inputLevel, Modifier.width(56.dp).height(8.dp), label = "IN")
-            LevelMeter(vm.masterLevel, Modifier.width(56.dp).height(8.dp), label = "OUT")
+            if (vm.recording) LevelMeter(vm.inputLevel, Modifier.width(70.dp).height(8.dp), label = "IN")
+            LevelMeter(vm.masterLevel, Modifier.width(70.dp).height(8.dp), label = "OUT")
         }
     }
 }
@@ -287,7 +309,7 @@ private fun TimeDisplay(vm: DawViewModel) {
             .clip(RoundedCornerShape(8.dp))
             .background(DawColors.Lcd)
             .border(1.dp, DawColors.PanelRaised, RoundedCornerShape(8.dp))
-            .padding(horizontal = 14.dp, vertical = 3.dp),
+            .padding(horizontal = 10.dp, vertical = 3.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
@@ -327,26 +349,21 @@ private fun TempoControl(vm: DawViewModel) {
 private fun SmallTextButton(text: String, onClick: () -> Unit) {
     Box(
         Modifier
-            .size(width = 34.dp, height = 42.dp)
+            .size(width = 30.dp, height = 42.dp)
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) { Text(text, color = DawColors.TextPrimary, fontSize = 20.sp) }
 }
 
+/** Horizontal peak meter on the faders' dB scale. */
 @Composable
 private fun LevelMeter(level: Float, modifier: Modifier, label: String? = null) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
         if (label != null) {
-            Text(label, color = DawColors.TextSecondary, fontSize = 9.sp, modifier = Modifier.padding(end = 4.dp))
+            Text(label, color = DawColors.TextSecondary, fontSize = 9.sp, modifier = Modifier.width(22.dp))
         }
-        Canvas(modifier.clip(RoundedCornerShape(3.dp)).background(Color.Black)) {
-            val v = level.coerceIn(0f, 1f)
-            val color = when {
-                v > 0.95f -> DawColors.MeterRed
-                v > 0.7f -> DawColors.MeterYellow
-                else -> DawColors.MeterGreen
-            }
-            drawRect(color, size = Size(size.width * v, size.height))
+        Canvas(Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(3.dp))) {
+            drawMeter(level, Offset.Zero, size, vertical = false)
         }
     }
 }
@@ -374,6 +391,42 @@ private suspend fun PointerInputScope.detectHorizontalDragFromDown(
             change.consume()
         }
         onEnd()
+    }
+}
+
+/**
+ * Envelope editing: a drag that starts on a point moves it in any direction;
+ * one that starts elsewhere scrolls the timeline sideways.
+ */
+private suspend fun PointerInputScope.detectEnvelopeDrag(
+    hitTest: (Offset) -> Int?,
+    onPointStart: (Int) -> Unit,
+    onPointDrag: (Offset) -> Unit,
+    onPointEnd: () -> Unit,
+    onScroll: (dx: Float) -> Unit,
+) {
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        val point = hitTest(down.position)
+        if (point != null) {
+            val slopChange = awaitTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
+                ?: return@awaitEachGesture
+            onPointStart(point)
+            onPointDrag(slopChange.position)
+            drag(slopChange.id) { change ->
+                onPointDrag(change.position)
+                change.consume()
+            }
+            onPointEnd()
+        } else {
+            val slopChange = awaitHorizontalTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
+                ?: return@awaitEachGesture
+            onScroll(slopChange.position.x - down.position.x)
+            horizontalDrag(slopChange.id) { change ->
+                onScroll(change.positionChange().x)
+                change.consume()
+            }
+        }
     }
 }
 
@@ -455,7 +508,7 @@ private fun Ruler(vm: DawViewModel, modifier: Modifier) {
 }
 
 private val paints = HashMap<Triple<Float, Int, Boolean>, android.graphics.Paint>()
-private fun textPaint(textSize: Float, color: Int, bold: Boolean): android.graphics.Paint =
+internal fun textPaint(textSize: Float, color: Int, bold: Boolean): android.graphics.Paint =
     paints.getOrPut(Triple(textSize, color, bold)) {
         android.graphics.Paint().apply {
             isAntiAlias = true
@@ -519,7 +572,9 @@ private fun TrackRow(vm: DawViewModel, track: Track, index: Int) {
 private fun TrackHeader(vm: DawViewModel, track: Track) {
     val color = DawColors.track(track.colorIndex)
     var menuOpen by remember { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf(false) }
     val selected = vm.selectedTrackId == track.id
+    val envKind = vm.envModes[track.id]
     Row(
         Modifier
             .width(HeaderWidth)
@@ -528,7 +583,10 @@ private fun TrackHeader(vm: DawViewModel, track: Track) {
             .clickable { vm.selectItem(null, track.id) }
     ) {
         Box(Modifier.width(5.dp).fillMaxHeight().background(color))
-        Column(Modifier.padding(horizontal = 8.dp, vertical = 6.dp).fillMaxSize()) {
+        Column(
+            Modifier.padding(horizontal = 8.dp, vertical = 6.dp).fillMaxSize(),
+            verticalArrangement = Arrangement.SpaceBetween,
+        ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     track.name,
@@ -549,35 +607,106 @@ private fun TrackHeader(vm: DawViewModel, track: Track) {
                         contentAlignment = Alignment.Center,
                     ) { Text("⋮", color = DawColors.TextSecondary, fontSize = 16.sp) }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        DropdownMenuItem(
-                            text = { Text("Delete track") },
-                            onClick = {
-                                menuOpen = false
-                                vm.deleteTrack(track.id)
-                            },
-                        )
+                        val close = { menuOpen = false }
+                        MenuItem("Rename track") { close(); renaming = true }
+                        MenuItem("Duplicate track") { close(); vm.duplicateTrack(track.id) }
+                        MenuItem("Move track up") { close(); vm.moveTrack(track.id, -1) }
+                        MenuItem("Move track down") { close(); vm.moveTrack(track.id, 1) }
+                        if (track.volumeEnv.isNotEmpty()) {
+                            MenuItem("Clear volume automation") { close(); vm.clearEnvelope(track.id, EnvKind.Volume) }
+                        }
+                        if (track.panEnv.isNotEmpty()) {
+                            MenuItem("Clear pan automation") { close(); vm.clearEnvelope(track.id, EnvKind.Pan) }
+                        }
+                        MenuItem("Delete track") { close(); vm.deleteTrack(track.id) }
                     }
                 }
             }
-            Slider(
-                value = track.gain,
-                onValueChange = { vm.setTrackGain(track.id, it) },
-                onValueChangeFinished = { vm.endGesture() },
-                valueRange = 0f..1.5f,
-                colors = SliderDefaults.colors(
-                    thumbColor = DawColors.TextPrimary,
-                    activeTrackColor = color,
-                    inactiveTrackColor = DawColors.Background,
-                ),
-                modifier = Modifier.height(28.dp),
-            )
-            LevelMeter(vm.trackLevels[track.id] ?: 0f, Modifier.fillMaxWidth().height(5.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                MiniSlider(
+                    position = Scales.gainToPosition(track.gain),
+                    color = color,
+                    onChange = { vm.setTrackGain(track.id, Scales.positionToGain(it)) },
+                    onEnd = vm::endGesture,
+                    onReset = {
+                        vm.setTrackGain(track.id, 1f)
+                        vm.endGesture()
+                    },
+                    modifier = Modifier.weight(1f).height(26.dp),
+                )
+                Text(
+                    Scales.gainLabel(track.gain).removeSuffix(" dB"),
+                    color = DawColors.TextSecondary,
+                    fontSize = 10.sp,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.width(34.dp),
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                LevelMeter(vm.trackLevels[track.id] ?: 0f, Modifier.weight(1f).height(6.dp))
+                Spacer(Modifier.width(6.dp))
+                LabelChip("FX", track.fx.isNotEmpty(), DawColors.Accent, Modifier.width(32.dp)) { vm.openFx(track.id) }
+                Spacer(Modifier.width(4.dp))
+                // Automation: off, then the volume envelope, then the pan envelope.
+                val hasAutomation = track.volumeEnv.isNotEmpty() || track.panEnv.isNotEmpty()
+                LabelChip(
+                    when (envKind) {
+                        null -> if (hasAutomation) "A•" else "A"
+                        EnvKind.Volume -> "VOL"
+                        EnvKind.Pan -> "PAN"
+                    },
+                    envKind != null,
+                    envKind?.let(::envelopeColor) ?: DawColors.Accent,
+                    Modifier.width(38.dp),
+                ) { vm.cycleEnvelope(track.id) }
+            }
         }
+    }
+    if (renaming) {
+        RenameDialog(
+            initial = track.name,
+            onDismiss = { renaming = false },
+            onRename = {
+                renaming = false
+                vm.renameTrack(track.id, it)
+            },
+        )
     }
 }
 
 @Composable
-private fun ToggleChip(label: String, on: Boolean, onColor: Color, onClick: () -> Unit) {
+private fun MenuItem(label: String, onClick: () -> Unit) {
+    DropdownMenuItem(text = { Text(label) }, onClick = onClick)
+}
+
+@Composable
+private fun RenameDialog(initial: String, onDismiss: () -> Unit, onRename: (String) -> Unit) {
+    var text by remember { mutableStateOf(initial) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename track") },
+        text = { OutlinedTextField(value = text, onValueChange = { text = it }, singleLine = true) },
+        confirmButton = { TextButton(onClick = { onRename(text) }) { Text("OK") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun LabelChip(label: String, on: Boolean, onColor: Color, modifier: Modifier, onClick: () -> Unit) {
+    Box(
+        modifier
+            .height(24.dp)
+            .clip(RoundedCornerShape(5.dp))
+            .background(if (on) onColor else DawColors.Background)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, color = if (on) Color.Black else DawColors.TextSecondary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+internal fun ToggleChip(label: String, on: Boolean, onColor: Color, onClick: () -> Unit) {
     Box(
         Modifier
             .size(24.dp)
@@ -595,31 +724,56 @@ private fun TrackLane(vm: DawViewModel, track: Track, index: Int, modifier: Modi
     val latestVm by rememberUpdatedState(vm)
     val latestTrack by rememberUpdatedState(track)
     val color = DawColors.track(track.colorIndex)
+    // With an envelope shown, touches edit its points instead of the items, as in REAPER's envelope lanes.
+    val envKind = vm.envModes[track.id]
     Canvas(
         modifier
             .background(if (index % 2 == 0) DawColors.Lane else DawColors.LaneAlt)
-            .pointerInput(track.id) {
-                var draggingItem = false
-                detectHorizontalDragFromDown(
-                    onStart = { down ->
-                        val hit = latestVm.hitTest(latestTrack, down.x, down.y, size.height.toFloat())
-                        draggingItem = hit != null
-                        if (hit != null) latestVm.beginItemDrag(hit.first, hit.second, latestTrack.id)
-                    },
-                    onDrag = { _, dx -> if (draggingItem) latestVm.dragItemBy(dx) else latestVm.scrollBy(-dx) },
-                    onEnd = { if (draggingItem) latestVm.endItemDrag() },
-                )
-            }
-            .pointerInput(track.id) {
-                detectTapGestures { pos ->
-                    val hit = latestVm.hitTest(latestTrack, pos.x, pos.y, size.height.toFloat())
-                    if (hit != null) {
-                        latestVm.selectItem(hit.first.id, latestTrack.id)
-                    } else {
-                        latestVm.selectItem(null, latestTrack.id)
-                        latestVm.seekToScreenX(pos.x)
-                    }
+            .pointerInput(track.id, envKind) {
+                if (envKind == null) {
+                    var draggingItem = false
+                    detectHorizontalDragFromDown(
+                        onStart = { down ->
+                            val hit = latestVm.hitTest(latestTrack, down.x, down.y, size.height.toFloat())
+                            draggingItem = hit != null
+                            if (hit != null) latestVm.beginItemDrag(hit.first, hit.second, latestTrack.id)
+                        },
+                        onDrag = { _, dx -> if (draggingItem) latestVm.dragItemBy(dx) else latestVm.scrollBy(-dx) },
+                        onEnd = { if (draggingItem) latestVm.endItemDrag() },
+                    )
+                } else {
+                    detectEnvelopeDrag(
+                        hitTest = { latestVm.envPointAt(latestTrack, envKind, it.x, it.y, size.height.toFloat()) },
+                        onPointStart = { latestVm.beginEnvDrag(latestTrack.id, it) },
+                        onPointDrag = { latestVm.dragEnvPoint(latestTrack.id, envKind, it.x, it.y, size.height.toFloat()) },
+                        onPointEnd = { latestVm.endEnvDrag() },
+                        onScroll = { dx -> latestVm.scrollBy(-dx) },
+                    )
                 }
+            }
+            .pointerInput(track.id, envKind) {
+                detectTapGestures(
+                    onTap = { pos ->
+                        val h = size.height.toFloat()
+                        if (envKind != null) {
+                            if (latestVm.envPointAt(latestTrack, envKind, pos.x, pos.y, h) == null) {
+                                latestVm.addEnvPoint(latestTrack.id, envKind, pos.x, pos.y, h)
+                            }
+                        } else {
+                            val hit = latestVm.hitTest(latestTrack, pos.x, pos.y, h)
+                            if (hit != null) {
+                                latestVm.selectItem(hit.first.id, latestTrack.id)
+                            } else {
+                                latestVm.selectItem(null, latestTrack.id)
+                                latestVm.seekToScreenX(pos.x)
+                            }
+                        }
+                    },
+                    onLongPress = if (envKind == null) null else { pos: Offset ->
+                        latestVm.envPointAt(latestTrack, envKind, pos.x, pos.y, size.height.toFloat())
+                            ?.let { latestVm.deleteEnvPoint(latestTrack.id, envKind, it) }
+                    },
+                )
             }
     ) {
         drawGrid(vm)
@@ -627,8 +781,54 @@ private fun TrackLane(vm: DawViewModel, track: Track, index: Int, modifier: Modi
             drawItem(vm, item, vm.sources[item.sourceId], color, item.id in vm.selectedItems, track.mute)
         }
         if (vm.isRecordingInto(track)) drawRecording(vm)
+        if (envKind != null) drawEnvelope(vm, track, envKind)
         drawPlayhead(vm)
     }
+}
+
+private fun envelopeColor(kind: EnvKind) = if (kind == EnvKind.Volume) Color(0xFF30D158) else Color(0xFF64D2FF)
+
+/** The automation envelope over a lane: a line through its points, as straight lines on the fader scale. */
+private fun DrawScope.drawEnvelope(vm: DawViewModel, track: Track, kind: EnvKind) {
+    val color = envelopeColor(kind)
+    val h = size.height
+    drawRect(Color.Black.copy(alpha = 0.35f))
+    val points = track.envelope(kind)
+    val stroke = 2.dp.toPx()
+    if (points.isEmpty()) {
+        // No points yet: the envelope rests at 0 dB, or at the pan knob.
+        val y = vm.envY(kind, if (kind == EnvKind.Volume) 1f else track.pan, h)
+        drawLine(
+            color.copy(alpha = 0.7f), Offset(0f, y), Offset(size.width, y), stroke,
+            pathEffect = PathEffect.dashPathEffect(floatArrayOf(8.dp.toPx(), 6.dp.toPx())),
+        )
+    } else {
+        val path = Path()
+        path.moveTo(minOf(0f, vm.screenX(points.first().frame)), vm.envY(kind, points.first().value, h))
+        points.forEach { pt -> path.lineTo(vm.screenX(pt.frame), vm.envY(kind, pt.value, h)) }
+        path.lineTo(maxOf(size.width, vm.screenX(points.last().frame)), vm.envY(kind, points.last().value, h))
+        drawPath(path, color, style = Stroke(stroke))
+        val drag = vm.envDrag
+        points.forEachIndexed { i, pt ->
+            val x = vm.screenX(pt.frame)
+            if (x < -12f || x > size.width + 12f) return@forEachIndexed
+            val y = vm.envY(kind, pt.value, h)
+            drawCircle(Color.Black, 7.dp.toPx(), Offset(x, y))
+            drawCircle(color, 5.5.dp.toPx(), Offset(x, y))
+            if (drag != null && drag.first == track.id && drag.second == i) {
+                val label = if (kind == EnvKind.Volume) Scales.gainLabel(pt.value) else Scales.panLabel(pt.value)
+                drawContext.canvas.nativeCanvas.drawText(
+                    label, x + 10.dp.toPx(), (y - 8.dp.toPx()).coerceAtLeast(12.dp.toPx()),
+                    textPaint(12.dp.toPx(), android.graphics.Color.WHITE, bold = true),
+                )
+            }
+        }
+    }
+    drawContext.canvas.nativeCanvas.drawText(
+        (if (kind == EnvKind.Volume) "Volume" else "Pan") + "   tap: add point · drag: move · hold: delete",
+        8.dp.toPx(), h - 6.dp.toPx(),
+        textPaint(10.dp.toPx(), android.graphics.Color.argb(0xB0, 0xF2, 0xF2, 0xF7), bold = false),
+    )
 }
 
 @Composable

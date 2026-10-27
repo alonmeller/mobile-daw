@@ -13,11 +13,18 @@ import com.alonmeller.mobiledaw.data.ProjectSettings
 import com.alonmeller.mobiledaw.data.ProjectStore
 import com.alonmeller.mobiledaw.data.WavFile
 import com.alonmeller.mobiledaw.model.Edits
+import com.alonmeller.mobiledaw.model.Effect
+import com.alonmeller.mobiledaw.model.EffectType
+import com.alonmeller.mobiledaw.model.EnvKind
+import com.alonmeller.mobiledaw.model.EnvPoint
+import com.alonmeller.mobiledaw.model.Envelopes
 import com.alonmeller.mobiledaw.model.History
 import com.alonmeller.mobiledaw.model.Ids
 import com.alonmeller.mobiledaw.model.Item
+import com.alonmeller.mobiledaw.model.MASTER
 import com.alonmeller.mobiledaw.model.Marker
 import com.alonmeller.mobiledaw.model.Project
+import com.alonmeller.mobiledaw.model.Scales
 import com.alonmeller.mobiledaw.model.Track
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -27,6 +34,7 @@ import kotlinx.coroutines.withContext
 import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.pow
 
 /** Frames per waveform bucket; fine enough for the deepest zoom level. */
 const val PEAK_BUCKET = 256
@@ -39,6 +47,9 @@ enum class DragMode { Move, TrimLeft, TrimRight, FadeIn, FadeOut }
 
 /** Grid choices: notes per bar. */
 val GRID_DIVISIONS = listOf(1, 2, 4, 8, 16)
+
+/** How fast meters fall back after a peak. */
+private const val METER_FALL_DB_PER_SECOND = 24f
 
 class DawViewModel(app: Application) : AndroidViewModel(app) {
     private val store = ProjectStore(app.filesDir)
@@ -85,6 +96,16 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var loading by mutableStateOf(true)
         private set
+
+    /** Mixer instead of the arrange view. */
+    var showMixer by mutableStateOf(false)
+        private set
+    /** Track id (or [MASTER]) whose effect chain is open, or null. */
+    var fxTarget by mutableStateOf<Long?>(null)
+        private set
+    /** Tracks showing an automation envelope over their lane. */
+    var envModes by mutableStateOf(mapOf<Long, EnvKind>())
+        private set
     var message by mutableStateOf<String?>(if (engineStarted) null else "Audio engine failed to start")
 
     /** Timeline zoom in dp per second, and horizontal scroll in px. */
@@ -129,8 +150,28 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         loading = false
     }
 
+    /** Effects the engine already has, with the settings it was last given. */
+    private val pushedEffects = mutableMapOf<Long, Effect>()
+
+    private fun syncEffects(p: Project) {
+        for (e in p.allEffects) {
+            val prev = pushedEffects[e.id]
+            if (prev == null) {
+                NativeEngine.createEffect(e.id, e.type.code, e.values.toFloatArray())
+                if (e.bypass) NativeEngine.setEffectBypass(e.id, true)
+            } else if (prev != e) {
+                e.values.forEachIndexed { i, v ->
+                    if (prev.values.getOrNull(i) != v) NativeEngine.setEffectParam(e.id, i, v)
+                }
+                if (prev.bypass != e.bypass) NativeEngine.setEffectBypass(e.id, e.bypass)
+            }
+            pushedEffects[e.id] = e
+        }
+    }
+
     /** Pushes the project to the audio engine. */
     private fun sync(p: Project) {
+        syncEffects(p)
         val trackParams = FloatArray(p.tracks.size * 4)
         val counts = IntArray(p.tracks.size)
         val items = p.tracks.map { t -> t.items.filter { !it.mute && it.sourceId in sources } }
@@ -155,7 +196,26 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
                 k++
             }
         }
-        NativeEngine.setArrangement(trackParams, counts, itemParams, itemGains)
+        val fxCounts = IntArray(p.tracks.size + 1)
+        p.tracks.forEachIndexed { i, t -> fxCounts[i] = t.fx.size }
+        fxCounts[p.tracks.size] = p.masterFx.size
+        val fxIds = (p.tracks.flatMap { it.fx } + p.masterFx).map { it.id }.toLongArray()
+        val envCounts = IntArray(p.tracks.size * 2)
+        val points = mutableListOf<EnvPoint>()
+        p.tracks.forEachIndexed { i, t ->
+            envCounts[i * 2] = t.volumeEnv.size
+            envCounts[i * 2 + 1] = t.panEnv.size
+            // Volume goes as fader positions so the engine interpolates on the
+            // fader scale, exactly the straight lines drawn on screen.
+            points += t.volumeEnv.map { EnvPoint(it.frame, Scales.gainToPosition(it.value)) }
+            points += t.panEnv
+        }
+        NativeEngine.setArrangement(
+            trackParams, counts, itemParams, itemGains,
+            fxCounts, fxIds,
+            envCounts, points.map { it.frame }.toLongArray(), points.map { it.value }.toFloatArray(),
+            p.masterGain,
+        )
         NativeEngine.setTempo(p.tempo)
         NativeEngine.setLoop(p.loopStart, p.loopEnd, p.loopOn)
     }
@@ -204,20 +264,30 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------------ per-frame polling
 
+    private var lastTickNanos = 0L
+
     /** Called every UI frame to pull transport and meter state from the engine. */
     fun tick() {
+        val now = System.nanoTime()
+        val seconds = if (lastTickNanos == 0L) 0f else ((now - lastTickNanos) / 1e9f).coerceAtMost(0.25f)
+        lastTickNanos = now
+        // Meters jump up to each new peak and fall back at a steady rate, like a mixing desk.
+        val fall = 10f.pow(-METER_FALL_DB_PER_SECOND * seconds / 20f)
+        fun meter(shown: Float, peak: Float) = max(peak, shown * fall).let { if (it < 1e-4f) 0f else it }
+
         position = NativeEngine.position()
-        masterLevel = NativeEngine.masterPeak()
+        masterLevel = meter(masterLevel, NativeEngine.masterPeak())
         if (recording) {
             recordedFrames = NativeEngine.recordedFrames()
-            inputLevel = NativeEngine.inputLevel()
+            inputLevel = meter(inputLevel, NativeEngine.inputLevel())
         }
-        if (playing) {
-            trackLevels = project.tracks.withIndex().associate { (i, t) -> t.id to NativeEngine.trackPeak(i) }
-            followPlayhead()
-        } else if (trackLevels.isNotEmpty()) {
-            trackLevels = emptyMap()
+        val levels = HashMap<Long, Float>()
+        project.tracks.forEachIndexed { i, t ->
+            val v = meter(trackLevels[t.id] ?: 0f, NativeEngine.trackPeak(i))
+            if (v > 0f) levels[t.id] = v
         }
+        if (levels.isNotEmpty() || trackLevels.isNotEmpty()) trackLevels = levels
+        if (playing) followPlayhead()
     }
 
     // ------------------------------------------------------------ timeline geometry
@@ -432,6 +502,36 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteTrack(id: Long) = commit(project.copy(tracks = project.tracks.filterNot { it.id == id }))
 
+    fun renameTrack(id: Long, name: String) {
+        val clean = name.trim()
+        if (clean.isNotEmpty()) commit(project.updateTrack(id) { it.copy(name = clean) })
+    }
+
+    /** Copies a track with its items, effects and automation right below it. */
+    fun duplicateTrack(id: Long) {
+        val index = project.tracks.indexOfFirst { it.id == id }
+        if (index < 0) return
+        val t = project.tracks[index]
+        val copy = t.copy(
+            id = Ids.next(),
+            name = "${t.name} copy",
+            solo = false,
+            items = t.items.map { it.copy(id = Ids.next()) },
+            fx = t.fx.map { it.copy(id = Ids.next()) },
+        )
+        commit(project.copy(tracks = project.tracks.toMutableList().apply { add(index + 1, copy) }))
+        selectedTrackId = copy.id
+    }
+
+    fun moveTrack(id: Long, direction: Int) {
+        val tracks = project.tracks.toMutableList()
+        val i = tracks.indexOfFirst { it.id == id }
+        val j = i + direction
+        if (i < 0 || j !in tracks.indices) return
+        tracks[i] = tracks[j].also { tracks[j] = tracks[i] }
+        commit(project.copy(tracks = tracks))
+    }
+
     fun toggleArm(id: Long) {
         if (recording) return
         armedTrackId = if (armedTrackId == id) -1 else id
@@ -441,11 +541,151 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     fun toggleSolo(id: Long) = commit(project.updateTrack(id) { it.copy(solo = !it.solo) })
 
     /** Live slider change; [endGesture] makes it one undo step. */
-    fun setTrackGain(id: Long, gain: Float) {
+    fun setTrackGain(id: Long, gain: Float) = preview(project.updateTrack(id) { it.copy(gain = gain) })
+
+    fun setTrackPan(id: Long, pan: Float) = preview(project.updateTrack(id) { it.copy(pan = pan.coerceIn(-1f, 1f)) })
+
+    fun centerPan(id: Long) = commit(project.updateTrack(id) { it.copy(pan = 0f) })
+
+    fun setMasterGain(gain: Float) = preview(project.copy(masterGain = gain))
+
+    /** Applies a live change during a gesture; [endGesture] makes the whole gesture one undo step. */
+    private fun preview(p: Project) {
         if (gestureBase == null) gestureBase = project
-        val p = project.updateTrack(id) { it.copy(gain = gain) }
         project = p
         sync(p)
+    }
+
+    fun toggleMixer() {
+        showMixer = !showMixer
+    }
+
+    // ------------------------------------------------------------ effects
+
+    fun openFx(target: Long) {
+        fxTarget = target
+    }
+
+    fun closeFx() {
+        endGesture()
+        fxTarget = null
+    }
+
+    fun fxTitle(target: Long): String =
+        if (target == MASTER) "Master" else project.tracks.firstOrNull { it.id == target }?.name ?: ""
+
+    fun addEffect(target: Long, type: EffectType) =
+        commit(project.withFxChain(target, project.fxChain(target) + Effect(Ids.next(), type)))
+
+    fun removeEffect(target: Long, id: Long) =
+        commit(project.withFxChain(target, project.fxChain(target).filterNot { it.id == id }))
+
+    fun moveEffect(target: Long, id: Long, direction: Int) {
+        val chain = project.fxChain(target).toMutableList()
+        val i = chain.indexOfFirst { it.id == id }
+        val j = i + direction
+        if (i < 0 || j !in chain.indices) return
+        chain[i] = chain[j].also { chain[j] = chain[i] }
+        commit(project.withFxChain(target, chain))
+    }
+
+    fun toggleBypass(target: Long, id: Long) = commit(
+        project.withFxChain(target, project.fxChain(target).map { if (it.id == id) it.copy(bypass = !it.bypass) else it })
+    )
+
+    /** Live parameter change; only the effect is updated, the arrangement stays as it is. */
+    fun setEffectParam(target: Long, id: Long, index: Int, value: Float) {
+        if (gestureBase == null) gestureBase = project
+        val chain = project.fxChain(target).map { e ->
+            if (e.id != id) e else e.copy(values = e.values.toMutableList().also { it[index] = value })
+        }
+        val p = project.withFxChain(target, chain)
+        project = p
+        syncEffects(p)
+    }
+
+    fun resetEffect(target: Long, id: Long) = commit(
+        project.withFxChain(target, project.fxChain(target).map { if (it.id == id) it.copy(values = it.type.defaults()) else it })
+    )
+
+    // ------------------------------------------------------------ automation envelopes
+
+    /** Track header "A" button: no envelope, then volume, then pan. */
+    fun cycleEnvelope(trackId: Long) {
+        envModes = when (envModes[trackId]) {
+            null -> envModes + (trackId to EnvKind.Volume)
+            EnvKind.Volume -> envModes + (trackId to EnvKind.Pan)
+            EnvKind.Pan -> envModes - trackId
+        }
+    }
+
+    fun envValueToPosition(kind: EnvKind, value: Float) =
+        if (kind == EnvKind.Volume) Scales.gainToPosition(value) else Scales.panToPosition(value)
+
+    fun envPositionToValue(kind: EnvKind, position: Float) =
+        if (kind == EnvKind.Volume) Scales.positionToGain(position) else Scales.positionToPan(position)
+
+    /** Envelopes keep clear of the lane's edges so their extreme points stay visible. */
+    private val envInset get() = 8 * density
+
+    /** Screen y of an envelope [value] in a lane of height [laneH]. */
+    fun envY(kind: EnvKind, value: Float, laneH: Float): Float =
+        envInset + (1 - envValueToPosition(kind, value)) * (laneH - 2 * envInset)
+
+    private fun envValueAtY(kind: EnvKind, y: Float, laneH: Float): Float =
+        envPositionToValue(kind, 1 - ((y - envInset) / (laneH - 2 * envInset)).coerceIn(0f, 1f))
+
+    /** Envelope point near screen (x, y) in a lane of height [laneH], if any. */
+    fun envPointAt(track: Track, kind: EnvKind, x: Float, y: Float, laneH: Float): Int? {
+        val radius = 22 * density
+        var best: Int? = null
+        var bestDist = Float.MAX_VALUE
+        track.envelope(kind).forEachIndexed { i, pt ->
+            val px = screenX(pt.frame)
+            val py = envY(kind, pt.value, laneH)
+            val d = kotlin.math.hypot(px - x, py - y)
+            if (d < radius && d < bestDist) {
+                best = i
+                bestDist = d
+            }
+        }
+        return best
+    }
+
+    fun addEnvPoint(trackId: Long, kind: EnvKind, x: Float, y: Float, laneH: Float) {
+        val frame = snapped(frameAtScreen(x))
+        val value = envValueAtY(kind, y, laneH)
+        commit(project.updateTrack(trackId) { it.withEnvelope(kind, Envelopes.add(it.envelope(kind), EnvPoint(frame, value))) })
+    }
+
+    fun deleteEnvPoint(trackId: Long, kind: EnvKind, index: Int) =
+        commit(project.updateTrack(trackId) { it.withEnvelope(kind, Envelopes.remove(it.envelope(kind), index)) })
+
+    fun clearEnvelope(trackId: Long, kind: EnvKind) =
+        commit(project.updateTrack(trackId) { it.withEnvelope(kind, emptyList()) })
+
+    /** Track id and index of the envelope point being dragged, so the lane can show its value. */
+    var envDrag by mutableStateOf<Pair<Long, Int>?>(null)
+        private set
+
+    fun beginEnvDrag(trackId: Long, index: Int) {
+        gestureBase = project
+        envDrag = trackId to index
+    }
+
+    fun dragEnvPoint(trackId: Long, kind: EnvKind, x: Float, y: Float, laneH: Float) {
+        val base = gestureBase ?: return
+        val index = envDrag?.second ?: return
+        val frame = snapped(frameAtScreen(x))
+        val value = envValueAtY(kind, y, laneH)
+        val p = base.updateTrack(trackId) { it.withEnvelope(kind, Envelopes.move(it.envelope(kind), index, frame, value)) }
+        project = p
+        sync(p)
+    }
+
+    fun endEnvDrag() {
+        envDrag = null
+        endGesture()
     }
 
     // ------------------------------------------------------------ item selection and dragging
