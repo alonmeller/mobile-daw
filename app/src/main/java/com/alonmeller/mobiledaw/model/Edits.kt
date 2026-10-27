@@ -18,16 +18,15 @@ object Edits {
         return item.copy(fadeIn = fadeIn, fadeOut = fadeOut)
     }
 
-    /** Splits [item] at timeline frame [at]; null when [at] is not strictly inside it. */
+    /** Splits [item] at timeline frame [at]; null when [at] is not strictly inside it. Both halves keep every take. */
     fun split(item: Item, at: Long): Pair<Item, Item>? {
         if (!item.contains(at)) return null
         val leftLen = at - item.position
         val left = clampFades(item.copy(length = leftLen, fadeOut = 0))
         val right = clampFades(
-            item.copy(
+            Takes.shift(item, leftLen).copy(
                 id = Ids.next(),
                 position = at,
-                offset = item.offset + leftLen,
                 length = item.length - leftLen,
                 fadeIn = 0,
             )
@@ -55,13 +54,13 @@ object Edits {
         return project.copy(tracks = tracks) to rightIds
     }
 
-    /** Moves the left edge to [newPosition], revealing or hiding source audio. */
+    /** Moves the left edge to [newPosition], revealing or hiding source audio (of every take). */
     fun trimLeft(item: Item, newPosition: Long): Item {
-        val minPos = item.position - item.offset // cannot reveal before the source start
+        val minPos = item.position - Takes.earliestOffset(item) // cannot reveal before a source's start
         val maxPos = item.end - MIN_LENGTH
         val pos = newPosition.coerceIn(minPos.coerceAtLeast(0), maxOf(minPos.coerceAtLeast(0), maxPos))
         val delta = pos - item.position
-        return clampFades(item.copy(position = pos, offset = item.offset + delta, length = item.length - delta))
+        return clampFades(Takes.shift(item, delta).copy(position = pos, length = item.length - delta))
     }
 
     /** Moves the right edge to [newEnd], limited by the source length. */

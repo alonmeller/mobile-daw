@@ -38,7 +38,7 @@ class ReaperProjectTest {
         ReaperProject.write(
             project = p,
             sampleRate = rate,
-            mediaFile = { if (it.sourceId == 3) "take 1.wav" else null },
+            mediaFile = { if (it == 3) "take 1.wav" else if (it == 6) "take 2.wav" else null },
             rendered = rendered,
             drumNotes = mapOf(2L to IntArray(PAD_COUNT) { if (it == 2) 39 else 36 + it }),
             colors = mapOf(1L to 0x3D9BFF),
@@ -119,6 +119,28 @@ class ReaperProjectTest {
         assertEquals(listOf("<SOURCE WAVE", "FILE \"take 1.wav\"", ">"), block(write(), "SOURCE WAVE"))
         // The item with no file is left out.
         assertEquals(1, track.count { it == "<ITEM" })
+    }
+
+    @Test
+    fun takesArriveAsReaperTakesWithTheOnePlaying() {
+        // Three takes, the second playing; the third's file did not come along.
+        val takes = listOf(Take(3, 24_000, 0.8f), Take(6, 48_000, 0.5f), Take(4, 0))
+        val item = Takes.withTakes(Item(12, sourceId = 3, position = 0, offset = 0, length = 48_000), takes, active = 1)
+        val text = write(project.copy(tracks = listOf(vocal.copy(items = listOf(item)))))
+        val lines = block(text, "ITEM")
+        // The first take follows the item's own lines; the next starts with "TAKE SEL", as it plays.
+        assertEquals(listOf("TAKE SEL"), lines.filter { it.startsWith("TAKE") })
+        assertEquals(listOf("NAME \"Vocal take 1\"", "NAME \"Vocal take 2\""), lines.filter { it.startsWith("NAME ") })
+        assertEquals(listOf("SOFFS 0.5", "SOFFS 1"), lines.filter { it.startsWith("SOFFS ") })
+        assertEquals(listOf("VOLPAN 0.8000000119 0 1 -1", "VOLPAN 0.5 0 1 -1"), lines.filter { it.startsWith("VOLPAN ") })
+        assertEquals(listOf("FILE \"take 1.wav\"", "FILE \"take 2.wav\""), lines.filter { it.startsWith("FILE ") })
+        assertEquals(1, lines.count { it == "<SOURCE WAVE" } - 1)
+        // With the first take playing, no take line is marked.
+        val first = write(project.copy(tracks = listOf(vocal.copy(items = listOf(Takes.select(item, 0))))))
+        assertEquals(listOf("TAKE"), block(first, "ITEM").filter { it.startsWith("TAKE") })
+        // A take that plays but did not come along leaves the first one playing.
+        val missing = write(project.copy(tracks = listOf(vocal.copy(items = listOf(Takes.select(item, 2))))))
+        assertEquals(listOf("TAKE"), block(missing, "ITEM").filter { it.startsWith("TAKE") })
     }
 
     @Test

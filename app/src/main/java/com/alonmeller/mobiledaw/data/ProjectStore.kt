@@ -14,6 +14,8 @@ import com.alonmeller.mobiledaw.model.Pad
 import com.alonmeller.mobiledaw.model.Project
 import com.alonmeller.mobiledaw.model.Routing
 import com.alonmeller.mobiledaw.model.Send
+import com.alonmeller.mobiledaw.model.Take
+import com.alonmeller.mobiledaw.model.Takes
 import com.alonmeller.mobiledaw.model.Track
 import org.json.JSONArray
 import org.json.JSONObject
@@ -26,6 +28,12 @@ data class ProjectSettings(
     val gridDivision: Int = 4,
     /** Pulls notes played live onto the nearest 1/16 while recording. */
     val quantizeRecording: Boolean = true,
+    /** Bars the metronome counts in before recording from a stop, as REAPER's count-in: 0, 1 or 2. */
+    val countInBars: Int = 0,
+    /** A recording over an item becomes a new take of it, as in REAPER, instead of replacing it like tape. */
+    val keepTakes: Boolean = true,
+    /** Hears the microphone through the armed track, with headphones (REAPER's record monitoring). */
+    val monitoring: Boolean = false,
 )
 
 data class LoadedProject(val project: Project, val settings: ProjectSettings)
@@ -81,8 +89,10 @@ class ProjectStore(val dir: File) {
                             )
                             continue
                         }
-                        val src = source(it.getString("file")) ?: continue
-                        items += Item(
+                        // Version 6: the takes, of which "file", "offset" and "gain" are the one playing.
+                        val takes = readTakes(it.optJSONArray("takes"), it.optInt("take", 0), ::frames, ::source)
+                        val src = takes?.let { (list, playing) -> list[playing].sourceId } ?: source(it.getString("file")) ?: continue
+                        val item = Item(
                             id = Ids.next(),
                             sourceId = src,
                             position = frames(it.getLong("position")),
@@ -93,6 +103,7 @@ class ProjectStore(val dir: File) {
                             gain = it.optDouble("gain", 1.0).toFloat(),
                             mute = it.optBoolean("mute", false),
                         )
+                        items += if (takes == null) item else Takes.withTakes(item, takes.first, takes.second)
                     }
                 } else if (t.has("file")) {
                     // Version 1: one clip per track.
@@ -149,6 +160,9 @@ class ProjectStore(val dir: File) {
                 snap = json.optBoolean("snap", true),
                 gridDivision = json.optInt("grid", 4),
                 quantizeRecording = json.optBoolean("quantize", true),
+                countInBars = json.optInt("countIn", 0).coerceIn(0, 2),
+                keepTakes = json.optBoolean("keepTakes", true),
+                monitoring = json.optBoolean("monitor", false),
             )
             LoadedProject(project, settings)
         }.getOrNull()
@@ -178,17 +192,26 @@ class ProjectStore(val dir: File) {
                     return@forEach
                 }
                 val file = fileOf(item.sourceId) ?: return@forEach
-                items.put(
-                    JSONObject()
-                        .put("file", file)
-                        .put("position", item.position)
-                        .put("offset", item.offset)
-                        .put("length", item.length)
-                        .put("fadeIn", item.fadeIn)
-                        .put("fadeOut", item.fadeOut)
-                        .put("gain", item.gain.toDouble())
-                        .put("mute", item.mute)
-                )
+                val o = JSONObject()
+                    .put("file", file)
+                    .put("position", item.position)
+                    .put("offset", item.offset)
+                    .put("length", item.length)
+                    .put("fadeIn", item.fadeIn)
+                    .put("fadeOut", item.fadeOut)
+                    .put("gain", item.gain.toDouble())
+                    .put("mute", item.mute)
+                if (Takes.count(item) > 1) {
+                    val takes = JSONArray()
+                    var active = 0
+                    Takes.all(item).forEachIndexed { k, take ->
+                        val takeFile = fileOf(take.sourceId) ?: return@forEachIndexed
+                        if (k == Takes.active(item)) active = takes.length()
+                        takes.put(JSONObject().put("file", takeFile).put("offset", take.offset).put("gain", take.gain.toDouble()))
+                    }
+                    o.put("takes", takes).put("take", active)
+                }
+                items.put(o)
             }
             tracks.put(
                 JSONObject()
@@ -211,13 +234,16 @@ class ProjectStore(val dir: File) {
         val markers = JSONArray()
         project.markers.forEach { markers.put(JSONObject().put("position", it.position).put("name", it.name)) }
         val json = JSONObject()
-            .put("version", 5)
+            .put("version", 6)
             .put("tempo", project.tempo)
             .put("sampleRate", sampleRate)
             .put("metronome", settings.metronome)
             .put("snap", settings.snap)
             .put("grid", settings.gridDivision)
             .put("quantize", settings.quantizeRecording)
+            .put("countIn", settings.countInBars)
+            .put("keepTakes", settings.keepTakes)
+            .put("monitor", settings.monitoring)
             .put("loop", JSONObject().put("start", project.loopStart).put("end", project.loopEnd).put("on", project.loopOn))
             .put("markers", markers)
             .put("masterGain", project.masterGain.toDouble())
@@ -229,6 +255,23 @@ class ProjectStore(val dir: File) {
         tmp.writeText(json.toString(2))
         tmp.renameTo(projectFile)
         ProjectMeta.update(dir) { it.copy(seconds = project.endFrame.toDouble() / sampleRate) }
+    }
+
+    /**
+     * An item's takes and the index of the one it plays, leaving out those
+     * whose file is gone; null when it has none.
+     */
+    private fun readTakes(arr: JSONArray?, active: Int, frames: (Long) -> Long, source: (String) -> Int?): Pair<List<Take>, Int>? {
+        if (arr == null) return null
+        val takes = mutableListOf<Take>()
+        var playing = 0
+        for (k in 0 until arr.length()) {
+            val o = arr.getJSONObject(k)
+            val src = source(o.getString("file")) ?: continue
+            if (k == active) playing = takes.size
+            takes += Take(src, frames(o.optLong("offset", 0)), o.optDouble("gain", 1.0).toFloat())
+        }
+        return if (takes.isEmpty()) null else takes to playing
     }
 
     private fun readEffects(arr: JSONArray?): List<Effect> {

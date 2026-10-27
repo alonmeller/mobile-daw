@@ -105,19 +105,30 @@ struct TrackTaps {
     std::vector<float *> dry;
 };
 
+// The microphone heard live through the track it is recording into, as
+// REAPER's record monitoring plays it: through that track's effects, fader,
+// folders and sends, and kept quiet by its mute and solo like the track's
+// own sound.
+struct LiveInput {
+    const float *samples = nullptr;  // mono, one block
+    int track = -1;                  // the track it plays through, or -1 for straight to the master
+};
+
 // Mixes an arrangement block by block. The real-time engine and each offline
 // render own one, so their scratch buffers never meet.
 class Mixer {
 public:
     // Adds n (at most kBlock) frames of `arr` from `pos` to `out`, interleaved
     // stereo. With `playing` false items and notes stay silent, and only
-    // sounding voices and effect tails are heard. `peaks`, when given, gets
-    // each track's post-fader peak (kMaxMeters entries). Tracks play into
-    // their folders and sends before the master hears them, and a track's
-    // stem is what it passes on. A muted track still fills its dry tap.
+    // sounding voices, effect tails and the live input are heard. `peaks`,
+    // when given, gets each track's post-fader peak (kMaxMeters entries).
+    // Tracks play into their folders and sends before the master hears them,
+    // and a track's stem is what it passes on. A muted track still fills its
+    // dry tap; the live input never reaches the taps.
     // Returns true while an instrument is still sounding.
     bool renderBlock(Arrangement &arr, float *out, int n, int64_t pos, bool playing,
-                     std::atomic<float> *peaks = nullptr, const TrackTaps *taps = nullptr);
+                     std::atomic<float> *peaks = nullptr, const TrackTaps *taps = nullptr,
+                     const LiveInput *live = nullptr);
 
 private:
     // Adds a stereo signal, scaled by `gain`, to what `t` receives this block.

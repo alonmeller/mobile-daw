@@ -10,9 +10,9 @@ import kotlin.math.roundToLong
 
 /**
  * Writes a project as a REAPER project file (.rpp), the plain-text format
- * REAPER opens directly. Audio items keep their place, trims, fades, gain and
- * mute; tracks keep their volume, pan, mute, solo, color, automation, folders
- * and sends; the tempo, markers and loop come along. REAPER cannot play the
+ * REAPER opens directly. Audio items keep their place, trims, fades, gain,
+ * mute and takes; tracks keep their volume, pan, mute, solo, color,
+ * automation, folders and sends; the tempo, markers and loop come along. REAPER cannot play the
  * app's effects or instruments, so effects are listed in the project notes
  * and each instrument track arrives as rendered audio, with its notes as MIDI
  * items on a track of its own right below it. A send into a track with
@@ -24,7 +24,7 @@ object ReaperProject {
     class RenderedTrack(val file: String, val length: Long)
 
     /**
-     * @param mediaFile file name, next to the .rpp, of the audio source an item plays
+     * @param mediaFile file name, next to the .rpp, of an audio source (by source id)
      * @param rendered the rendered audio of each instrument track, by track id
      * @param drumNotes the MIDI note of each pad of each drum track, by track id
      * @param colors the color of each track as 0xRRGGBB, by track id
@@ -34,7 +34,7 @@ object ReaperProject {
     fun write(
         project: Project,
         sampleRate: Int,
-        mediaFile: (Item) -> String?,
+        mediaFile: (Int) -> String?,
         rendered: Map<Long, RenderedTrack> = emptyMap(),
         drumNotes: Map<Long, IntArray> = emptyMap(),
         colors: Map<Long, Int> = emptyMap(),
@@ -102,13 +102,8 @@ object ReaperProject {
             if (track.instrument != null && audio != null) {
                 // What the instrument played, as audio, with the track's mix settings.
                 out.track(track.name, track, colors[track.id], sec, placement(k++)) {
-                    out.item(
-                        name = track.name, position = 0.0, length = sec(audio.length), mute = false,
-                        loop = false, offset = 0.0, gain = 1.0, fadeIn = 0.0, fadeOut = 0.0,
-                    ) {
-                        out.open("SOURCE WAVE")
-                        out.line("FILE ${quote(audio.file)}")
-                        out.close()
+                    out.item(position = 0.0, length = sec(audio.length), mute = false, loop = false, fadeIn = 0.0, fadeOut = 0.0) {
+                        out.take(track.name, offset = 0.0, gain = 1.0, first = true, active = true) { out.wave(audio.file) }
                     }
                 }
                 // Its notes on their own track, ready for an instrument chosen in REAPER.
@@ -124,15 +119,19 @@ object ReaperProject {
                             out.midiItem(item, track, drumNotes[track.id], framesPerBeat, sec)
                             continue
                         }
-                        val file = mediaFile(item) ?: continue
+                        // Its takes whose files came along, and which of them plays.
+                        val all = Takes.all(item)
+                        val takes = all.withIndex().mapNotNull { (k, take) -> mediaFile(take.sourceId)?.let { Triple(k, take, it) } }
+                        if (takes.isEmpty()) continue
+                        val playing = takes.indexOfFirst { it.first == Takes.active(item) }.coerceAtLeast(0)
                         out.item(
-                            name = track.name, position = sec(item.position), length = sec(item.length),
-                            mute = item.mute, loop = false, offset = sec(item.offset), gain = item.gain.toDouble(),
+                            position = sec(item.position), length = sec(item.length), mute = item.mute, loop = false,
                             fadeIn = sec(item.fadeIn), fadeOut = sec(item.fadeOut),
                         ) {
-                            out.open("SOURCE WAVE")
-                            out.line("FILE ${quote(file)}")
-                            out.close()
+                            takes.forEachIndexed { n, (k, take, file) ->
+                                val name = if (all.size > 1) "${track.name} take ${k + 1}" else track.name
+                                out.take(name, sec(take.offset), take.gain.toDouble(), first = n == 0, active = n == playing) { out.wave(file) }
+                            }
                         }
                     }
                 }
@@ -222,9 +221,9 @@ object ReaperProject {
         close()
     }
 
+    /** An item; [takes] writes its takes with [take]. */
     private fun Rpp.item(
-        name: String, position: Double, length: Double, mute: Boolean, loop: Boolean, offset: Double,
-        gain: Double, fadeIn: Double, fadeOut: Double, source: () -> Unit,
+        position: Double, length: Double, mute: Boolean, loop: Boolean, fadeIn: Double, fadeOut: Double, takes: () -> Unit,
     ) {
         open("ITEM")
         line("POSITION ${num(position)}")
@@ -239,6 +238,17 @@ object ReaperProject {
         line("SEL 0")
         line("IGUID ${guid()}")
         line("IID ${++itemCount}")
+        takes()
+        close()
+    }
+
+    /**
+     * One take of an item, [offset] seconds into its source. The first take
+     * follows the item's own lines; each further one starts with a TAKE
+     * line, "TAKE SEL" for the one that plays (the first plays otherwise).
+     */
+    private fun Rpp.take(name: String, offset: Double, gain: Double, first: Boolean, active: Boolean, source: () -> Unit) {
+        if (!first) line(if (active) "TAKE SEL" else "TAKE")
         line("NAME ${quote(name)}")
         line("VOLPAN ${num(gain)} 0 1 -1")
         line("SOFFS ${num(offset)}")
@@ -246,6 +256,11 @@ object ReaperProject {
         line("CHANMODE 0")
         line("GUID ${guid()}")
         source()
+    }
+
+    private fun Rpp.wave(file: String) {
+        open("SOURCE WAVE")
+        line("FILE ${quote(file)}")
         close()
     }
 
@@ -255,19 +270,18 @@ object ReaperProject {
         val pattern = Midi.patternLength(item)
         val looping = item.loopLength > 0
         val offset = if (looping) Math.floorMod(item.offset, pattern) else item.offset
-        item(
-            name = if (drums) "Beat" else "Notes", position = sec(item.position), length = sec(item.length),
-            mute = item.mute, loop = looping, offset = sec(offset), gain = 1.0, fadeIn = 0.0, fadeOut = 0.0,
-        ) {
-            open("SOURCE MIDI")
-            midiEvents(item.notes ?: emptyList(), pattern, framesPerBeat, if (drums) MidiFile.DRUM_CHANNEL else 0) { pitch ->
-                if (drums && drumNotes != null && pitch - FIRST_PAD_NOTE in drumNotes.indices) {
-                    drumNotes[pitch - FIRST_PAD_NOTE]
-                } else {
-                    pitch
-                }
-            }.forEach { line(it) }
-            close()
+        item(position = sec(item.position), length = sec(item.length), mute = item.mute, loop = looping, fadeIn = 0.0, fadeOut = 0.0) {
+            take(if (drums) "Beat" else "Notes", sec(offset), gain = 1.0, first = true, active = true) {
+                open("SOURCE MIDI")
+                midiEvents(item.notes ?: emptyList(), pattern, framesPerBeat, if (drums) MidiFile.DRUM_CHANNEL else 0) { pitch ->
+                    if (drums && drumNotes != null && pitch - FIRST_PAD_NOTE in drumNotes.indices) {
+                        drumNotes[pitch - FIRST_PAD_NOTE]
+                    } else {
+                        pitch
+                    }
+                }.forEach { line(it) }
+                close()
+            }
         }
     }
 

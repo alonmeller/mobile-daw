@@ -3,8 +3,11 @@ package com.alonmeller.mobiledaw.data
 import com.alonmeller.mobiledaw.model.Effect
 import com.alonmeller.mobiledaw.model.EffectType
 import com.alonmeller.mobiledaw.model.Ids
+import com.alonmeller.mobiledaw.model.Item
 import com.alonmeller.mobiledaw.model.Project
 import com.alonmeller.mobiledaw.model.Send
+import com.alonmeller.mobiledaw.model.Take
+import com.alonmeller.mobiledaw.model.Takes
 import com.alonmeller.mobiledaw.model.Track
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -41,6 +44,37 @@ class ProjectStoreTest {
         assertTrue(kickSend.preFader && kickSend.mute)
         assertEquals(listOf("Reverb bus", "Drums"), loaded.tracks[2].sends.map(::target))
         assertEquals(0.1f, loaded.tracks[2].sends[1].gain, 1e-6f)
+    }
+
+    @Test
+    fun takesAndRecordingSettingsSurviveSaveAndLoad() {
+        val store = ProjectStore(tmp.newFolder("takes"))
+        val files = mapOf(1 to "a.wav", 2 to "b.wav", 3 to "c.wav")
+        val item = Takes.withTakes(
+            Item(Ids.next(), 1, position = 1000, offset = 0, length = 4000),
+            listOf(Take(1, 100), Take(2, 200, 0.5f), Take(3, 300)),
+            active = 1,
+        )
+        val settings = ProjectSettings(countInBars = 2, keepTakes = false, monitoring = true)
+        store.save(Project(tracks = listOf(Track(Ids.next(), "Vocal", 0, items = listOf(item)))), settings, 48000) { files[it] }
+
+        // Sources come back with new ids, found by file.
+        val ids = mapOf("a.wav" to 11, "b.wav" to 12, "c.wav" to 13)
+        val loaded = store.load(48000) { ids[it] }!!
+        val back = loaded.project.tracks.single().items.single()
+        assertEquals(listOf(Take(11, 100), Take(12, 200, 0.5f), Take(13, 300)), Takes.all(back))
+        assertEquals(1, Takes.active(back))
+        assertEquals(12, back.sourceId)
+        assertEquals(1000, back.position)
+        assertEquals(settings, loaded.settings)
+
+        // A take whose file is gone is left out, and the item plays the take it played.
+        val partial = store.load(48000) { if (it == "a.wav") null else ids[it] }!!.project.tracks.single().items.single()
+        assertEquals(listOf(Take(12, 200, 0.5f), Take(13, 300)), Takes.all(partial))
+        assertEquals(12, partial.sourceId)
+        // With one take left, it is a plain item.
+        val one = store.load(48000) { if (it == "c.wav") ids[it] else null }!!.project.tracks.single().items.single()
+        assertEquals(listOf(Take(13, 300)), Takes.all(one))
     }
 
     @Test

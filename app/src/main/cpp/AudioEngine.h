@@ -14,6 +14,7 @@
 #include "Effects.h"
 #include "Instruments.h"
 #include "Mixer.h"
+#include "Monitor.h"
 #include "Render.h"
 #include "RingBuffer.h"
 
@@ -53,7 +54,8 @@ private:
 };
 
 // Real-time multitrack engine: stereo output mixes the arrangement plus a
-// metronome; a separate mono input stream records new takes into sources.
+// metronome; a separate mono input stream records new takes into sources
+// and can be heard live through the track it records into.
 class AudioEngine : public oboe::AudioStreamDataCallback,
                     public oboe::AudioStreamErrorCallback {
 public:
@@ -66,27 +68,47 @@ public:
 
     // Transport
     void setPlaying(bool playing);
+    // Starts playing after `countInFrames` of metronome clicks, during which
+    // the timeline waits (a count-in).
+    void startPlaying(int64_t countInFrames);
     bool isPlaying() const { return playing_.load(); }
     void seek(int64_t frame);
     int64_t position() const { return position_.load(); }
     void setLoop(int64_t start, int64_t end, bool enabled);
+    // Frames of count-in still to play.
+    int64_t countInRemaining() const { return countIn_.load(); }
 
     // Recording
     // With `withTransport` false the timeline stays put: the input is only
-    // captured, as when sampling the microphone into a drum pad.
-    bool startRecording(bool withTransport = true);
-    int stopRecording();  // returns the new source id, or -1 when nothing was recorded
+    // captured, as when sampling the microphone into a drum pad. Otherwise
+    // the transport starts (after the count-in, when it was stopped) and,
+    // with the loop on, goes round the loop until recording stops.
+    bool startRecording(bool withTransport = true, int64_t countInFrames = 0);
+    // Returns the id of a new source holding everything captured, from the
+    // moment recording started (count-in included), or -1 when nothing was.
+    int stopRecording();
     // How far behind the render position the speaker is, in frames.
     int64_t outputLatencyFrames();
     bool isRecording() const { return recording_.load(); }
     int64_t recordedFrames() const { return recordedFrames_.load(); }
     int64_t recordStartFrame() const { return recordStartFrame_; }
-    int64_t lastTakeStart() const { return lastTakeStart_; }
+    // Round-trip latency of the last recording, in frames: what the performer
+    // played while hearing the start of the timeline was captured this much
+    // after the capture began (plus the count-in).
+    int64_t lastLatency() const { return lastLatency_; }
     // Meters report the highest peak since they were last read.
     float inputLevel() { return inputPeak_.exchange(0.0f); }
 
+    // Input monitoring (REAPER's record monitoring): with `enabled` the
+    // microphone is heard live through track `trackIndex` of the
+    // arrangement, or straight through the master when it is -1. Opens the
+    // microphone; false when it could not be opened.
+    bool setMonitor(bool enabled, int trackIndex);
+
     // Sources: immutable audio buffers that items point into
     int createSource(const float *data, int64_t numFrames);
+    // Forgets a source no arrangement uses yet, such as a recording that was copied.
+    void releaseSource(int id);
     int64_t sourceLength(int id);
     std::vector<float> sourcePeaks(int id, int framesPerBucket);
     std::vector<float> sourceSamples(int id);
@@ -145,7 +167,7 @@ private:
     void closeInput();
     void drainLoop();
     void drainOnce();
-    void renderSegment(float *out, int32_t numFrames, int64_t pos, bool playing);
+    void renderSegment(float *out, int32_t numFrames, int64_t pos, bool playing, bool monitoring);
     void renderMetronome(float *out, int32_t numFrames, int64_t pos);
     void applyLiveNotes();
 
@@ -187,14 +209,23 @@ private:
 
     std::atomic<bool> metronomeOn_{false};
     std::atomic<double> tempo_{120.0};
+    // Written by the UI to start a count-in, counted down by the audio thread.
+    std::atomic<int64_t> countIn_{0};
 
     std::atomic<bool> recording_{false};
     std::atomic<int64_t> recordedFrames_{0};
     std::atomic<float> inputPeak_{0.0f};
     int64_t recordStartFrame_ = 0;
     bool sampling_ = false;
-    int64_t lastTakeStart_ = 0;
+    int64_t lastLatency_ = 0;
     RingBuffer ring_{1 << 18};
+
+    std::atomic<bool> monitorOn_{false};
+    std::atomic<int> monitorTrack_{-1};
+    // Frames the monitor keeps queued against jitter: two input bursts.
+    std::atomic<int> monitorTarget_{256};
+    MonitorBuffer monitor_{1 << 14};
+    std::array<float, kBlock> liveBlock_{};
     std::vector<float> recordBuffer_;
     std::thread drainThread_;
     std::atomic<bool> draining_{false};

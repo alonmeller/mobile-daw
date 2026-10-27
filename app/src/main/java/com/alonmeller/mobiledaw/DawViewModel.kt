@@ -1,8 +1,14 @@
 package com.alonmeller.mobiledaw
 
 import android.app.Application
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.os.Handler
+import android.os.Looper
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -44,6 +50,8 @@ import com.alonmeller.mobiledaw.model.ReaperProject
 import com.alonmeller.mobiledaw.model.Routing
 import com.alonmeller.mobiledaw.model.Scales
 import com.alonmeller.mobiledaw.model.Send
+import com.alonmeller.mobiledaw.model.Take
+import com.alonmeller.mobiledaw.model.Takes
 import com.alonmeller.mobiledaw.model.Track
 import com.alonmeller.mobiledaw.ui.DawColors
 import kotlinx.coroutines.Dispatchers
@@ -55,6 +63,7 @@ import java.io.File
 import java.util.IdentityHashMap
 import java.util.UUID
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.pow
@@ -102,6 +111,17 @@ class ExportResult(val file: File, val mime: String, val details: String)
 
 /** Peak level that "Normalize" aims for: -1 dB, so encoders never clip. */
 private const val NORMALIZE_PEAK = 0.891f
+
+/** Input peak that counts as clipping while recording. */
+private const val CLIP_LEVEL = 0.98f
+
+/** Outputs that let the microphone be heard without feeding back: headphones, or an audio interface. */
+private val HEADPHONE_TYPES = setOf(
+    AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+    AudioDeviceInfo.TYPE_WIRED_HEADSET,
+    AudioDeviceInfo.TYPE_USB_HEADSET,
+    AudioDeviceInfo.TYPE_USB_DEVICE,
+)
 
 class DawViewModel(app: Application) : AndroidViewModel(app) {
     private val library = ProjectLibrary(app.filesDir)
@@ -395,6 +415,8 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             if (auditioning) toggleAudition()
             noteEditorItemId = null
         }
+        // The armed track may have moved, or gone.
+        updateMonitoring()
     }
 
     /** Applies an undoable edit. */
@@ -440,11 +462,19 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun undo() {
+        if (busyRecording()) return
         history.undo(project)?.let { applyProject(it); scheduleSave() }
     }
 
     fun redo() {
+        if (busyRecording()) return
         history.redo(project)?.let { applyProject(it); scheduleSave() }
+    }
+
+    /** True (with a word to the user) while a recording is running, which undo, the tempo and the loop must not change under it. */
+    private fun busyRecording(): Boolean {
+        if (recording || recordingMidi) message = "Stop recording first"
+        return recording || recordingMidi
     }
 
     // ------------------------------------------------------------ per-frame polling
@@ -463,9 +493,21 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         position = NativeEngine.position()
         if (exportProgress != null) exportProgress = NativeEngine.renderProgress()
         masterLevel = meter(masterLevel, NativeEngine.masterPeak())
-        if (recording || samplingPad != null) {
-            recordedFrames = NativeEngine.recordedFrames()
-            inputLevel = meter(inputLevel, NativeEngine.inputLevel())
+        val capturing = recording || samplingPad != null
+        // Monitoring shows the input too, so the level can be set before recording.
+        if (capturing || monitoringLive) {
+            val peak = NativeEngine.inputLevel()
+            inputLevel = meter(inputLevel, peak)
+            if (capturing) recordedFrames = NativeEngine.recordedFrames()
+            if (capturing && peak >= CLIP_LEVEL && !clipWarned) {
+                clipWarned = true
+                message = "Clipping! Sing softer or move the phone away"
+            }
+        }
+        if (recording || recordingMidi) {
+            seePosition(position)
+            val countIn = NativeEngine.countInRemaining()
+            countInBeats = if (countIn > 0) ceil(countIn / framesPerBeat).toInt() else 0
         }
         val levels = HashMap<Long, Float>()
         project.tracks.forEachIndexed { i, t ->
@@ -532,9 +574,11 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Stop button: first press stops, a second press returns to the start. */
     fun stop() {
+        // Stopping a recording during its count-in stops the transport too: still a first press.
+        val wasPlaying = playing
         if (recording) stopRecording()
         if (recordingMidi) stopMidiRecording()
-        if (!playing) {
+        if (!wasPlaying) {
             seekFrames(0)
             scrollPx = 0f
         }
@@ -548,6 +592,8 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun seekFrames(frame: Long) {
+        // A take lines up with the timeline as it played: no jumping while recording.
+        if (recording) return
         NativeEngine.seek(frame.coerceAtLeast(0))
         position = NativeEngine.position()
     }
@@ -569,7 +615,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     fun setTempo(bpm: Double) {
         val p = project
         val tempo = bpm.coerceIn(30.0, 300.0)
-        if (tempo == p.tempo) return
+        if (tempo == p.tempo || busyRecording()) return
         val ratio = p.tempo / tempo
         commit(
             p.copy(
@@ -598,6 +644,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------ loop and markers
 
     fun toggleLoop() {
+        if (busyRecording()) return
         val p = project
         if (p.loopEnd <= p.loopStart) {
             // No loop range yet: loop the bar under the playhead.
@@ -611,11 +658,13 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     private var loopDragStart = 0L
     fun beginLoopDrag(x: Float) {
+        if (busyRecording()) return
         gestureBase = project
         loopDragStart = snapped(frameAtScreen(x))
     }
 
     fun dragLoop(x: Float) {
+        if (recording || recordingMidi) return
         val a = loopDragStart
         val b = snapped(frameAtScreen(x))
         val p = project.copy(loopStart = minOf(a, b), loopEnd = maxOf(a, b), loopOn = abs(b - a) > 0)
@@ -659,6 +708,37 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     /** True when the record button records notes (an instrument track is armed) rather than the microphone. */
     val recordsMidi: Boolean get() = project.tracks.firstOrNull { it.id == armedTrackId }?.instrument != null
 
+    /** Beats of count-in still to come, while the metronome counts a recording in. */
+    var countInBeats by mutableIntStateOf(0)
+        private set
+    /** Passes round the loop so far in this recording; each one becomes a take. */
+    var recordPasses by mutableIntStateOf(1)
+        private set
+    /** The count-in this recording started with, and the loop it goes round, as they were when it started. */
+    private var recordCountIn = 0L
+    private var recordLoop: Pair<Long, Long>? = null
+    private var clipWarned = false
+    /** The engine position last seen while recording, to tell a jump back round the loop. */
+    private var lastSeenPosition = 0L
+    private var wrapped = false
+
+    private fun seePosition(pos: Long) {
+        if (pos < lastSeenPosition) {
+            wrapped = true
+            recordPasses++
+        }
+        lastSeenPosition = pos
+    }
+
+    private fun startTakeTracking(start: Long, countIn: Long) {
+        recordStart = start
+        recordCountIn = countIn
+        lastSeenPosition = start
+        wrapped = false
+        recordPasses = 1
+        countInBeats = 0
+    }
+
     fun toggleRecord() {
         when {
             recording -> stopRecording()
@@ -669,29 +749,66 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Frames the metronome counts in before a recording that starts from a stop. */
+    private fun countInFrames(): Long =
+        if (playing || settings.countInBars <= 0) 0L else (framesPerBeat * 4 * settings.countInBars).roundToLong()
+
     private fun startRecording() {
         if (auditioning) toggleAudition()
-        if (!NativeEngine.startRecording(true)) {
+        val countIn = countInFrames()
+        if (!NativeEngine.startRecording(true, countIn)) {
             message = "Could not open the microphone"
             return
         }
-        recordStart = NativeEngine.recordStartFrame()
+        val p = project
+        startTakeTracking(NativeEngine.recordStartFrame(), countIn)
+        // With the loop on, the transport goes round it until recording stops.
+        recordLoop = if (p.loopOn && p.loopEnd > p.loopStart) p.loopStart to p.loopEnd else null
         recordedFrames = 0
+        clipWarned = false
         recording = true
         playing = true
+        updateMonitoring()
     }
 
     private fun stopRecording() {
-        val sourceId = NativeEngine.stopRecording()
+        // Stopped before the count-in was over: nothing was played yet, so the transport stops too.
+        val countingIn = NativeEngine.countInRemaining() > 0
+        val captured = NativeEngine.stopRecording()
         recording = false
         inputLevel = 0f
-        if (sourceId < 0) return
-        val length = NativeEngine.sourceLength(sourceId)
-        val info = SourceInfo("take_${UUID.randomUUID()}.wav", length, NativeEngine.sourcePeaks(sourceId, PEAK_BUCKET))
+        countInBeats = 0
+        if (countingIn) {
+            playing = false
+            NativeEngine.setPlaying(false)
+        }
+        updateMonitoring()
+        if (captured < 0) return
+        // What was played while hearing the timeline start comes this far into the capture.
+        val lead = recordCountIn + NativeEngine.recordLatency()
+        val layout = Takes.layout(NativeEngine.sourceLength(captured), recordStart, lead, recordLoop)
+        if (layout == null) {
+            NativeEngine.releaseSource(captured)
+            if (!countingIn) message = "The take was too short to keep"
+            return
+        }
+        var sourceId = captured
+        var samples = NativeEngine.sourceSamples(captured)
+        if (layout.padBefore > 0 || layout.padAfter > 0) {
+            // Passes cut short are silent where nothing was recorded.
+            val padded = FloatArray((layout.padBefore + samples.size + layout.padAfter).toInt())
+            samples.copyInto(padded, layout.padBefore.toInt())
+            samples = padded
+            sourceId = NativeEngine.createSource(padded)
+            NativeEngine.releaseSource(captured)
+        }
+        val info = SourceInfo("take_${UUID.randomUUID()}.wav", samples.size.toLong(), NativeEngine.sourcePeaks(sourceId, PEAK_BUCKET))
         sources = sources + (sourceId to info)
-        writeSource(info.fileName, NativeEngine.sourceSamples(sourceId))
+        writeSource(info.fileName, samples)
 
-        val item = Item(Ids.next(), sourceId, NativeEngine.lastTakeStart(), 0, length)
+        // One take per pass round the loop, the newest playing.
+        val takes = layout.offsets.map { Take(sourceId, it) }
+        val item = Takes.withTakes(Item(Ids.next(), sourceId, layout.position, 0, layout.length), takes, takes.lastIndex)
         var p = project
         var trackId = armedTrackId
         if (p.tracks.none { it.id == trackId }) {
@@ -699,16 +816,108 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             p = p.copy(tracks = p.tracks + t)
             trackId = t.id
         }
-        // Like a punch-in: the new take replaces whatever it overlaps.
-        p = p.updateTrack(trackId) { it.copy(items = Edits.placeOnTop(it.items, item)) }
-        commit(p)
+        val (items, holding) = Takes.place(p.tracks.first { it.id == trackId }.items, item, settings.keepTakes)
+        commit(p.updateTrack(trackId) { it.copy(items = items) })
         armedTrackId = trackId
         selectedTrackId = trackId
-        selectedItems = setOf(item.id)
+        selectedItems = holding
+        updateMonitoring()
+        val most = items.filter { it.id in holding }.maxOfOrNull { Takes.count(it) } ?: 1
+        if (most > 1) message = "Take $most of $most: ◀ ▶ above picks another"
     }
 
     /** True while a take is being recorded into this track. */
     fun isRecordingInto(track: Track) = (recording || recordingMidi) && track.id == armedTrackId
+
+    /** Count-in before recording from a stop: off, then 1 bar, then 2 bars. */
+    fun setCountIn(bars: Int) {
+        settings = settings.copy(countInBars = bars.coerceIn(0, 2))
+        scheduleSave()
+    }
+
+    /** Recording over an item: add a take to it (REAPER's way), or replace it like tape. */
+    fun setKeepTakes(keep: Boolean) {
+        settings = settings.copy(keepTakes = keep)
+        scheduleSave()
+    }
+
+    // ------------------------------------------------------------ input monitoring (REAPER's record monitoring)
+
+    private val audioManager = app.getSystemService(AudioManager::class.java)
+    private val deviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) = refreshHeadphones()
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) = refreshHeadphones()
+    }
+
+    /** True while wired or USB headphones are plugged in, so the microphone can be heard without feeding back. */
+    var headphones by mutableStateOf(false)
+        private set
+    /** True when the only headphones are Bluetooth ones, which are too slow to sing along with. */
+    private var bluetoothOnly = false
+    /** True while the microphone is heard live. */
+    var monitoringLive by mutableStateOf(false)
+        private set
+    /** The arrangement track the engine monitors through (-1: the master), or null when it is not monitoring. */
+    private var monitorIndex: Int? = null
+    private var foreground = true
+
+    init {
+        audioManager?.registerAudioDeviceCallback(deviceCallback, Handler(Looper.getMainLooper()))
+        refreshHeadphones()
+    }
+
+    override fun onCleared() {
+        audioManager?.unregisterAudioDeviceCallback(deviceCallback)
+    }
+
+    private fun refreshHeadphones() {
+        val outputs = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS) ?: emptyArray()
+        val wired = outputs.any { it.type in HEADPHONE_TYPES }
+        bluetoothOnly = !wired && outputs.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP }
+        if (wired != headphones) {
+            headphones = wired
+            // Unplugged: the phone's speaker would feed the microphone back into itself.
+            updateMonitoring()
+        }
+    }
+
+    /** The 🎧 button: hear yourself through the armed track while recording, with headphones. */
+    fun toggleMonitoring() {
+        settings = settings.copy(monitoring = !settings.monitoring)
+        scheduleSave()
+        updateMonitoring()
+        if (settings.monitoring && !headphones) {
+            message = if (bluetoothOnly) "Bluetooth is too slow to hear yourself: use wired headphones"
+            else "Plug in headphones to hear yourself"
+        }
+    }
+
+    /**
+     * Turns monitoring on or off as the setting, the headphones and the armed
+     * audio track allow. Recording with no track armed is heard straight
+     * through the master, until it lands on its new track.
+     */
+    private fun updateMonitoring() {
+        val index = project.tracks.indexOfFirst { it.id == armedTrackId && it.instrument == null }
+        val wanted = settings.monitoring && headphones && foreground && samplingPad == null && (index >= 0 || recording)
+        val target = if (wanted) index else null
+        if (target == monitorIndex) return
+        if (target != null && !NativeEngine.setMonitor(true, target)) {
+            // Most likely the microphone permission was taken back: stay off until asked again.
+            settings = settings.copy(monitoring = false)
+            message = "Could not open the microphone"
+            if (monitorIndex != null) NativeEngine.setMonitor(false, -1)
+            monitorIndex = null
+            monitoringLive = false
+            return
+        }
+        if (target == null) {
+            NativeEngine.setMonitor(false, -1)
+            if (!recording && samplingPad == null) inputLevel = 0f
+        }
+        monitorIndex = target
+        monitoringLive = target != null
+    }
 
     // ------------------------------------------------------------ playing instruments and recording MIDI
 
@@ -756,39 +965,63 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         heldNotes.clear()
         takeItemId = -1L
         outputLatency = NativeEngine.outputLatency()
-        recordStart = position
+        val countIn = countInFrames()
+        startTakeTracking(position, countIn)
         recordingMidi = true
         if (view != MainView.Play) {
             project.tracks.firstOrNull { it.id == armedTrackId }?.let { message = "Recording notes into ${it.name}: play its pads or keys" }
         }
         if (!playing) {
             playing = true
-            NativeEngine.setPlaying(true)
+            NativeEngine.startPlaying(countIn)
         }
     }
 
     private fun stopMidiRecording() {
+        val countingIn = NativeEngine.countInRemaining() > 0
         val now = recordFrame()
         heldNotes.keys.toList().forEach { finishNote(it, now) }
         recordingMidi = false
+        countInBeats = 0
+        if (countingIn) {
+            playing = false
+            NativeEngine.setPlaying(false)
+        }
         // The whole take is one undo step.
         endGesture()
     }
 
-    /** Timeline frame the performer hears now: the engine renders ahead of the speaker by the output latency. */
+    /**
+     * Timeline frame the performer hears now: the engine renders ahead of the
+     * speaker by the output latency, and during a count-in the timeline waits,
+     * so what is heard then comes before the start.
+     */
     private fun recordFrame(): Long {
         val p = project
-        val rendered = NativeEngine.position()
+        val pos = NativeEngine.position()
+        seePosition(pos)
+        val rendered = pos - NativeEngine.countInRemaining()
         var frame = rendered - outputLatency
         // Just after a loop jump the speaker still plays the end of the loop.
-        if (p.loopOn && p.loopEnd > p.loopStart && rendered >= p.loopStart && frame < p.loopStart) {
+        if (wrapped && p.loopOn && p.loopEnd > p.loopStart && rendered >= p.loopStart && frame < p.loopStart) {
             frame += p.loopEnd - p.loopStart
         }
-        return frame.coerceAtLeast(0)
+        return frame
     }
 
     private fun finishNote(pitch: Int, end: Long) {
-        val (played, velocity) = heldNotes.remove(pitch) ?: return
+        val (pressed, velocity) = heldNotes.remove(pitch) ?: return
+        var played = pressed
+        var stop = end
+        // Played in the count-in: a note just before the start (a pickup played
+        // a little early) starts with the take, and earlier ones are dropped.
+        if (recordCountIn > 0 && played < recordStart) {
+            if (recordStart - played > framesPerBeat / 4) return
+            played = recordStart
+            stop = maxOf(stop, recordStart)
+        }
+        played = played.coerceAtLeast(0)
+        stop = stop.coerceAtLeast(0)
         val p = project
         val track = p.tracks.firstOrNull { it.id == armedTrackId } ?: return
         val looping = p.loopOn && p.loopEnd > p.loopStart
@@ -800,7 +1033,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             if (looping && played < p.loopEnd && start >= p.loopEnd) start -= p.loopEnd - p.loopStart
         }
         val held = when {
-            end >= played -> end - played
+            stop >= played -> stop - played
             looping -> p.loopEnd - played // the loop jumped while the note was held
             else -> 0L
         }
@@ -878,6 +1111,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         selectedTrackId = t.id
         selectedItems = t.items.map { it.id }.toSet()
         playTrackId = if (t.instrument != null) t.id else playTrackId
+        updateMonitoring()
     }
 
     /**
@@ -1034,6 +1268,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     fun toggleArm(id: Long) {
         if (recording) return
         armedTrackId = if (armedTrackId == id) -1 else id
+        updateMonitoring()
     }
 
     fun toggleMute(id: Long) = commit(project.updateTrack(id) { it.copy(mute = !it.mute) })
@@ -1318,9 +1553,33 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
                 val to = ((item.offset + item.length) / PEAK_BUCKET + 1).toInt().coerceIn(from, peaks.size)
                 var peak = 0f
                 for (b in from until to) peak = max(peak, peaks[b])
-                item.copy(gain = Edits.normalizeGain(peak))
+                Takes.withGain(item, Edits.normalizeGain(peak))
             }
         }
+        commit(p)
+    }
+
+    // ------------------------------------------------------------ takes (REAPER's takes)
+
+    /** The selected item, when it holds more than one take. */
+    val selectedTakesItem: Item?
+        get() = project.tracks.flatMap { it.items }.firstOrNull { it.id in selectedItems && Takes.count(it) > 1 }
+
+    /** Plays the next (+1) or previous (-1) take of the selected items, like REAPER's T and Shift+T. */
+    fun stepTake(direction: Int) = changeTakes { Takes.step(it, direction) }
+
+    /** Plays take [index] of an item: a tap on its lane. */
+    fun selectTake(itemId: Long, index: Int) = commit(project.updateItem(itemId) { Takes.select(it, index) })
+
+    /** Removes the take that plays, keeping the others. */
+    fun deleteTake() = changeTakes { Takes.deleteActive(it) ?: it }
+
+    /** Keeps only the take that plays (REAPER's "crop to active take"). */
+    fun cropTake() = changeTakes(Takes::crop)
+
+    private fun changeTakes(change: (Item) -> Item) {
+        var p = project
+        for (id in selectedItems) p = p.updateItem(id) { if (Takes.count(it) > 1) change(it) else it }
         commit(p)
     }
 
@@ -1361,6 +1620,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         selectedTrackId = trackId
         if (!recording && !recordingMidi) armedTrackId = trackId
         view = MainView.Play
+        updateMonitoring()
     }
 
     fun toggleQuantizeRecording() {
@@ -1435,12 +1695,14 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             playing = false
             NativeEngine.setPlaying(false)
         }
-        if (!NativeEngine.startRecording(false)) {
+        if (!NativeEngine.startRecording(false, 0)) {
             message = "Could not open the microphone"
             return
         }
         recordedFrames = 0
+        clipWarned = false
         samplingPad = trackId to index
+        updateMonitoring()
     }
 
     fun stopSampling() {
@@ -1448,6 +1710,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         samplingPad = null
         inputLevel = 0f
         val id = NativeEngine.stopRecording()
+        updateMonitoring()
         if (id < 0) return
         val samples = NativeEngine.sourceSamples(id)
         val info = SourceInfo("sample_${UUID.randomUUID()}.wav", samples.size.toLong(), NativeEngine.sourcePeaks(id, PEAK_BUCKET))
@@ -1592,8 +1855,16 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     fun onAppBackground() {
         stopAll()
+        // The microphone is never left open behind the user's back.
+        foreground = false
+        updateMonitoring()
         saveJob?.cancel()
         saveNow()
+    }
+
+    fun onAppForeground() {
+        foreground = true
+        updateMonitoring()
     }
 
     // ------------------------------------------------------------ songs (GarageBand's "My Songs")
@@ -1942,8 +2213,9 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val folder = AudioExport.asciiFileName(job.title, "Mobile DAW song")
         val entries = mutableListOf<Pair<String, File>>()
         val taken = mutableSetOf("$folder.rpp".lowercase())
-        // The recordings, imports and samples the items play, as they are.
-        val media = p.tracks.flatMap { it.items }.filter { !it.isMidi }.mapNotNull { job.files[it.sourceId] }.toSet()
+        // The recordings (every take), imports and samples the items play, as they are.
+        val media = p.tracks.flatMap { it.items }.filter { !it.isMidi }.flatMap { Takes.all(it) }
+            .mapNotNull { job.files[it.sourceId] }.toSet()
             .filter { File(job.songDir, it).exists() }
         media.forEach {
             entries += "$folder/$it" to File(job.songDir, it)
@@ -1969,7 +2241,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val rpp = ReaperProject.write(
             project = p,
             sampleRate = sampleRate,
-            mediaFile = { item -> job.files[item.sourceId]?.takeIf { it in media } },
+            mediaFile = { sourceId -> job.files[sourceId]?.takeIf { it in media } },
             rendered = rendered,
             drumNotes = job.drumNotes,
             colors = job.colors,

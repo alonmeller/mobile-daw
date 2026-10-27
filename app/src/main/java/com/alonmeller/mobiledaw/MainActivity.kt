@@ -139,6 +139,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        vm.onAppForeground()
+    }
+
     override fun onStop() {
         super.onStop()
         vm.onAppBackground()

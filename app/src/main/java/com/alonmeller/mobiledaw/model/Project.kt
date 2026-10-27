@@ -15,8 +15,18 @@ object Ids {
 }
 
 /**
+ * One recording that an item can play, as in REAPER's takes: its own
+ * source, where in that source the item starts, and its own gain.
+ */
+data class Take(val sourceId: Int, val offset: Long, val gain: Float = 1f)
+
+/**
  * A media item: the window [offset, offset + length) of an audio source,
  * placed at [position] on the timeline. All times are in sample frames.
+ *
+ * An item can hold several [takes], such as the passes of a loop recording,
+ * and plays the one at [activeTake]; its [sourceId], [offset] and [gain] are
+ * that take's (see [Takes]). An item with a single take keeps [takes] empty.
  *
  * A MIDI item has [notes] instead of an audio source (its [sourceId] is -1).
  * Its notes are timed from the start of its source, like audio, and when
@@ -35,6 +45,8 @@ data class Item(
     val mute: Boolean = false,
     val notes: List<Note>? = null,
     val loopLength: Long = 0,
+    val takes: List<Take> = emptyList(),
+    val activeTake: Int = 0,
 ) {
     val end: Long get() = position + length
     val isMidi: Boolean get() = notes != null
