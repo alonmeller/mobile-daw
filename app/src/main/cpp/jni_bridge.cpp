@@ -67,8 +67,12 @@ JNIEXPORT void JNICALL JNI_FN(setLoop)(JNIEnv *, jobject, jlong start, jlong end
     engine().setLoop(start, end, enabled);
 }
 
-JNIEXPORT jboolean JNICALL JNI_FN(startRecording)(JNIEnv *, jobject, jboolean withTransport) {
-    return engine().startRecording(withTransport);
+JNIEXPORT void JNICALL JNI_FN(startPlaying)(JNIEnv *, jobject, jlong countIn) { engine().startPlaying(countIn); }
+
+JNIEXPORT jlong JNICALL JNI_FN(countInRemaining)(JNIEnv *, jobject) { return engine().countInRemaining(); }
+
+JNIEXPORT jboolean JNICALL JNI_FN(startRecording)(JNIEnv *, jobject, jboolean withTransport, jlong countIn) {
+    return engine().startRecording(withTransport, countIn);
 }
 
 JNIEXPORT jlong JNICALL JNI_FN(outputLatency)(JNIEnv *, jobject) { return engine().outputLatencyFrames(); }
@@ -81,9 +85,13 @@ JNIEXPORT jlong JNICALL JNI_FN(recordedFrames)(JNIEnv *, jobject) { return engin
 
 JNIEXPORT jlong JNICALL JNI_FN(recordStartFrame)(JNIEnv *, jobject) { return engine().recordStartFrame(); }
 
-JNIEXPORT jlong JNICALL JNI_FN(lastTakeStart)(JNIEnv *, jobject) { return engine().lastTakeStart(); }
+JNIEXPORT jlong JNICALL JNI_FN(recordLatency)(JNIEnv *, jobject) { return engine().lastLatency(); }
 
 JNIEXPORT jfloat JNICALL JNI_FN(inputLevel)(JNIEnv *, jobject) { return engine().inputLevel(); }
+
+JNIEXPORT jboolean JNICALL JNI_FN(setMonitor)(JNIEnv *, jobject, jboolean enabled, jint track) {
+    return engine().setMonitor(enabled, track);
+}
 
 JNIEXPORT jfloat JNICALL JNI_FN(masterPeak)(JNIEnv *, jobject) { return engine().masterPeak(); }
 
@@ -94,6 +102,8 @@ JNIEXPORT jint JNICALL JNI_FN(createSource)(JNIEnv *env, jobject, jfloatArray sa
     env->ReleaseFloatArrayElements(samples, data, JNI_ABORT);
     return id;
 }
+
+JNIEXPORT void JNICALL JNI_FN(releaseSource)(JNIEnv *, jobject, jint id) { engine().releaseSource(id); }
 
 JNIEXPORT jlong JNICALL JNI_FN(sourceLength)(JNIEnv *, jobject, jint id) { return engine().sourceLength(id); }
 

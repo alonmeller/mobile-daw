@@ -11,26 +11,42 @@ object NativeEngine {
     external fun sampleRate(): Int
 
     external fun setPlaying(playing: Boolean)
+    /** Starts playing after [countIn] frames of metronome clicks, while the timeline waits. */
+    external fun startPlaying(countIn: Long)
+    /** Frames of count-in still to play. */
+    external fun countInRemaining(): Long
     external fun isPlaying(): Boolean
     external fun seek(frame: Long)
     external fun position(): Long
     external fun setLoop(start: Long, end: Long, enabled: Boolean)
 
-    /** With [withTransport] false only the input is captured (sampling into a pad). */
-    external fun startRecording(withTransport: Boolean): Boolean
-    /** Returns the id of a new source holding the take, or -1. */
+    /**
+     * With [withTransport] false only the input is captured (sampling into a
+     * pad); otherwise the transport starts too, after [countIn] frames of
+     * count-in when it was stopped. Capture starts at once, count-in included.
+     */
+    external fun startRecording(withTransport: Boolean, countIn: Long): Boolean
+    /** Returns the id of a new source holding everything captured, or -1. */
     external fun stopRecording(): Int
     external fun isRecording(): Boolean
     external fun recordedFrames(): Long
     external fun recordStartFrame(): Long
-    /** Timeline position of the last take after latency compensation. */
-    external fun lastTakeStart(): Long
+    /** Round-trip latency of the last recording, in frames (see [com.alonmeller.mobiledaw.model.Takes.layout]). */
+    external fun recordLatency(): Long
     external fun inputLevel(): Float
+    /**
+     * Input monitoring: the microphone heard live through track [track]
+     * (index in the arrangement), or the master when it is -1. False when
+     * the microphone could not be opened.
+     */
+    external fun setMonitor(enabled: Boolean, track: Int): Boolean
     /** Frames between the render position and what the speaker plays now. */
     external fun outputLatency(): Long
     external fun masterPeak(): Float
 
     external fun createSource(samples: FloatArray): Int
+    /** Forgets a source that nothing plays, such as a recording that was copied into another. */
+    external fun releaseSource(id: Int)
     external fun sourceLength(id: Int): Long
     external fun sourcePeaks(id: Int, framesPerBucket: Int): FloatArray
     external fun sourceSamples(id: Int): FloatArray

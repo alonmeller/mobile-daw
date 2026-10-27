@@ -5,7 +5,8 @@
 #include <vector>
 
 // Lock-free single-producer / single-consumer float FIFO.
-// The audio input callback writes, the drain thread reads.
+// The audio input callback writes; the drain thread (recording) or the
+// output callback (monitoring) reads.
 class RingBuffer {
 public:
     explicit RingBuffer(size_t capacityPow2) : buffer_(capacityPow2), mask_(capacityPow2 - 1) {}
@@ -26,6 +27,18 @@ public:
         const size_t available = w - r;
         const size_t n = count < available ? count : available;
         for (size_t i = 0; i < n; ++i) data[i] = buffer_[(r + i) & mask_];
+        read_.store(r + n, std::memory_order_release);
+        return n;
+    }
+
+    // Values waiting to be read; called by the reader.
+    size_t available() const { return write_.load(std::memory_order_acquire) - read_.load(std::memory_order_relaxed); }
+
+    // Drops up to `count` of the oldest values; called by the reader.
+    size_t skip(size_t count) {
+        const size_t r = read_.load(std::memory_order_relaxed);
+        const size_t w = write_.load(std::memory_order_acquire);
+        const size_t n = count < w - r ? count : w - r;
         read_.store(r + n, std::memory_order_release);
         return n;
     }

@@ -167,7 +167,7 @@ void Mixer::receive(TrackMix &t, const float *l, const float *r, int n, float ga
 }
 
 bool Mixer::renderBlock(Arrangement &arr, float *out, int n, int64_t pos, bool playing,
-                        std::atomic<float> *peaks, const TrackTaps *taps) {
+                        std::atomic<float> *peaks, const TrackTaps *taps, const LiveInput *live) {
     const int64_t blockEnd = pos + n;
     bool sounding = false;
     std::fill(masterL_.begin(), masterL_.begin() + n, 0.0f);
@@ -231,6 +231,11 @@ bool Mixer::renderBlock(Arrangement &arr, float *out, int n, int64_t pos, bool p
             if (!own) any = false;
         } else if (t.instrument) {
             t.instrument->allNotesOff(true);
+        }
+        // The microphone, while this track records with monitoring on.
+        if (own && live && live->samples && live->track == index) {
+            for (int i = 0; i < n; ++i) mono_[static_cast<size_t>(i)] += live->samples[i];
+            any = true;
         }
 
         // A muted track passes nothing on, not even what its tracks bring it.
@@ -303,7 +308,13 @@ bool Mixer::renderBlock(Arrangement &arr, float *out, int n, int64_t pos, bool p
         }
     }
 
-    // 6. Master bus.
+    // 6. Master bus, with the microphone when it has no track to go through.
+    if (live && live->samples && live->track < 0) {
+        for (int i = 0; i < n; ++i) {
+            masterL_[static_cast<size_t>(i)] += live->samples[i];
+            masterR_[static_cast<size_t>(i)] += live->samples[i];
+        }
+    }
     for (auto &fx : arr.masterFx) {
         if (fx && !fx->bypassed()) fx->process(masterL_.data(), masterR_.data(), n);
     }

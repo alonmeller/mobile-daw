@@ -1,5 +1,6 @@
-// Host-side checks of the mixer, offline rendering and the loudness meter;
-// built and run by CI with the system compiler.
+// Host-side checks of the mixer, offline rendering, the loudness meter and
+// the input monitor's queue; built and run by CI with the system compiler.
+#include "Monitor.h"
 #include "Render.h"
 
 #include <algorithm>
@@ -474,6 +475,146 @@ int main() {
         delay->setBypass(true);
         auto copy = arr.cloneForRender();
         CHECK(copy->tracks[0].fx[0] != delay && copy->tracks[0].fx[0]->bypassed(), "a clone is a new effect with the same settings");
+    }
+
+    // Input monitoring: the microphone is heard live through the track it
+    // records into, its fader and sends, even while stopped.
+    {
+        std::vector<float> mic(kBlock, 0.4f);
+        LiveInput live;
+        live.samples = mic.data();
+        live.track = 0;
+        auto block = [&](Arrangement &arr, bool playing) {
+            finish(arr);
+            Mixer mixer;
+            std::vector<float> out(2 * kBlock, 0.0f);
+            mixer.renderBlock(arr, out.data(), kBlock, 0, playing, nullptr, nullptr, &live);
+            return std::make_pair(out[0], out[1]);
+        };
+        Arrangement arr;
+        arr.tracks.resize(2);
+        arr.tracks[0].gain = 0.5f;
+        arr.tracks[0].sends.push_back(send(1, 1.0f));
+        auto [l, r] = block(arr, false);
+        CHECK(near(l, 0.4f) && near(r, 0.4f), "the live input plays through its track and its sends while stopped");
+        arr.tracks[0].items.push_back(item(constant(kBlock, 0.2f), 0, 0, kBlock));
+        CHECK(near(block(arr, true).first, 0.6f), "it plays along with the track's items");
+        arr.tracks[0].mute = true;
+        CHECK(block(arr, true).first == 0.0f, "a muted track mutes its live input");
+        arr.tracks[0].mute = false;
+
+        Arrangement two;
+        two.tracks.resize(2);
+        two.tracks[1].solo = true;
+        CHECK(block(two, false).first == 0.0f, "another track's solo keeps the live input quiet");
+        two.tracks[0].solo = true;
+        CHECK(near(block(two, false).first, 0.4f), "soloing the recording track lets it through");
+
+        live.track = -1;
+        Arrangement none;
+        none.masterGain = 0.5f;
+        CHECK(near(block(none, false).first, 0.2f), "with no track to go through it plays to the master");
+        live.track = 5;
+        CHECK(block(none, false).first == 0.0f, "a track that is not there plays nothing");
+    }
+
+    // The monitor's queue between the microphone and the speakers: a small, bounded delay.
+    {
+        MonitorBuffer m(1 << 12);
+        std::vector<float> in(64), out(256);
+        float next = 1.0f;
+        auto push = [&](int bursts) {
+            for (int k = 0; k < bursts; ++k) {
+                for (float &v : in) v = next++;
+                m.push(in.data(), in.size());
+            }
+        };
+        // One output callback of `frames`, read in blocks of 64 as the engine does.
+        auto callback = [&](size_t frames) {
+            m.begin(frames, 64);
+            for (size_t done = 0; done < frames; done += 64) m.read(out.data() + done, 64);
+        };
+        push(1);
+        callback(64);
+        CHECK(out[0] == 0.0f && out[63] == 0.0f, "monitoring waits for a burst beyond the callback before it starts");
+        push(1);
+        callback(64);
+        CHECK(out[0] == 1.0f && out[63] == 64.0f, "then plays the input in order");
+        push(1);
+        callback(64);
+        CHECK(out[0] == 65.0f, "one burst in, one callback out keeps the delay steady");
+        push(4);
+        callback(64);
+        CHECK(out[0] == 321.0f && out[63] == 384.0f, "when the input runs ahead the oldest frames go");
+        callback(64);
+        CHECK(out[0] == 385.0f, "what is left plays on");
+        callback(64);
+        CHECK(out[0] == 0.0f, "running dry gives silence");
+        push(1);
+        callback(64);
+        CHECK(out[0] == 0.0f, "and then it waits for a burst again");
+        push(1);
+        callback(64);
+        CHECK(out[0] == 449.0f, "before playing on");
+        push(2);
+        m.reset();
+        callback(64);
+        CHECK(out[0] == 0.0f && out[63] == 0.0f, "a reset forgets what was queued");
+        push(2);
+        callback(64);
+        CHECK(out[0] == 705.0f, "and starts over with what comes next");
+
+        // A callback four times the input burst: the queue swings by a whole
+        // callback between them, and nothing is dropped or runs dry.
+        MonitorBuffer big(1 << 12);
+        float sent = 1.0f, expected = 1.0f;
+        bool steady = true, started = false;
+        for (int k = 0; k < 40; ++k) {
+            for (int b = 0; b < 4; ++b) {
+                for (float &v : in) v = sent++;
+                big.push(in.data(), in.size());
+            }
+            big.begin(256, 64);
+            for (size_t done = 0; done < 256; done += 64) big.read(out.data() + done, 64);
+            if (!started && out[0] != 0.0f) {
+                started = true;
+                expected = out[0];
+            }
+            if (!started) continue;
+            for (size_t i = 0; i < 256; ++i) steady = steady && out[i] == expected++;
+        }
+        CHECK(started && steady, "a callback larger than the input burst plays every frame in order");
+
+        // Bursts arriving up to a burst late against the callbacks, with the
+        // engine's target of two bursts: once started it never drops or runs dry.
+        MonitorBuffer jittery(1 << 12);
+        uint32_t seed = 12345;
+        auto jitter = [&]() {
+            seed = seed * 1664525u + 1013904223u;
+            return static_cast<int64_t>((seed >> 16) % 64);
+        };
+        int64_t burst = 0, arrives = jitter();
+        sent = 1.0f;
+        started = false;
+        steady = true;
+        for (int c = 1; c <= 400; ++c) {
+            const int64_t now = c * 256 + 100;
+            while (arrives <= now) {
+                for (float &v : in) v = sent++;
+                jittery.push(in.data(), in.size());
+                ++burst;
+                arrives = burst * 64 + jitter();
+            }
+            jittery.begin(256, 128);
+            for (size_t done = 0; done < 256; done += 64) jittery.read(out.data() + done, 64);
+            if (!started && out[0] != 0.0f) {
+                started = true;
+                expected = out[0];
+            }
+            if (!started) continue;
+            for (size_t i = 0; i < 256; ++i) steady = steady && out[i] == expected++;
+        }
+        CHECK(started && steady, "input arriving early or late by a burst still plays every frame in order");
     }
 
     // Cancelling stops the render and reports it.

@@ -82,6 +82,8 @@ bool AudioEngine::openInput() {
         input_.reset();
         return false;
     }
+    // Two bursts: the input can arrive a burst early or late against the output's callbacks.
+    monitorTarget_.store(std::clamp(2 * input_->getFramesPerBurst(), 128, 4096));
     return true;
 }
 
@@ -95,6 +97,7 @@ void AudioEngine::closeInput() {
 }
 
 void AudioEngine::shutdown() {
+    monitorOn_.store(false);
     if (recording_.load()) stopRecording();
     closeInput();
     if (output_) {
@@ -104,7 +107,33 @@ void AudioEngine::shutdown() {
     }
 }
 
-void AudioEngine::setPlaying(bool playing) { playing_.store(playing); }
+void AudioEngine::setPlaying(bool playing) {
+    // Stopping during a count-in ends it, so the next start counts in afresh.
+    if (!playing) countIn_.store(0);
+    playing_.store(playing);
+}
+
+void AudioEngine::startPlaying(int64_t countInFrames) {
+    if (playing_.load()) return;
+    // Set before playing_, so the audio thread sees the count-in as soon as it sees playing.
+    countIn_.store(std::max<int64_t>(0, countInFrames));
+    playing_.store(true);
+}
+
+bool AudioEngine::setMonitor(bool enabled, int trackIndex) {
+    monitorTrack_.store(trackIndex);
+    if (!enabled) {
+        monitorOn_.store(false);
+        if (!recording_.load()) closeInput();
+        return true;
+    }
+    if (!openInput()) return false;
+    if (!monitorOn_.load()) {
+        monitor_.reset();
+        monitorOn_.store(true);
+    }
+    return true;
+}
 
 void AudioEngine::seek(int64_t frame) { position_.store(std::max<int64_t>(0, frame)); }
 
@@ -114,7 +143,7 @@ void AudioEngine::setLoop(int64_t start, int64_t end, bool enabled) {
     loopOn_.store(enabled && end > start);
 }
 
-bool AudioEngine::startRecording(bool withTransport) {
+bool AudioEngine::startRecording(bool withTransport, int64_t countInFrames) {
     if (recording_.load()) return true;
     if (!openInput()) return false;
 
@@ -127,8 +156,10 @@ bool AudioEngine::startRecording(bool withTransport) {
 
     draining_.store(true);
     drainThread_ = std::thread(&AudioEngine::drainLoop, this);
+    // Capture starts now, through the count-in, so a note sung just before
+    // the first beat is kept (hidden before the start of the take).
     recording_.store(true);
-    if (withTransport) playing_.store(true);
+    if (withTransport) startPlaying(countInFrames);
     return true;
 }
 
@@ -141,36 +172,28 @@ int64_t AudioEngine::outputLatencyFrames() {
 int AudioEngine::stopRecording() {
     if (!recording_.load()) return -1;
     recording_.store(false);
+    countIn_.store(0);
     draining_.store(false);
     if (drainThread_.joinable()) drainThread_.join();
     drainOnce();
 
-    // Shift the take earlier by the round-trip latency so it lines up with
-    // what the performer heard while playing along. A sample has no timeline
-    // to line up with.
+    // The round-trip latency, so the app can line the take up with what the
+    // performer heard while playing along. A sample has no timeline to line
+    // up with.
     int64_t latencyFrames = 0;
     if (!sampling_) latencyFrames += outputLatencyFrames();
     if (input_ && !sampling_) {
         auto inLatency = input_->calculateLatencyMillis();
         if (inLatency) latencyFrames += static_cast<int64_t>(inLatency.value() * sampleRate_ / 1000.0);
     }
-    closeInput();
+    lastLatency_ = latencyFrames;
+    // Monitoring keeps the microphone open.
+    if (!monitorOn_.load()) closeInput();
 
     if (recordBuffer_.empty()) return -1;
-
-    int64_t start = recordStartFrame_ - latencyFrames;
-    size_t skip = 0;
-    if (start < 0) {
-        skip = static_cast<size_t>(std::min<int64_t>(-start, static_cast<int64_t>(recordBuffer_.size())));
-        start = 0;
-    }
-    if (skip >= recordBuffer_.size()) return -1;
-
-    auto take = std::make_shared<Samples>(recordBuffer_.begin() + static_cast<std::ptrdiff_t>(skip),
-                                          recordBuffer_.end());
-    recordBuffer_.clear();
     recordBuffer_.shrink_to_fit();
-    lastTakeStart_ = start;
+    auto take = std::make_shared<Samples>(std::move(recordBuffer_));
+    recordBuffer_ = std::vector<float>();
 
     std::lock_guard<std::mutex> lock(sourcesMutex_);
     const int id = nextSourceId_++;
@@ -201,6 +224,7 @@ oboe::DataCallbackResult AudioEngine::InputCallback::onAudioReady(oboe::AudioStr
     for (int32_t i = 0; i < numFrames; ++i) peak = std::max(peak, std::fabs(in[i]));
     engine_.inputPeak_.store(std::max(engine_.inputPeak_.load(), peak));
     if (engine_.recording_.load()) engine_.ring_.write(in, static_cast<size_t>(numFrames));
+    if (engine_.monitorOn_.load()) engine_.monitor_.push(in, static_cast<size_t>(numFrames));
     return oboe::DataCallbackResult::Continue;
 }
 
@@ -210,6 +234,16 @@ int AudioEngine::createSource(const float *data, int64_t numFrames) {
     const int id = nextSourceId_++;
     sources_[id] = std::move(samples);
     return id;
+}
+
+void AudioEngine::releaseSource(int id) {
+    std::shared_ptr<const Samples> gone;
+    std::lock_guard<std::mutex> lock(sourcesMutex_);
+    auto it = sources_.find(id);
+    if (it == sources_.end()) return;
+    // An arrangement that still plays it keeps its own reference.
+    gone = std::move(it->second);
+    sources_.erase(it);
 }
 
 std::shared_ptr<const Samples> AudioEngine::source(int id) {
@@ -381,7 +415,7 @@ void AudioEngine::applyLiveNotes() {
     }
 }
 
-void AudioEngine::renderSegment(float *out, int32_t numFrames, int64_t pos, bool playing) {
+void AudioEngine::renderSegment(float *out, int32_t numFrames, int64_t pos, bool playing, bool monitoring) {
     if (playing && pos != nextBlockPos_) {
         // Playback started, seeked or looped: notes from before must not hang on.
         for (auto &t : arrangement_->tracks) {
@@ -389,10 +423,15 @@ void AudioEngine::renderSegment(float *out, int32_t numFrames, int64_t pos, bool
         }
     }
     nextBlockPos_ = playing ? pos + numFrames : -1;
+    // The microphone, while monitoring, through the track it records into.
+    LiveInput live;
+    live.samples = liveBlock_.data();
+    live.track = monitorTrack_.load();
     for (int32_t done = 0; done < numFrames; done += kBlock) {
         const int n = static_cast<int>(std::min<int32_t>(kBlock, numFrames - done));
+        if (monitoring) monitor_.read(liveBlock_.data(), static_cast<size_t>(n));
         if (mixer_.renderBlock(*arrangement_, out + 2 * done, n, playing ? pos + done : pos, playing,
-                               trackPeaks_.data())) {
+                               trackPeaks_.data(), nullptr, monitoring ? &live : nullptr)) {
             instrumentsActive_ = true;
         }
     }
@@ -408,14 +447,30 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
     std::unique_lock<std::mutex> lock(arrangementMutex_, std::try_to_lock);
     instrumentsActive_ = false;
     if (lock.owns_lock()) applyLiveNotes();
+    // Decided once for the whole callback, which may render in several segments.
+    const bool monitoring = monitorOn_.load();
+    if (monitoring) monitor_.begin(static_cast<size_t>(numFrames), static_cast<size_t>(monitorTarget_.load()));
 
     if (playing_.load()) {
         tailFrames_ = static_cast<int64_t>(sampleRate_) * 4;
+        int32_t done = 0;
+        // A count-in: the metronome counts the bars in while the timeline
+        // waits, its clicks on the beats before the start.
+        int64_t countIn = countIn_.load();
+        if (countIn > 0) {
+            const auto count = static_cast<int32_t>(std::min<int64_t>(countIn, numFrames));
+            const int64_t start = position_.load();
+            if (lock.owns_lock()) renderSegment(out, count, start, false, monitoring);
+            renderMetronome(out, count, start - countIn);
+            // Unless the UI stopped it meanwhile.
+            countIn_.compare_exchange_strong(countIn, countIn - count);
+            done = count;
+        }
         int64_t pos = position_.load();
-        const bool loop = loopOn_.load() && !recording_.load();
+        // While recording too: each pass round the loop becomes a take.
+        const bool loop = loopOn_.load();
         const int64_t loopStart = loopStart_.load();
         const int64_t loopEnd = loopEnd_.load();
-        int32_t done = 0;
         while (done < numFrames) {
             int32_t count = numFrames - done;
             // Wrap only when playback reaches the loop end from inside the
@@ -423,7 +478,7 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
             const bool wraps = loop && pos < loopEnd && pos + count >= loopEnd;
             if (wraps) count = static_cast<int32_t>(loopEnd - pos);
             if (lock.owns_lock()) {
-                renderSegment(out + 2 * done, count, pos, true);
+                renderSegment(out + 2 * done, count, pos, true, monitoring);
             } else {
                 if (metronomeOn_.load()) renderMetronome(out + 2 * done, count, pos);
                 if (nextBlockPos_ == pos) nextBlockPos_ = pos + count;
@@ -433,11 +488,12 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
             if (wraps) pos = loopStart;
         }
         position_.store(pos);
-    } else if (tailFrames_ > 0) {
+    } else if (tailFrames_ > 0 || monitoring) {
         // Like REAPER's "run FX when stopped": let reverb and delay tails ring
         // out for a few seconds after stopping, then go quiet to save battery.
-        if (lock.owns_lock()) renderSegment(out, numFrames, position_.load(), false);
-        tailFrames_ -= numFrames;
+        // Monitoring keeps the mix running, so the microphone is heard.
+        if (lock.owns_lock()) renderSegment(out, numFrames, position_.load(), false, monitoring);
+        tailFrames_ = std::max<int64_t>(0, tailFrames_ - numFrames);
         // Notes still sounding (a held pad or key) keep the engine running.
         if (instrumentsActive_) tailFrames_ = std::max<int64_t>(tailFrames_, static_cast<int64_t>(sampleRate_) * 2);
     }

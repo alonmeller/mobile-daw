@@ -12,11 +12,12 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 /** Transport glyphs drawn directly, so the app needs no icon library. */
-enum class Glyph { Play, Pause, Stop, Record, Rewind, Metronome, ZoomIn, ZoomOut, Pads, Songs, Share }
+enum class Glyph { Play, Pause, Stop, Record, Rewind, Metronome, ZoomIn, ZoomOut, Pads, Songs, Share, Settings, Headphones }
 
 @Composable
 fun GlyphIcon(glyph: Glyph, color: Color, modifier: Modifier = Modifier, size: Dp = 22.dp) {
@@ -106,6 +107,24 @@ fun GlyphIcon(glyph: Glyph, color: Color, modifier: Modifier = Modifier, size: D
                     lineTo(w * 0.68f, h * 0.25f)
                 }
                 drawPath(arrow, color, style = stroke)
+            }
+            Glyph.Settings -> {
+                // A cog: eight teeth round a ring.
+                val c = Offset(w / 2, h / 2)
+                for (k in 0 until 8) {
+                    rotate(k * 45f, c) {
+                        drawRoundRect(color, Offset(w * 0.42f, h * 0.06f), Size(w * 0.16f, h * 0.2f), CornerRadius(w * 0.03f))
+                    }
+                }
+                drawCircle(color, radius = w * 0.26f, center = c, style = Stroke(width = w * 0.15f))
+            }
+            Glyph.Headphones -> {
+                drawArc(
+                    color, 180f, 180f, false, Offset(w * 0.17f, h * 0.14f), Size(w * 0.66f, h * 0.72f),
+                    style = Stroke(width = w * 0.09f, cap = StrokeCap.Round),
+                )
+                drawRoundRect(color, Offset(w * 0.1f, h * 0.5f), Size(w * 0.2f, h * 0.36f), CornerRadius(w * 0.06f))
+                drawRoundRect(color, Offset(w * 0.7f, h * 0.5f), Size(w * 0.2f, h * 0.36f), CornerRadius(w * 0.06f))
             }
             Glyph.ZoomIn, Glyph.ZoomOut -> {
                 drawLine(color, Offset(w * 0.2f, h * 0.5f), Offset(w * 0.8f, h * 0.5f), strokeWidth = w * 0.1f)

@@ -68,6 +68,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -85,6 +86,7 @@ import com.alonmeller.mobiledaw.model.Midi
 import com.alonmeller.mobiledaw.model.PAD_COUNT
 import com.alonmeller.mobiledaw.model.Routing
 import com.alonmeller.mobiledaw.model.Scales
+import com.alonmeller.mobiledaw.model.Takes
 import com.alonmeller.mobiledaw.model.Track
 import kotlin.math.floor
 import kotlin.math.max
@@ -92,6 +94,9 @@ import kotlin.math.max
 private val HeaderWidth = 204.dp
 private val TrackHeight = 92.dp
 private val RulerHeight = 34.dp
+/** Room an item leaves above and below it in its lane, and the height of its title strip. */
+private val ItemPad = 4.dp
+private val ItemTitle = 14.dp
 
 /**
  * The whole app. [withMic] runs an action once the microphone may be used,
@@ -121,14 +126,14 @@ fun DawScreen(
             .fillMaxSize()
             .background(DawColors.Background)
     ) {
-        TransportBar(vm) {
+        TransportBar(vm, withMic) {
             // Recording notes needs no microphone.
             if (vm.recording || vm.recordingMidi || vm.recordsMidi) vm.toggleRecord() else withMic(vm::toggleRecord)
         }
         when (vm.view) {
             MainView.Mixer -> MixerView(vm, Modifier.fillMaxSize())
             MainView.Play -> PlayView(vm, withMic, pickAudio, Modifier.fillMaxSize())
-            MainView.Arrange -> ArrangeView(vm, trackScroll, pickAudio)
+            MainView.Arrange -> ArrangeView(vm, trackScroll, pickAudio, withMic)
         }
     }
     vm.fxTarget?.let { FxDialog(vm, it) }
@@ -146,7 +151,12 @@ fun DawScreen(
 
 /** The timeline: edit tools, ruler and track lanes. */
 @Composable
-private fun ArrangeView(vm: DawViewModel, trackScroll: ScrollState, pickAudio: ((ImportedAudio) -> Unit) -> Unit) {
+private fun ArrangeView(
+    vm: DawViewModel,
+    trackScroll: ScrollState,
+    pickAudio: ((ImportedAudio) -> Unit) -> Unit,
+    withMic: (() -> Unit) -> Unit,
+) {
     Column(Modifier.fillMaxSize()) {
         EditBar(vm)
         Row(Modifier.fillMaxWidth().height(RulerHeight)) {
@@ -170,7 +180,7 @@ private fun ArrangeView(vm: DawViewModel, trackScroll: ScrollState, pickAudio: (
                     // Tracks in a collapsed folder are hidden, as in REAPER, unless a take is going into one.
                     if (track.id in hidden && !vm.isRecordingInto(track)) return@forEachIndexed
                     val row = shown++
-                    key(track.id) { TrackRow(vm, track, row, folder = Routing.isFolder(tracks, index)) }
+                    key(track.id) { TrackRow(vm, track, row, folder = Routing.isFolder(tracks, index), withMic = withMic) }
                 }
                 if (vm.recording && vm.project.tracks.none { vm.isRecordingInto(it) }) {
                     RecordingRow(vm, vm.project.tracks.size)
@@ -231,18 +241,18 @@ private fun EmptyHint() {
 // ---------------------------------------------------------------- Transport
 
 @Composable
-private fun TransportBar(vm: DawViewModel, onRecordPressed: () -> Unit) {
+private fun TransportBar(vm: DawViewModel, withMic: (() -> Unit) -> Unit, onRecordPressed: () -> Unit) {
     val recordingAny = vm.recording || vm.recordingMidi
     // Smaller buttons on narrow phones, so the whole bar still fits.
     BoxWithConstraints(Modifier.fillMaxWidth().height(60.dp).background(DawColors.Panel)) {
         val compact = maxWidth < 860.dp
-        val button = if (compact) 36.dp else 40.dp
+        val button = if (compact) 34.dp else 40.dp
         Row(
             Modifier
                 .fillMaxSize()
                 .padding(horizontal = if (compact) 8.dp else 12.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (compact) 3.dp else 6.dp),
         ) {
             // "My Songs", like GarageBand's song browser.
             RoundButton(onClick = vm::openSongs, size = button) { GlyphIcon(Glyph.Songs, DawColors.TextPrimary, size = 20.dp) }
@@ -262,6 +272,7 @@ private fun TransportBar(vm: DawViewModel, onRecordPressed: () -> Unit) {
             RoundButton(onClick = vm::toggleMetronome, active = vm.settings.metronome, activeColor = DawColors.Accent, size = button) {
                 GlyphIcon(Glyph.Metronome, DawColors.TextPrimary, size = 20.dp)
             }
+            RecordSettingsButton(vm, withMic, button)
             // Switches between the timeline and the mixer, like REAPER's View > Mixer,
             // or the pads and keys of an instrument.
             RoundButton(onClick = { vm.showView(MainView.Mixer) }, active = vm.view == MainView.Mixer, activeColor = DawColors.Accent, size = button) {
@@ -278,11 +289,57 @@ private fun TransportBar(vm: DawViewModel, onRecordPressed: () -> Unit) {
             RoundButton(onClick = vm::openExport, size = button) { GlyphIcon(Glyph.Share, DawColors.TextPrimary, size = 20.dp) }
             val meterWidth = if (compact) 56.dp else 70.dp
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                if (vm.recording || vm.samplingPad != null) LevelMeter(vm.inputLevel, Modifier.width(meterWidth).height(8.dp), label = "IN")
+                if (vm.recording || vm.samplingPad != null || vm.monitoringLive) {
+                    LevelMeter(vm.inputLevel, Modifier.width(meterWidth).height(8.dp), label = "IN")
+                }
                 LevelMeter(vm.masterLevel, Modifier.width(meterWidth).height(8.dp), label = "OUT")
             }
         }
     }
+}
+
+/** Recording settings, as in REAPER's record and metronome options: the count-in, takes and hearing yourself. */
+@Composable
+private fun RecordSettingsButton(vm: DawViewModel, withMic: (() -> Unit) -> Unit, size: Dp) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        RoundButton(onClick = { open = true }, size = size) { GlyphIcon(Glyph.Settings, DawColors.TextPrimary, size = 20.dp) }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            val s = vm.settings
+            fun mark(on: Boolean) = if (on) "✓  " else "     "
+            MenuHeading("Count-in before recording")
+            listOf(0 to "Off", 1 to "1 bar", 2 to "2 bars").forEach { (bars, label) ->
+                MenuItem(mark(s.countInBars == bars) + label) {
+                    open = false
+                    vm.setCountIn(bars)
+                }
+            }
+            MenuHeading("Recording over an item")
+            MenuItem(mark(s.keepTakes) + "Adds a take, keeping the old one") {
+                open = false
+                vm.setKeepTakes(true)
+            }
+            MenuItem(mark(!s.keepTakes) + "Replaces it, like tape") {
+                open = false
+                vm.setKeepTakes(false)
+            }
+            MenuHeading("While recording")
+            MenuItem(mark(s.monitoring) + "Hear yourself in headphones") {
+                open = false
+                if (s.monitoring) vm.toggleMonitoring() else withMic(vm::toggleMonitoring)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MenuHeading(text: String) {
+    Text(
+        text,
+        color = DawColors.TextSecondary,
+        fontSize = 12.sp,
+        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 2.dp),
+    )
 }
 
 /** Second toolbar with REAPER's everyday item edits. */
@@ -302,6 +359,20 @@ private fun EditBar(vm: DawViewModel) {
         EditButton("↶ Undo", enabled = vm.canUndo, onClick = vm::undo)
         EditButton("↷ Redo", enabled = vm.canRedo, onClick = vm::redo)
         Divider()
+        // The takes of the selected item, as in REAPER: hear each one, then keep the best.
+        vm.selectedTakesItem?.let { item ->
+            EditButton("◀") { vm.stepTake(-1) }
+            Text(
+                "Take ${Takes.active(item) + 1}/${Takes.count(item)}",
+                color = DawColors.TextPrimary,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            EditButton("▶") { vm.stepTake(1) }
+            EditButton("Delete take", onClick = vm::deleteTake)
+            EditButton("Keep only this take", onClick = vm::cropTake)
+            Divider()
+        }
         EditButton("✂ Split", onClick = vm::splitAtPlayhead)
         EditButton("⧉ Duplicate", enabled = hasSelection, onClick = vm::duplicateSelected)
         EditButton("Copy", enabled = hasSelection, onClick = vm::copySelected)
@@ -383,6 +454,7 @@ private fun TimeDisplay(vm: DawViewModel) {
     val sixteenth = floor((beats % 1.0) * 4).toInt() + 1
     val minutes = (seconds / 60).toInt()
     val secs = seconds % 60
+    val countIn = vm.countInBeats
     Column(
         Modifier
             .clip(RoundedCornerShape(8.dp))
@@ -392,8 +464,9 @@ private fun TimeDisplay(vm: DawViewModel) {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            "%3d . %d . %d".format(bar, beat, sixteenth),
-            color = DawColors.LcdText,
+            // The same width as the position, so the bar does not jump.
+            if (countIn > 0) "%-9s%2d".format("COUNT-IN", countIn) else "%3d . %d . %d".format(bar, beat, sixteenth),
+            color = if (countIn > 0) DawColors.Record else DawColors.LcdText,
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.Bold,
             fontSize = 17.sp,
@@ -667,9 +740,9 @@ private fun DrawScope.drawGrid(vm: DawViewModel) {
 
 /** [row] counts the tracks shown, for the lanes' alternating shades; [folder] is true when tracks play into this one. */
 @Composable
-private fun TrackRow(vm: DawViewModel, track: Track, row: Int, folder: Boolean) {
+private fun TrackRow(vm: DawViewModel, track: Track, row: Int, folder: Boolean, withMic: (() -> Unit) -> Unit) {
     Row(Modifier.fillMaxWidth().height(TrackHeight)) {
-        TrackHeader(vm, track, folder)
+        TrackHeader(vm, track, folder, withMic)
         TrackLane(vm, track, row, Modifier.weight(1f).fillMaxHeight())
     }
     Box(Modifier.fillMaxWidth().height(1.dp).background(Color.Black))
@@ -680,7 +753,7 @@ private val FolderStep = 10.dp
 private const val MAX_SHOWN_DEPTH = 3
 
 @Composable
-private fun TrackHeader(vm: DawViewModel, track: Track, folder: Boolean) {
+private fun TrackHeader(vm: DawViewModel, track: Track, folder: Boolean, withMic: (() -> Unit) -> Unit) {
     val color = DawColors.track(track.colorIndex)
     var menuOpen by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
@@ -789,6 +862,14 @@ private fun TrackHeader(vm: DawViewModel, track: Track, folder: Boolean) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 LevelMeter(vm.trackLevels[track.id] ?: 0f, Modifier.weight(1f).height(6.dp))
                 Spacer(Modifier.width(6.dp))
+                if (vm.armedTrackId == track.id && track.instrument == null) {
+                    // Hear yourself through this track (REAPER's record monitoring): green when heard, yellow while
+                    // waiting for headphones.
+                    GlyphChip(Glyph.Headphones, vm.settings.monitoring, if (vm.monitoringLive) DawColors.MeterGreen else DawColors.Solo, Modifier.width(30.dp)) {
+                        if (vm.settings.monitoring) vm.toggleMonitoring() else withMic(vm::toggleMonitoring)
+                    }
+                    Spacer(Modifier.width(4.dp))
+                }
                 track.instrument?.let { inst ->
                     // Opens the instrument's pads or keys.
                     LabelChip(if (inst.type == InstrumentType.DRUMS) "PADS" else "KEYS", true, color, Modifier.width(40.dp)) {
@@ -857,6 +938,20 @@ internal fun LabelChip(label: String, on: Boolean, onColor: Color, modifier: Mod
 }
 
 @Composable
+private fun GlyphChip(glyph: Glyph, on: Boolean, onColor: Color, modifier: Modifier, onClick: () -> Unit) {
+    Box(
+        modifier
+            .height(24.dp)
+            .clip(RoundedCornerShape(5.dp))
+            .background(if (on) onColor else DawColors.Background)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        GlyphIcon(glyph, if (on) Color.Black else DawColors.TextSecondary, size = 16.dp)
+    }
+}
+
+@Composable
 internal fun ToggleChip(label: String, on: Boolean, onColor: Color, onClick: () -> Unit) {
     Box(
         Modifier
@@ -913,11 +1008,15 @@ private fun TrackLane(vm: DawViewModel, track: Track, index: Int, modifier: Modi
                         } else {
                             val hit = latestVm.hitTest(latestTrack, pos.x, pos.y, h)
                             if (hit != null) {
-                                // Tapping a selected MIDI item again opens its notes.
-                                if (hit.first.isMidi && hit.first.id in latestVm.selectedItems) {
-                                    latestVm.openNoteEditor(hit.first.id)
-                                } else {
-                                    latestVm.selectItem(hit.first.id, latestTrack.id)
+                                val item = hit.first
+                                val selected = item.id in latestVm.selectedItems
+                                val lane = if (selected) takeLaneAt(item, pos.y, h) else null
+                                when {
+                                    // Tapping a selected MIDI item again opens its notes.
+                                    item.isMidi && selected -> latestVm.openNoteEditor(item.id)
+                                    // Tapping a take's lane in a selected item plays that take, as in REAPER.
+                                    lane != null -> latestVm.selectTake(item.id, lane)
+                                    else -> latestVm.selectItem(item.id, latestTrack.id)
                                 }
                             } else {
                                 latestVm.selectItem(null, latestTrack.id)
@@ -937,7 +1036,7 @@ private fun TrackLane(vm: DawViewModel, track: Track, index: Int, modifier: Modi
             if (item.isMidi) {
                 drawMidiItem(vm, item, track, color, item.id in vm.selectedItems)
             } else {
-                drawItem(vm, item, vm.sources[item.sourceId], color, item.id in vm.selectedItems, track.mute)
+                drawItem(vm, item, vm.sources, color, item.id in vm.selectedItems, track.mute)
             }
         }
         if (vm.isRecordingInto(track)) {
@@ -1018,15 +1117,27 @@ private fun RecordingRow(vm: DawViewModel, index: Int) {
     }
 }
 
+/** While recording: a red box over what this take has covered, from the loop start once it has gone round. */
 private fun DrawScope.drawRecording(vm: DawViewModel) {
-    val x0 = vm.screenX(vm.recordStart)
-    val w = vm.framesToPx(vm.recordedFrames)
+    // Counting in: nothing is on the timeline yet.
+    if (vm.countInBeats > 0) return
+    val p = vm.project
+    val looped = vm.recordPasses > 1 && p.loopOn && p.loopEnd > p.loopStart
+    val x0 = vm.screenX(if (looped) p.loopStart else vm.recordStart)
+    val w = vm.screenX(vm.position) - x0
     if (w <= 0f) return
-    val pad = 4.dp.toPx()
+    val pad = ItemPad.toPx()
     drawRoundRect(
         DawColors.Record.copy(alpha = 0.45f), Offset(x0, pad), Size(w, size.height - pad * 2),
         CornerRadius(6.dp.toPx()),
     )
+    // Each pass round the loop is a take of its own.
+    if (looped && w > 50.dp.toPx()) {
+        drawContext.canvas.nativeCanvas.drawText(
+            "Take ${vm.recordPasses}", max(x0, 0f) + 6.dp.toPx(), pad + 12.dp.toPx(),
+            textPaint(11.dp.toPx(), android.graphics.Color.WHITE, bold = true),
+        )
+    }
 }
 
 /** While notes are recorded: a red band over what this pass has covered. */
@@ -1047,12 +1158,12 @@ private fun DrawScope.drawMidiItem(vm: DawViewModel, item: Item, track: Track, c
     val x0 = vm.screenX(item.position)
     val width = vm.framesToPx(item.length)
     if (x0 > size.width || x0 + width < 0 || width <= 0f) return
-    val pad = 4.dp.toPx()
+    val pad = ItemPad.toPx()
     val top = pad
     val height = size.height - pad * 2
     val radius = CornerRadius(6.dp.toPx())
     val alpha = if (item.mute || track.mute) 0.3f else 1f
-    val titleH = 14.dp.toPx()
+    val titleH = ItemTitle.toPx()
 
     drawRoundRect(color.copy(alpha = 0.3f * alpha), Offset(x0, top), Size(width, height), radius)
     drawRoundRect(color.copy(alpha = 0.9f * alpha), Offset(x0, top), Size(width, titleH), radius)
@@ -1109,10 +1220,25 @@ private fun DrawScope.drawMidiItem(vm: DawViewModel, item: Item, track: Track, c
     }
 }
 
+/** Which take lane of [item] the height [y] in a track lane [laneH] high falls on, when it has several takes. */
+private fun Density.takeLaneAt(item: Item, y: Float, laneH: Float): Int? {
+    val n = Takes.count(item)
+    if (n < 2) return null
+    val top = (ItemPad + ItemTitle).toPx()
+    val height = laneH - 2 * ItemPad.toPx() - ItemTitle.toPx()
+    if (y < top || y >= top + height) return null
+    return ((y - top) / (height / n)).toInt().coerceIn(0, n - 1)
+}
+
+/**
+ * An audio item: its waveform, fades and gain. A selected item with several
+ * takes shows each in a lane of its own, the one playing lit up, as REAPER
+ * shows takes in lanes; tapping a lane plays that take.
+ */
 private fun DrawScope.drawItem(
     vm: DawViewModel,
     item: Item,
-    source: SourceInfo?,
+    sources: Map<Int, SourceInfo>,
     color: Color,
     selected: Boolean,
     trackMuted: Boolean,
@@ -1121,22 +1247,25 @@ private fun DrawScope.drawItem(
     val width = vm.framesToPx(item.length)
     if (x0 > size.width || x0 + width < 0 || width <= 0f) return
 
-    val pad = 4.dp.toPx()
+    val pad = ItemPad.toPx()
     val top = pad
     val height = size.height - pad * 2
     val bottom = top + height
     val radius = CornerRadius(6.dp.toPx())
     val alpha = if (item.mute || trackMuted) 0.3f else 1f
-    val titleH = 14.dp.toPx()
+    val titleH = ItemTitle.toPx()
+    val takes = Takes.all(item)
+    val active = Takes.active(item)
 
     drawRoundRect(color.copy(alpha = 0.35f * alpha), Offset(x0, top), Size(width, height), radius)
     drawRoundRect(color.copy(alpha = 0.9f * alpha), Offset(x0, top), Size(width, titleH), radius)
     drawRect(color.copy(alpha = 0.9f * alpha), Offset(x0, top + titleH / 2), Size(width, titleH / 2))
     if (width > 40.dp.toPx()) {
-        val label = buildString {
-            append(if (item.mute) "muted" else "")
-            if (item.gain != 1f) append(" %+.1f dB".format(20 * kotlin.math.log10(item.gain.coerceAtLeast(1e-4f))))
-        }.trim()
+        val label = listOfNotNull(
+            if (takes.size > 1) "Take ${active + 1}/${takes.size}" else null,
+            if (item.mute) "muted" else null,
+            if (item.gain != 1f) "%+.1f dB".format(20 * kotlin.math.log10(item.gain.coerceAtLeast(1e-4f))) else null,
+        ).joinToString("  ")
         if (label.isNotEmpty()) {
             drawContext.canvas.nativeCanvas.drawText(
                 label, max(x0, 0f) + 6.dp.toPx(), top + titleH * 0.78f,
@@ -1145,27 +1274,19 @@ private fun DrawScope.drawItem(
         }
     }
 
-    // Waveform: one bar per pixel column, max of the source buckets it covers.
-    val peaks = source?.peaks
-    if (peaks != null && peaks.isNotEmpty()) {
-        val waveTop = top + titleH
-        val waveH = height - titleH
-        val mid = waveTop + waveH / 2
-        val waveColor = Color.Black.copy(alpha = 0.5f * alpha + 0.1f)
-        val step = max(1, 1.dp.toPx().toInt())
-        var col = max(0f, x0).toInt()
-        val endCol = minOf(size.width, x0 + width).toInt()
-        while (col < endCol) {
-            val f0 = item.offset + vm.pxToFrames(col - x0)
-            val f1 = item.offset + vm.pxToFrames(col + step - x0)
-            val b0 = (f0 / PEAK_BUCKET).toInt().coerceIn(0, peaks.size - 1)
-            val b1 = (f1 / PEAK_BUCKET).toInt().coerceIn(b0 + 1, peaks.size)
-            var pk = 0f
-            for (b in b0 until b1) pk = max(pk, peaks[b])
-            val h = (pk * item.gain).coerceAtMost(1f) * waveH / 2
-            drawLine(waveColor, Offset(col.toFloat(), mid - h.coerceAtLeast(0.5f)), Offset(col.toFloat(), mid + h.coerceAtLeast(0.5f)), step.toFloat())
-            col += step
+    val waveTop = top + titleH
+    val waveH = height - titleH
+    val waveColor = Color.Black.copy(alpha = 0.5f * alpha + 0.1f)
+    if (selected && takes.size > 1) {
+        val laneH = waveH / takes.size
+        takes.forEachIndexed { k, take ->
+            val y = waveTop + k * laneH
+            if (k == active) drawRect(Color.White.copy(alpha = 0.22f), Offset(x0, y), Size(width, laneH))
+            if (k > 0) drawLine(Color.Black.copy(alpha = 0.35f), Offset(x0, y), Offset(x0 + width, y), 1f)
+            drawWave(vm, sources[take.sourceId]?.peaks, take.offset, take.gain, x0, width, y, laneH, waveColor)
         }
+    } else {
+        drawWave(vm, sources[item.sourceId]?.peaks, item.offset, item.gain, x0, width, waveTop, waveH, waveColor)
     }
 
     // Fades: shade the area above each fade curve.
@@ -1209,5 +1330,42 @@ private fun DrawScope.drawItem(
         val edge = 3.dp.toPx()
         drawRect(Color.White.copy(alpha = 0.7f), Offset(x0, top + height * 0.35f), Size(edge, height * 0.3f))
         drawRect(Color.White.copy(alpha = 0.7f), Offset(x0 + width - edge, top + height * 0.35f), Size(edge, height * 0.3f))
+    }
+}
+
+/**
+ * A waveform in the band from [top], [height] high, of an item at screen
+ * [x0] that is [width] wide and starts [offset] frames into the source
+ * [peaks] come from: one bar per pixel column, the loudest bucket it covers.
+ */
+private fun DrawScope.drawWave(
+    vm: DawViewModel,
+    peaks: FloatArray?,
+    offset: Long,
+    gain: Float,
+    x0: Float,
+    width: Float,
+    top: Float,
+    height: Float,
+    color: Color,
+) {
+    if (peaks == null || peaks.isEmpty()) return
+    val mid = top + height / 2
+    val step = max(1, 1.dp.toPx().toInt())
+    var col = max(0f, x0).toInt()
+    val endCol = minOf(size.width, x0 + width).toInt()
+    while (col < endCol) {
+        val f0 = offset + vm.pxToFrames(col - x0)
+        val f1 = offset + vm.pxToFrames(col + step - x0)
+        // Before or after the source (a pass cut short) is silent.
+        if (f1 > 0 && f0 / PEAK_BUCKET < peaks.size) {
+            val b0 = (f0 / PEAK_BUCKET).toInt().coerceIn(0, peaks.size - 1)
+            val b1 = (f1 / PEAK_BUCKET).toInt().coerceIn(b0 + 1, peaks.size)
+            var pk = 0f
+            for (b in b0 until b1) pk = max(pk, peaks[b])
+            val h = ((pk * gain).coerceAtMost(1f) * height / 2).coerceAtLeast(0.5f)
+            drawLine(color, Offset(col.toFloat(), mid - h), Offset(col.toFloat(), mid + h), step.toFloat())
+        }
+        col += step
     }
 }
