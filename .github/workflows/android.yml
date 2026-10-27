@@ -1,0 +1,49 @@
+name: Build APK
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk MobileDAW.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MobileDAW-apk
+          path: MobileDAW.apk
+
+      # Every push gets a downloadable release, so the APK can be installed
+      # straight from the phone's browser. Builds from main are marked latest.
+      - name: Publish release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "Mobile DAW build ${{ github.run_number }} (${{ github.ref_name }})"
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ github.ref_name != 'main' }}
+          make_latest: ${{ github.ref_name == 'main' }}
+          files: MobileDAW.apk
+          body: |
+            Install: open this page on your Android phone, tap MobileDAW.apk, and allow installing from your browser.
+            Commit: ${{ github.sha }}
