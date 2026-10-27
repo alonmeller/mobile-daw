@@ -123,7 +123,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         if (result != null) {
             settings = result.settings
             NativeEngine.setMetronome(settings.metronome)
-            setProject(result.project)
+            applyProject(result.project)
             nextTrackNumber = result.project.tracks.size + 1
         }
         loading = false
@@ -160,7 +160,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         NativeEngine.setLoop(p.loopStart, p.loopEnd, p.loopOn)
     }
 
-    private fun setProject(p: Project) {
+    private fun applyProject(p: Project) {
         project = p
         sync(p)
         canUndo = history.canUndo
@@ -175,7 +175,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     private fun commit(newProject: Project) {
         if (newProject == project) return
         history.push(project)
-        setProject(newProject)
+        applyProject(newProject)
         scheduleSave()
     }
 
@@ -195,11 +195,11 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun undo() {
-        history.undo(project)?.let { setProject(it); scheduleSave() }
+        history.undo(project)?.let { applyProject(it); scheduleSave() }
     }
 
     fun redo() {
-        history.redo(project)?.let { setProject(it); scheduleSave() }
+        history.redo(project)?.let { applyProject(it); scheduleSave() }
     }
 
     // ------------------------------------------------------------ per-frame polling
@@ -457,10 +457,16 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Finds the item and drag mode for a touch at screen x, y within a lane of height [laneH]. */
     fun hitTest(track: Track, x: Float, y: Float, laneH: Float): Pair<Item, DragMode>? {
-        val item = track.items.lastOrNull { x >= screenX(it.position) && x <= screenX(it.end) } ?: return null
+        val edge = 16 * density
+        // A selected item's edges stay grabbable a little outside its bounds.
+        val tolerance = edge / 2
+        val item = track.items.lastOrNull { x >= screenX(it.position) && x <= screenX(it.end) }
+            ?: track.items.lastOrNull {
+                it.id in selectedItems && x >= screenX(it.position) - tolerance && x <= screenX(it.end) + tolerance
+            }
+            ?: return null
         val x0 = screenX(item.position)
         val x1 = screenX(item.end)
-        val edge = 16 * density
         val handleZone = laneH * 0.35f
         val mode = when {
             item.id !in selectedItems -> DragMode.Move

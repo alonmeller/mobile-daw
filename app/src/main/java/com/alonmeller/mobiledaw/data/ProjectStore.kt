@@ -116,6 +116,7 @@ class ProjectStore(root: File) {
     /** Set by the caller so version-1 projects can size their single item. */
     var sourceLengthOf: (Int) -> Long = { 0L }
 
+    @Synchronized
     fun save(project: Project, settings: ProjectSettings, sampleRate: Int, fileOf: (Int) -> String?) {
         val tracks = JSONArray()
         project.tracks.forEach { t ->

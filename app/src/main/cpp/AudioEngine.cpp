@@ -325,7 +325,10 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
         int32_t done = 0;
         while (done < numFrames) {
             int32_t count = numFrames - done;
-            if (loop && pos < loopEnd) count = static_cast<int32_t>(std::min<int64_t>(count, loopEnd - pos));
+            // Wrap only when playback reaches the loop end from inside the
+            // loop; starting after the loop just plays on, as in REAPER.
+            const bool wraps = loop && pos < loopEnd && pos + count >= loopEnd;
+            if (wraps) count = static_cast<int32_t>(loopEnd - pos);
             if (lock.owns_lock()) {
                 renderSegment(out + 2 * done, count, pos);
             } else if (metronomeOn_.load()) {
@@ -333,7 +336,7 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
             }
             pos += count;
             done += count;
-            if (loop && pos >= loopEnd) pos = loopStart;
+            if (wraps) pos = loopStart;
         }
         position_.store(pos);
     }

@@ -4,7 +4,10 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitHorizontalTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -31,6 +34,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -47,7 +51,9 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
@@ -111,7 +117,7 @@ fun DawScreen(vm: DawViewModel, onRecordPressed: () -> Unit) {
         Box(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
                 vm.project.tracks.forEachIndexed { index, track ->
-                    TrackRow(vm, track, index)
+                    key(track.id) { TrackRow(vm, track, index) }
                 }
                 if (vm.recording && vm.project.tracks.none { vm.isRecordingInto(it) }) {
                     RecordingRow(vm, vm.project.tracks.size)
@@ -151,7 +157,7 @@ private fun TransportBar(vm: DawViewModel, onRecordPressed: () -> Unit) {
             .background(DawColors.Panel)
             .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         RoundButton(onClick = vm::rewind) { GlyphIcon(Glyph.Rewind, DawColors.TextPrimary, size = 18.dp) }
         RoundButton(onClick = vm::stop) { GlyphIcon(Glyph.Stop, DawColors.TextPrimary, size = 20.dp) }
@@ -176,11 +182,11 @@ private fun TransportBar(vm: DawViewModel, onRecordPressed: () -> Unit) {
 
         Spacer(Modifier.weight(1f))
 
-        vm.message?.let { Text(it, color = DawColors.Solo, fontSize = 12.sp) }
-        if (vm.recording) LevelMeter(vm.inputLevel, Modifier.width(70.dp).height(10.dp), label = "IN")
-        LevelMeter(vm.masterLevel, Modifier.width(70.dp).height(10.dp), label = "OUT")
-        RoundButton(onClick = { vm.zoom(1f / 1.5f) }) { GlyphIcon(Glyph.ZoomOut, DawColors.TextPrimary, size = 16.dp) }
-        RoundButton(onClick = { vm.zoom(1.5f) }) { GlyphIcon(Glyph.ZoomIn, DawColors.TextPrimary, size = 16.dp) }
+        vm.message?.let { Text(it, color = DawColors.Solo, fontSize = 12.sp, maxLines = 1) }
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (vm.recording) LevelMeter(vm.inputLevel, Modifier.width(56.dp).height(8.dp), label = "IN")
+            LevelMeter(vm.masterLevel, Modifier.width(56.dp).height(8.dp), label = "OUT")
+        }
     }
 }
 
@@ -217,6 +223,9 @@ private fun EditBar(vm: DawViewModel) {
         EditButton("+ Marker", onClick = vm::addMarker)
         EditButton("◀ Marker") { vm.jumpMarker(forward = false) }
         EditButton("Marker ▶") { vm.jumpMarker(forward = true) }
+        Divider()
+        EditButton("Zoom −") { vm.zoom(1f / 1.5f) }
+        EditButton("Zoom +") { vm.zoom(1.5f) }
     }
 }
 
@@ -256,7 +265,7 @@ private fun RoundButton(
 ) {
     Box(
         Modifier
-            .size(42.dp)
+            .size(40.dp)
             .clip(CircleShape)
             .background(if (active) activeColor.copy(alpha = 0.85f) else DawColors.PanelRaised)
             .clickable(onClick = onClick),
@@ -342,6 +351,32 @@ private fun LevelMeter(level: Float, modifier: Modifier, label: String? = null) 
     }
 }
 
+// ---------------------------------------------------------------- Gestures
+
+/**
+ * Horizontal drag that reports where the finger first touched (not where the
+ * touch slop was crossed), so grabbing an item edge hits the edge.
+ * [onDrag] gets the pointer x and the x delta since the previous call.
+ */
+private suspend fun PointerInputScope.detectHorizontalDragFromDown(
+    onStart: (Offset) -> Unit,
+    onDrag: (x: Float, dx: Float) -> Unit,
+    onEnd: () -> Unit,
+) {
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        val slopChange = awaitHorizontalTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
+            ?: return@awaitEachGesture
+        onStart(down.position)
+        onDrag(slopChange.position.x, slopChange.position.x - down.position.x)
+        horizontalDrag(slopChange.id) { change ->
+            onDrag(change.position.x, change.positionChange().x)
+            change.consume()
+        }
+        onEnd()
+    }
+}
+
 // ---------------------------------------------------------------- Ruler
 
 @Composable
@@ -363,14 +398,11 @@ private fun Ruler(vm: DawViewModel, modifier: Modifier) {
             }
             .pointerInput(Unit) {
                 // Dragging along the ruler draws the loop range, as in REAPER.
-                detectHorizontalDragGestures(
-                    onDragStart = { latestVm.beginLoopDrag(it.x) },
-                    onDragEnd = { latestVm.endGesture() },
-                    onDragCancel = { latestVm.endGesture() },
-                ) { change, _ ->
-                    change.consume()
-                    latestVm.dragLoop(change.position.x)
-                }
+                detectHorizontalDragFromDown(
+                    onStart = { latestVm.beginLoopDrag(it.x) },
+                    onDrag = { x, _ -> latestVm.dragLoop(x) },
+                    onEnd = { latestVm.endGesture() },
+                )
             }
     ) {
         val p = vm.project
@@ -568,18 +600,14 @@ private fun TrackLane(vm: DawViewModel, track: Track, index: Int, modifier: Modi
             .background(if (index % 2 == 0) DawColors.Lane else DawColors.LaneAlt)
             .pointerInput(track.id) {
                 var draggingItem = false
-                detectHorizontalDragGestures(
-                    onDragStart = { offset ->
-                        val hit = latestVm.hitTest(latestTrack, offset.x, offset.y, size.height.toFloat())
+                detectHorizontalDragFromDown(
+                    onStart = { down ->
+                        val hit = latestVm.hitTest(latestTrack, down.x, down.y, size.height.toFloat())
                         draggingItem = hit != null
                         if (hit != null) latestVm.beginItemDrag(hit.first, hit.second, latestTrack.id)
                     },
-                    onDragEnd = { if (draggingItem) latestVm.endItemDrag() },
-                    onDragCancel = { if (draggingItem) latestVm.endItemDrag() },
-                    onHorizontalDrag = { change, dragAmount ->
-                        change.consume()
-                        if (draggingItem) latestVm.dragItemBy(dragAmount) else latestVm.scrollBy(-dragAmount)
-                    },
+                    onDrag = { _, dx -> if (draggingItem) latestVm.dragItemBy(dx) else latestVm.scrollBy(-dx) },
+                    onEnd = { if (draggingItem) latestVm.endItemDrag() },
                 )
             }
             .pointerInput(track.id) {
