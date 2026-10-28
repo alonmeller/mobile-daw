@@ -59,6 +59,7 @@ import com.alonmeller.mobiledaw.model.Send
 import com.alonmeller.mobiledaw.model.Take
 import com.alonmeller.mobiledaw.model.Takes
 import com.alonmeller.mobiledaw.model.Track
+import com.alonmeller.mobiledaw.model.Zoom
 import com.alonmeller.mobiledaw.ui.DawColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -73,6 +74,7 @@ import kotlin.math.ceil
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
 /** Frames per waveform bucket; fine enough for the deepest zoom level. */
@@ -283,7 +285,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     /** Timeline zoom in dp per second, and horizontal scroll in px. */
-    var zoomDp by mutableFloatStateOf(60f)
+    var zoomDp by mutableFloatStateOf(Zoom.DEFAULT_DP_PER_SECOND)
         private set
     var scrollPx by mutableFloatStateOf(0f)
     var laneWidthPx by mutableFloatStateOf(0f)
@@ -689,9 +691,37 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     /** Zooms keeping the time at screen [x] where it is, as a pinch does around the fingers. */
     fun zoomAround(factor: Float, x: Float) {
         val frame = pxToFrames(x + scrollPx)
-        zoomDp = (zoomDp * factor).coerceIn(5f, 600f)
+        zoomDp = (zoomDp * factor).coerceIn(Zoom.MIN_DP_PER_SECOND, Zoom.MAX_DP_PER_SECOND)
         scrollPx = (framesToPx(frame) - x).coerceAtLeast(0f)
     }
+
+    /** Shows the whole song across the screen, REAPER's "zoom out project"; a short song shows its first four bars. */
+    fun zoomToFit() {
+        if (laneWidthPx <= 0f) return
+        val end = max(project.endFrame, (framesPerBeat * 16).toLong())
+        zoomDp = Zoom.fit(end, sampleRate, laneWidthPx / density)
+        scrollPx = 0f
+    }
+
+    /** The tracks' height while a pinch changes it; it is saved in the preferences when the fingers lift. */
+    private var pinchTrackHeight by mutableStateOf<Float?>(null)
+
+    /** How tall each track is on the timeline, in dp. */
+    val trackHeight: Float get() = pinchTrackHeight ?: prefs.trackHeight.toFloat()
+
+    /** A pinch up and down makes every track taller or shorter by [factor]. */
+    fun scaleTrackHeight(factor: Float) {
+        pinchTrackHeight = (trackHeight * factor).coerceIn(Zoom.MIN_TRACK_HEIGHT.toFloat(), Zoom.MAX_TRACK_HEIGHT.toFloat())
+    }
+
+    fun endTrackHeightPinch() {
+        val height = pinchTrackHeight ?: return
+        updatePrefs { it.copy(trackHeight = height.roundToInt()) }
+        pinchTrackHeight = null
+    }
+
+    /** The zoom buttons: taller or shorter tracks, one step at a time. */
+    fun stepTrackHeight(up: Boolean) = updatePrefs { it.copy(trackHeight = Zoom.stepHeight(it.trackHeight, up)) }
 
     // ------------------------------------------------------------ transport
 
@@ -1756,29 +1786,36 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         selectedTrackId = trackId
     }
 
-    /** Finds the item and drag mode for a touch at screen x, y within a lane of height [laneH]. */
+    /**
+     * Finds the item and drag mode for a touch at screen x, y within a lane of
+     * height [laneH]. A selected item comes first: its edges trim it, from a
+     * little outside it too, so even a narrow one can be made longer, and the
+     * handles at its top corners set its fades. Any other item just moves.
+     */
     fun hitTest(track: Track, x: Float, y: Float, laneH: Float): Pair<Item, DragMode>? {
-        val edge = 16 * density
-        // A selected item's edges stay grabbable a little outside its bounds.
-        val tolerance = edge / 2
-        val item = track.items.lastOrNull { x >= screenX(it.position) && x <= screenX(it.end) }
-            ?: track.items.lastOrNull {
-                it.id in selectedItems && x >= screenX(it.position) - tolerance && x <= screenX(it.end) + tolerance
-            }
-            ?: return null
-        val x0 = screenX(item.position)
-        val x1 = screenX(item.end)
-        val handleZone = laneH * 0.35f
-        val mode = when {
-            item.id !in selectedItems -> DragMode.Move
-            // MIDI items have no fades.
-            !item.isMidi && y < handleZone && abs(x - (x0 + framesToPx(item.fadeIn))) < edge * 1.4f -> DragMode.FadeIn
-            !item.isMidi && y < handleZone && abs(x - (x1 - framesToPx(item.fadeOut))) < edge * 1.4f -> DragMode.FadeOut
-            x - x0 < edge && x1 - x0 > edge * 3 -> DragMode.TrimLeft
-            x1 - x < edge && x1 - x0 > edge * 3 -> DragMode.TrimRight
-            else -> DragMode.Move
+        val edge = 18 * density
+        val outside = 14 * density
+        val selected = track.items.lastOrNull {
+            it.id in selectedItems && x >= screenX(it.position) - outside && x <= screenX(it.end) + outside
         }
-        return item to mode
+        if (selected != null) {
+            val x0 = screenX(selected.position)
+            val x1 = screenX(selected.end)
+            // A narrow item keeps its middle third for moving it.
+            val reach = minOf(edge, (x1 - x0) / 3)
+            // MIDI items have no fades.
+            val fades = !selected.isMidi && y < laneH * 0.35f
+            val mode = when {
+                fades && abs(x - (x0 + framesToPx(selected.fadeIn))) < edge * 1.4f -> DragMode.FadeIn
+                fades && abs(x - (x1 - framesToPx(selected.fadeOut))) < edge * 1.4f -> DragMode.FadeOut
+                x < x0 + reach -> DragMode.TrimLeft
+                x > x1 - reach -> DragMode.TrimRight
+                else -> DragMode.Move
+            }
+            return selected to mode
+        }
+        val item = track.items.lastOrNull { x >= screenX(it.position) && x <= screenX(it.end) } ?: return null
+        return item to DragMode.Move
     }
 
     private var dragItem: Item? = null
@@ -2686,7 +2723,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val readme = File(dir, "README.txt")
         readme.writeText(
             """
-            ${job.title}: one WAV file per track, from Mobile DAW. A folder's file holds the tracks
+            ${job.title}: one WAV file per track, from Playdaw Studio. A folder's file holds the tracks
             in it and a bus's file its effect, so together the files make the whole song.
             Tempo ${num(p.tempo)} BPM, 4/4, ${sampleRate} Hz. Every file starts at the same moment
             (${if (job.start == 0L) "the start of the song, bar 1" else "the start of the loop"}), so they line up when placed at the same point.
@@ -2726,7 +2763,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun exportReaper(job: ExportJob, dir: File): ExportResult? {
         val p = job.project
-        val folder = AudioExport.asciiFileName(job.title, "Mobile DAW song")
+        val folder = AudioExport.asciiFileName(job.title, "Playdaw Studio song")
         val entries = mutableListOf<Pair<String, File>>()
         val taken = mutableSetOf("$folder.rpp".lowercase())
         // The recordings (every take), imports and samples the items play, as they are.
@@ -2778,7 +2815,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val p = job.project
         fun describe(e: Effect) = e.type.title + (if (e.bypass) " (off)" else "") + ": " +
             e.type.params.mapIndexed { i, spec -> "${spec.name} ${spec.format(e.values.getOrElse(i) { spec.default })}" }.joinToString(", ")
-        val lines = mutableListOf("${job.title} - from Mobile DAW", "")
+        val lines = mutableListOf("${job.title} - from Playdaw Studio", "")
         val withFx = p.tracks.filter { it.fx.isNotEmpty() }
         if (withFx.isNotEmpty() || p.masterFx.isNotEmpty()) {
             lines += "Effects are not included, because REAPER uses its own plug-ins (ReaEQ, ReaComp, ReaVerbate, ReaDelay...). They were:"

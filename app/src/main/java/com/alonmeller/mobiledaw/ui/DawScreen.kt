@@ -10,9 +10,6 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitHorizontalTouchSlopOrCancellation
 import androidx.compose.foundation.gestures.awaitTouchSlopOrCancellation
 import androidx.compose.foundation.gestures.awaitVerticalTouchSlopOrCancellation
-import androidx.compose.foundation.gestures.calculateCentroid
-import androidx.compose.foundation.gestures.calculatePan
-import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -109,11 +106,14 @@ import com.alonmeller.mobiledaw.model.Routing
 import com.alonmeller.mobiledaw.model.Scales
 import com.alonmeller.mobiledaw.model.Takes
 import com.alonmeller.mobiledaw.model.Track
+import com.alonmeller.mobiledaw.model.Zoom
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -219,49 +219,123 @@ private fun ArrangeView(
                 }
                 Ruler(vm, Modifier.weight(1f).fillMaxHeight())
             }
-            Column(Modifier.fillMaxSize().scrollHints(trackScroll, DawColors.Background).verticalScroll(trackScroll)) {
-                val tracks = vm.project.tracks
-                val hidden = vm.hiddenTracks
-                val buses = busIds(tracks)
-                var shown = 0
-                tracks.forEachIndexed { index, track ->
-                    // Tracks in a collapsed folder are hidden, as in REAPER, unless a take is going into one.
-                    if (track.id in hidden && !vm.isRecordingInto(track)) return@forEachIndexed
-                    val row = shown++
-                    key(track.id) {
-                        TrackRow(vm, track, row, index + 1, folder = Routing.isFolder(tracks, index), bus = track.id in buses, withMic = withMic)
-                    }
-                }
-                if (vm.recording && vm.project.tracks.none { vm.isRecordingInto(it) }) {
-                    RecordingRow(vm, vm.project.tracks.size)
-                }
-                if (vm.project.tracks.isEmpty() && !vm.recording && !vm.loading && vm.prefs.showHints) EmptyHint()
+            Box(Modifier.fillMaxSize()) {
+                TrackList(vm, trackScroll, withMic)
+                ZoomControls(vm, Modifier.align(Alignment.BottomEnd).padding(end = 14.dp, bottom = 10.dp))
             }
         }
     }
 }
 
+/** The tracks, each a header and a lane, under one another. */
+@Composable
+private fun TrackList(vm: DawViewModel, trackScroll: ScrollState, withMic: (() -> Unit) -> Unit) {
+    Column(Modifier.fillMaxSize().scrollHints(trackScroll, DawColors.Background).verticalScroll(trackScroll)) {
+        val tracks = vm.project.tracks
+        val hidden = vm.hiddenTracks
+        val buses = busIds(tracks)
+        var shown = 0
+        tracks.forEachIndexed { index, track ->
+            // Tracks in a collapsed folder are hidden, as in REAPER, unless a take is going into one.
+            if (track.id in hidden && !vm.isRecordingInto(track)) return@forEachIndexed
+            val row = shown++
+            key(track.id) {
+                TrackRow(vm, track, row, index + 1, folder = Routing.isFolder(tracks, index), bus = track.id in buses, withMic = withMic)
+            }
+        }
+        if (vm.recording && vm.project.tracks.none { vm.isRecordingInto(it) }) {
+            RecordingRow(vm, vm.project.tracks.size)
+        }
+        if (vm.project.tracks.isEmpty() && !vm.recording && !vm.loading && vm.prefs.showHints) EmptyHint()
+    }
+}
+
 /**
- * Two fingers on the timeline: pinch to zoom around them, as in GarageBand,
- * and move them together to scroll the song or the tracks. The fingers are
- * caught before the lanes see them, so a pinch never drags an item.
+ * Zoom buttons that stay on the timeline, as a map's do: closer and wider
+ * in time, the whole song at once, and shorter or taller tracks. Two
+ * fingers do the same: spread sideways for time, up and down for the tracks.
+ */
+@Composable
+private fun ZoomControls(vm: DawViewModel, modifier: Modifier) {
+    val seg = 38.dp
+    val icon = 20.dp
+    Row(modifier.height(34.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        ToolGroup(Modifier.fillMaxHeight()) {
+            ToolSegment(seg, onClick = { vm.zoom(1f / 1.5f) }, first = true) { GlyphIcon(Glyph.ZoomOut, DawColors.TextPrimary, size = icon) }
+            ToolSegment(seg, onClick = { vm.zoom(1.5f) }) { GlyphIcon(Glyph.ZoomIn, DawColors.TextPrimary, size = icon) }
+            ToolSegment(seg, onClick = vm::zoomToFit) { GlyphIcon(Glyph.FitSong, DawColors.TextPrimary, size = icon) }
+        }
+        ToolGroup(Modifier.fillMaxHeight()) {
+            ToolSegment(seg, onClick = { vm.stepTrackHeight(up = false) }, first = true) {
+                GlyphIcon(Glyph.ShorterTracks, DawColors.TextPrimary, size = icon)
+            }
+            ToolSegment(seg, onClick = { vm.stepTrackHeight(up = true) }) { GlyphIcon(Glyph.TallerTracks, DawColors.TextPrimary, size = icon) }
+        }
+    }
+}
+
+/**
+ * Two fingers on the timeline, as in GarageBand and Logic: spread them
+ * sideways to zoom into the song, up and down to make the tracks taller,
+ * along a slant for both, and move them together to scroll. What is under
+ * the fingers stays under them. The fingers are caught before the lanes
+ * see them, so a pinch never drags an item.
  */
 private fun Modifier.pinchToZoom(vm: DawViewModel, trackScroll: ScrollState): Modifier = pointerInput(vm, trackScroll) {
+    val minSpan = 40.dp.toPx()
+    val separator = 1.dp.toPx()
     awaitEachGesture {
-        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-        do {
-            val event = awaitPointerEvent(PointerEventPass.Initial)
-            if (event.changes.count { it.pressed } >= 2) {
-                val zoom = event.calculateZoom()
-                val pan = event.calculatePan()
-                // The lanes start after the track headers.
-                val x = (event.calculateCentroid().x - HeaderWidth.toPx()).coerceAtLeast(0f)
-                if (zoom != 1f) vm.zoomAround(zoom, x)
-                if (pan.x != 0f) vm.scrollBy(-pan.x)
-                if (pan.y != 0f) trackScroll.dispatchRawDelta(-pan.y)
-                event.changes.forEach { it.consume() }
-            }
-        } while (event.changes.any { it.pressed })
+        try {
+            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            // How far apart the fingers were when the second came down, across and down.
+            var start: Offset? = null
+            var axes: Zoom.Axes? = null
+            // Where the tracks scroll to once they have been laid out at their new height.
+            var scrollTo: Float? = null
+            do {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                scrollTo?.let { trackScroll.dispatchRawDelta(it - trackScroll.value) }
+                scrollTo = null
+                val fingers = event.changes.filter { it.pressed }
+                if (fingers.size >= 2) {
+                    val a = fingers[0]
+                    val b = fingers[1]
+                    val span = Offset(abs(a.position.x - b.position.x), abs(a.position.y - b.position.y))
+                    val before = Offset(abs(a.previousPosition.x - b.previousPosition.x), abs(a.previousPosition.y - b.previousPosition.y))
+                    val from = start ?: span.also { start = it }
+                    var timeScale = 1f
+                    var tracksScale = 1f
+                    val decided = axes
+                    if (decided == null) {
+                        val now = Zoom.pinchAxes(from.x, from.y, span.x, span.y, minSpan)
+                        if (now != null) {
+                            axes = now
+                            // The zoom waited for the fingers to show their way; it catches up at once.
+                            if (now.time) timeScale = Zoom.scale(from.x, span.x, minSpan)
+                            if (now.tracks) tracksScale = Zoom.scale(from.y, span.y, minSpan)
+                        }
+                    } else {
+                        if (decided.time) timeScale = Zoom.scale(before.x, span.x, minSpan)
+                        if (decided.tracks) tracksScale = Zoom.scale(before.y, span.y, minSpan)
+                    }
+                    val centroid = (a.position + b.position) / 2f
+                    val previous = (a.previousPosition + b.previousPosition) / 2f
+                    // Time: the lanes start after the track headers.
+                    if (timeScale != 1f) vm.zoomAround(timeScale, (centroid.x - HeaderWidth.toPx()).coerceAtLeast(0f))
+                    vm.scrollBy(previous.x - centroid.x)
+                    // Tracks: the point of the track list under the fingers follows them as it grows.
+                    val top = RulerHeight.toPx()
+                    val y = trackScroll.value + previous.y - top
+                    val oldPitch = vm.trackHeight.dp.toPx() + separator
+                    if (tracksScale != 1f) vm.scaleTrackHeight(tracksScale)
+                    val target = y * (vm.trackHeight.dp.toPx() + separator) / oldPitch - (centroid.y - top)
+                    if (tracksScale == 1f) trackScroll.dispatchRawDelta(target - trackScroll.value) else scrollTo = target
+                    event.changes.forEach { it.consume() }
+                }
+            } while (event.changes.any { it.pressed })
+        } finally {
+            vm.endTrackHeightPinch()
+        }
     }
 }
 
@@ -624,10 +698,6 @@ private fun EditBar(vm: DawViewModel) {
             MenuAction("◀ Marker") { vm.jumpMarker(forward = false) }
             MenuAction("Marker ▶") { vm.jumpMarker(forward = true) }
         }
-        MenuGroup {
-            MenuAction("Zoom −", first = true) { vm.zoom(1f / 1.5f) }
-            MenuAction("Zoom +") { vm.zoom(1.5f) }
-        }
     }
 }
 
@@ -857,7 +927,7 @@ private fun TrackRow(
     bus: Boolean,
     withMic: (() -> Unit) -> Unit,
 ) {
-    Row(Modifier.fillMaxWidth().height(vm.prefs.trackSize.heightDp.dp)) {
+    Row(Modifier.fillMaxWidth().height(vm.trackHeight.dp)) {
         TrackHeader(vm, track, number, folder, bus, withMic)
         TrackLane(vm, track, row, Modifier.weight(1f).fillMaxHeight())
     }
@@ -868,13 +938,15 @@ private fun TrackRow(
 private val FolderStep = 10.dp
 private const val MAX_SHOWN_DEPTH = 3
 
-/** The parts of a track header at each track height the preferences offer. */
-private class HeaderSizes(val tile: Dp, val nameRow: Dp, val name: TextUnit, val toggle: Dp, val sliderRow: Dp)
+/** The parts of a track header; a header without a [sliderRow] leaves out the volume slider and its buttons. */
+private class HeaderSizes(val tile: Dp, val nameRow: Dp, val name: TextUnit, val toggle: Dp, val sliderRow: Dp?)
 
-private fun headerSizes(size: TrackSize) = when (size) {
-    TrackSize.Small -> HeaderSizes(tile = 36.dp, nameRow = 16.dp, name = 12.sp, toggle = 20.dp, sliderRow = 22.dp)
-    TrackSize.Normal -> HeaderSizes(tile = 48.dp, nameRow = 22.dp, name = 13.sp, toggle = 24.dp, sliderRow = 24.dp)
-    TrackSize.Large -> HeaderSizes(tile = 64.dp, nameRow = 24.dp, name = 15.sp, toggle = 30.dp, sliderRow = 28.dp)
+/** A track header grows in steps with its track, as REAPER's track panels do; below the small size only the top row fits. */
+private fun headerSizes(height: Float) = when {
+    height < TrackSize.Small.heightDp -> HeaderSizes(tile = 32.dp, nameRow = 14.dp, name = 11.sp, toggle = 18.dp, sliderRow = null)
+    height < TrackSize.Normal.heightDp -> HeaderSizes(tile = 36.dp, nameRow = 16.dp, name = 12.sp, toggle = 20.dp, sliderRow = 22.dp)
+    height < TrackSize.Large.heightDp -> HeaderSizes(tile = 48.dp, nameRow = 22.dp, name = 13.sp, toggle = 24.dp, sliderRow = 24.dp)
+    else -> HeaderSizes(tile = 64.dp, nameRow = 24.dp, name = 15.sp, toggle = 30.dp, sliderRow = 28.dp)
 }
 
 /**
@@ -885,7 +957,7 @@ private fun headerSizes(size: TrackSize) = when (size) {
 @Composable
 private fun TrackHeader(vm: DawViewModel, track: Track, number: Int, folder: Boolean, bus: Boolean, withMic: (() -> Unit) -> Unit) {
     val color = DawColors.track(track.colorIndex)
-    val sizes = headerSizes(vm.prefs.trackSize)
+    val sizes = headerSizes(vm.trackHeight)
     var renaming by remember { mutableStateOf(false) }
     val selected = vm.selectedTrackId == track.id
     val armed = vm.armedTrackId == track.id
@@ -908,7 +980,7 @@ private fun TrackHeader(vm: DawViewModel, track: Track, number: Int, folder: Boo
         }
         Column(
             Modifier.padding(start = 6.dp, end = 4.dp, top = 6.dp, bottom = 5.dp).fillMaxSize(),
-            verticalArrangement = Arrangement.SpaceBetween,
+            verticalArrangement = if (sizes.sliderRow == null) Arrangement.Center else Arrangement.SpaceBetween,
         ) {
             Row(Modifier.height(sizes.tile)) {
                 val open: (() -> Unit)? = when {
@@ -971,7 +1043,7 @@ private fun TrackHeader(vm: DawViewModel, track: Track, number: Int, folder: Boo
                     }
                 }
             }
-            Row(Modifier.fillMaxWidth().height(sizes.sliderRow), verticalAlignment = Alignment.CenterVertically) {
+            if (sizes.sliderRow != null) Row(Modifier.fillMaxWidth().height(sizes.sliderRow), verticalAlignment = Alignment.CenterVertically) {
                 MiniSlider(
                     position = Scales.gainToPosition(track.gain),
                     color = color,
@@ -1034,6 +1106,7 @@ private fun TrackMenu(vm: DawViewModel, track: Track, folder: Boolean, onRename:
         DawMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
             val close = { menuOpen = false }
             MenuItem("Rename track") { close(); onRename() }
+            MenuItem("Effects (FX)…") { close(); vm.openFx(track.id) }
             MenuItem("Routing and sends…") { close(); vm.openRouting(track.id) }
             MenuItem("Duplicate track") { close(); vm.duplicateTrack(track.id) }
             MenuItem("Move track up") { close(); vm.moveTrack(track.id, -1) }
@@ -1231,12 +1304,12 @@ private fun DrawScope.drawEnvelope(vm: DawViewModel, track: Track, kind: EnvKind
 
 @Composable
 private fun RecordingRow(vm: DawViewModel, index: Int) {
-    Row(Modifier.fillMaxWidth().height(vm.prefs.trackSize.heightDp.dp)) {
+    Row(Modifier.fillMaxWidth().height(vm.trackHeight.dp)) {
         Row(
             Modifier.width(HeaderWidth).fillMaxHeight().background(DawColors.Panel).padding(start = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            InstrumentTile(Glyph.Microphone, DawColors.Record, headerSizes(vm.prefs.trackSize).tile)
+            InstrumentTile(Glyph.Microphone, DawColors.Record, headerSizes(vm.trackHeight).tile)
             Text("  Recording…", color = DawColors.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
         }
         Canvas(
@@ -1416,12 +1489,23 @@ private fun DrawScope.drawMidiItem(vm: DawViewModel, item: Item, track: Track, c
     if (selected) drawSelection(x0, top, width, height)
 }
 
-/** The outline and trim edges of a selected region. */
+/**
+ * The outline of a selected region, and a grip on each of its edges, as
+ * GarageBand shows: drag a grip to make the region longer or shorter.
+ */
 private fun DrawScope.drawSelection(x0: Float, top: Float, width: Float, height: Float) {
     drawRoundRect(Color.White, Offset(x0, top), Size(width, height), CornerRadius(5.dp.toPx()), style = Stroke(1.5.dp.toPx()))
-    val edge = 3.dp.toPx()
-    drawRect(Color.White.copy(alpha = 0.8f), Offset(x0, top + height * 0.35f), Size(edge, height * 0.3f))
-    drawRect(Color.White.copy(alpha = 0.8f), Offset(x0 + width - edge, top + height * 0.35f), Size(edge, height * 0.3f))
+    // The grips sit across the edges, on the body below the name bar.
+    val bodyTop = top + ItemTitle.toPx()
+    val bodyH = height - ItemTitle.toPx()
+    val gripW = 6.dp.toPx()
+    val gripH = (bodyH * 0.55f).coerceIn(min(10.dp.toPx(), bodyH), bodyH)
+    val y = bodyTop + (bodyH - gripH) / 2
+    for (x in listOf(x0, x0 + width)) {
+        drawRoundRect(Color.Black.copy(alpha = 0.35f), Offset(x - gripW / 2 - 1.dp.toPx(), y - 1.dp.toPx()), Size(gripW + 2.dp.toPx(), gripH + 2.dp.toPx()), CornerRadius(gripW))
+        drawRoundRect(Color.White, Offset(x - gripW / 2, y), Size(gripW, gripH), CornerRadius(gripW / 2))
+        drawLine(Color.Black.copy(alpha = 0.3f), Offset(x, y + gripW * 0.7f), Offset(x, y + gripH - gripW * 0.7f), 1.dp.toPx())
+    }
 }
 
 /** Which take lane of [item] the height [y] in a track lane [laneH] high falls on, when it has several takes. */

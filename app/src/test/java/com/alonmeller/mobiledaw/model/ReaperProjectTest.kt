@@ -83,7 +83,7 @@ class ReaperProjectTest {
             assertTrue(depth >= 0)
         }
         assertEquals(0, depth)
-        assertTrue(text.startsWith("<REAPER_PROJECT 0.1 \"7.0/MobileDAW\" 1700000000\n"))
+        assertTrue(text.startsWith("<REAPER_PROJECT 0.1 \"7.0/PlaydawStudio\" 1700000000\n"))
         assertTrue(text.endsWith(">\n"))
     }
 

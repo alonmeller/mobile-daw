@@ -46,7 +46,7 @@ object ReaperProject {
         val sec = { frames: Long -> frames.toDouble() / sampleRate }
         val framesPerBeat = sampleRate * 60.0 / project.tempo
 
-        out.open("REAPER_PROJECT 0.1 \"7.0/MobileDAW\" $timestamp")
+        out.open("REAPER_PROJECT 0.1 \"7.0/PlaydawStudio\" $timestamp")
         out.line("RIPPLE 0")
         if (notes.isNotEmpty()) {
             out.open("NOTES 0 2")
