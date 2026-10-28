@@ -58,6 +58,7 @@ import com.alonmeller.mobiledaw.data.RecordFormat
 import com.alonmeller.mobiledaw.data.StartupProject
 import com.alonmeller.mobiledaw.data.TrackSize
 import com.alonmeller.mobiledaw.data.ZoomAnchor
+import com.alonmeller.mobiledaw.model.Zoom
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -232,7 +233,11 @@ private fun ColumnScope.PageContent(vm: DawViewModel, page: PrefPage, withMic: (
             InfoRow("Free space on the phone", s?.let { bytes(it.freeBytes) } ?: "…", "כל דקת הקלטה תופסת כ-11 MB ב-32-bit float, וכ-5.5 MB ב-16-bit")
         }
         PrefPage.Multitouch -> {
-            SwitchRow("Pinch to zoom the timeline", "צביטה בשתי אצבעות על הערוצים מגדילה ומקטינה את ציר הזמן", p.pinchZoom) { v ->
+            SwitchRow(
+                "Pinch to zoom the timeline",
+                "שתי אצבעות על הערוצים: פתיחה לרוחב מקרבת את ציר הזמן, ופתיחה לגובה מגדילה את הערוצים",
+                p.pinchZoom,
+            ) { v ->
                 set { it.copy(pinchZoom = v) }
             }
             SwitchRow("Vibrate when playing pads and keys", "רטט קצר בכל נגיעה בפד או בקליד", p.haptics) { v ->
@@ -403,10 +408,10 @@ private fun ColumnScope.PageContent(vm: DawViewModel, page: PrefPage, withMic: (
             }
         }
         PrefPage.TrackPanels -> {
-            SegmentRow(
-                "Track height", "גובה כל ערוץ על ציר הזמן",
-                TrackSize.entries.map { it.label }, p.trackSize.ordinal,
-            ) { i -> set { it.copy(trackSize = TrackSize.entries[i]) } }
+            StepRow(
+                "Track height", "גובה כל ערוץ על ציר הזמן. גם צביטה לגובה על הערוצים או הכפתורים שבפינה משנים אותו",
+                TrackSize.entries.firstOrNull { it.heightDp == p.trackHeight }?.label ?: "${p.trackHeight} dp",
+            ) { d -> set { it.copy(trackHeight = Zoom.stepHeight(it.trackHeight, up = d > 0)) } }
             SwitchRow("Show track numbers", "מספר לפני שם כל ערוץ", p.showTrackNumbers) { v -> set { it.copy(showTrackNumbers = v) } }
             SwitchRow("Show meters in track panels", "מד עוצמה בסליידר של כל ערוץ (כיבוי חוסך מעט סוללה)", p.headerMeters) { v ->
                 set { it.copy(headerMeters = v) }

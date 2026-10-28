@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "MobileDAW"
+rootProject.name = "PlaydawStudio"
 include(":app")

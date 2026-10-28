@@ -1,6 +1,7 @@
 package com.alonmeller.mobiledaw.data
 
 import com.alonmeller.mobiledaw.ExportFormat
+import com.alonmeller.mobiledaw.model.Zoom
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -30,7 +31,7 @@ enum class MicPreset(val label: String) {
 
 enum class KeepScreenOn(val label: String) { Always("Always"), WhilePlaying("While playing"), Never("Never") }
 
-/** Heights of the tracks on the timeline. */
+/** The track heights the app named before tracks could be any height; their size classes still shape the track headers. */
 enum class TrackSize(val label: String, val heightDp: Int) { Small("Small", 72), Normal("Normal", 92), Large("Large", 120) }
 
 /** The sample format new recordings are saved in, as REAPER's recording format. */
@@ -118,7 +119,8 @@ data class Preferences(
     val sqrtPeaks: Boolean = false,
     val rectifiedPeaks: Boolean = false,
     // Appearance > Track Control Panels
-    val trackSize: TrackSize = TrackSize.Normal,
+    /** Height of every track on the timeline in dp, which a pinch up and down also changes. */
+    val trackHeight: Int = TrackSize.Normal.heightDp,
     val showTrackNumbers: Boolean = false,
     val headerMeters: Boolean = true,
     // Editing Behavior
@@ -188,7 +190,7 @@ data class Preferences(
         .put("showTakeNumbers", showTakeNumbers)
         .put("sqrtPeaks", sqrtPeaks)
         .put("rectifiedPeaks", rectifiedPeaks)
-        .put("trackSize", trackSize.name)
+        .put("trackHeight", trackHeight)
         .put("showTrackNumbers", showTrackNumbers)
         .put("headerMeters", headerMeters)
         .put("playheadAfterPaste", playheadAfterPaste)
@@ -263,7 +265,9 @@ data class Preferences(
                 showTakeNumbers = bool("showTakeNumbers", d.showTakeNumbers),
                 sqrtPeaks = bool("sqrtPeaks", d.sqrtPeaks),
                 rectifiedPeaks = bool("rectifiedPeaks", d.rectifiedPeaks),
-                trackSize = json.enum("trackSize", d.trackSize),
+                // Before tracks could be any height, the preferences kept one of three sizes.
+                trackHeight = if (json.has("trackHeight")) int("trackHeight", d.trackHeight, Zoom.MIN_TRACK_HEIGHT..Zoom.MAX_TRACK_HEIGHT)
+                else json.enum("trackSize", TrackSize.Normal).heightDp,
                 showTrackNumbers = bool("showTrackNumbers", d.showTrackNumbers),
                 headerMeters = bool("headerMeters", d.headerMeters),
                 playheadAfterPaste = bool("playheadAfterPaste", d.playheadAfterPaste),

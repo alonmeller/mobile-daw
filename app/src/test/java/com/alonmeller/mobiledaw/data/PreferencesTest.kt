@@ -65,7 +65,7 @@ class PreferencesTest {
         showTakeNumbers = false,
         sqrtPeaks = true,
         rectifiedPeaks = true,
-        trackSize = TrackSize.Large,
+        trackHeight = 150,
         showTrackNumbers = true,
         headerMeters = false,
         playheadAfterPaste = false,
@@ -96,7 +96,7 @@ class PreferencesTest {
             .put("noteVelocity", 0)
             .put("latencyOffsetMs", 5000)
             .put("audioApi", "Bogus")
-            .put("trackSize", "")
+            .put("trackHeight", 9999)
             .put("keepScreenOn", 3)
             .put("startup", "NewProject")
         val p = Preferences.fromJson(odd)
@@ -109,10 +109,20 @@ class PreferencesTest {
         assertEquals(d.noteVelocity, p.noteVelocity)
         assertEquals(d.latencyOffsetMs, p.latencyOffsetMs)
         assertEquals(d.audioApi, p.audioApi)
-        assertEquals(d.trackSize, p.trackSize)
+        assertEquals(d.trackHeight, p.trackHeight)
         assertEquals(d.keepScreenOn, p.keepScreenOn)
         // What is fine is kept.
         assertEquals(StartupProject.NewProject, p.startup)
+    }
+
+    @Test
+    fun aTrackSizeSavedBeforeTracksCouldBeAnyHeightIsKept() {
+        // Preferences saved when the track height was one of three sizes.
+        assertEquals(TrackSize.Large.heightDp, Preferences.fromJson(JSONObject().put("trackSize", "Large")).trackHeight)
+        assertEquals(TrackSize.Small.heightDp, Preferences.fromJson(JSONObject().put("trackSize", "Small")).trackHeight)
+        assertEquals(TrackSize.Normal.heightDp, Preferences.fromJson(JSONObject().put("trackSize", "Huge")).trackHeight)
+        // Once a height is saved, it wins.
+        assertEquals(64, Preferences.fromJson(JSONObject().put("trackSize", "Large").put("trackHeight", 64)).trackHeight)
     }
 
     @Test

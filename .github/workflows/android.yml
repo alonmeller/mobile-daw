@@ -42,12 +42,12 @@ jobs:
         run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
 
       - name: Rename APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk MobileDAW.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk PlaydawStudio.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MobileDAW-apk
-          path: MobileDAW.apk
+          name: PlaydawStudio-apk
+          path: PlaydawStudio.apk
 
       # Every push gets a downloadable release, so the APK can be installed
       # straight from the phone's browser. Builds from main are marked latest.
@@ -56,11 +56,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: "Mobile DAW build ${{ github.run_number }} (${{ github.ref_name }})"
+          name: "Playdaw Studio build ${{ github.run_number }} (${{ github.ref_name }})"
           target_commitish: ${{ github.sha }}
           prerelease: ${{ github.ref_name != 'main' }}
           make_latest: ${{ github.ref_name == 'main' }}
-          files: MobileDAW.apk
+          files: PlaydawStudio.apk
           body: |
-            Install: open this page on your Android phone, tap MobileDAW.apk, and allow installing from your browser.
+            Install: open this page on your Android phone, tap PlaydawStudio.apk, and allow installing from your browser.
             Commit: ${{ github.sha }}

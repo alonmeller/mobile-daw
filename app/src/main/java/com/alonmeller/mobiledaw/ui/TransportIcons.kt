@@ -24,6 +24,7 @@ enum class Glyph {
     Play, Pause, Stop, Record, Rewind, Cycle, Metronome, Songs, Share, Settings, Headphones,
     Speaker, Monitor, Microphone, Drums, Keys, Stack, Bus, Tracks, Mixer, Plus, Power,
     WaveSine, WaveTriangle, WaveSaw, WaveSquare,
+    ZoomIn, ZoomOut, FitSong, TallerTracks, ShorterTracks,
 }
 
 @Composable
@@ -253,6 +254,57 @@ fun DrawScope.drawGlyph(glyph: Glyph, color: Color) {
         Glyph.Plus -> {
             drawLine(color, Offset(w * 0.5f, h * 0.18f), Offset(w * 0.5f, h * 0.82f), strokeWidth = w * 0.11f, cap = StrokeCap.Round)
             drawLine(color, Offset(w * 0.18f, h * 0.5f), Offset(w * 0.82f, h * 0.5f), strokeWidth = w * 0.11f, cap = StrokeCap.Round)
+        }
+        Glyph.ZoomIn, Glyph.ZoomOut -> {
+            // A magnifying glass with a plus or a minus in it.
+            val c = Offset(w * 0.42f, h * 0.42f)
+            val r = w * 0.27f
+            val line = w * 0.09f
+            drawCircle(color, r, c, style = Stroke(line))
+            drawLine(color, Offset(c.x + r * 0.74f, c.y + r * 0.74f), Offset(w * 0.86f, h * 0.86f), strokeWidth = w * 0.12f, cap = StrokeCap.Round)
+            drawLine(color, Offset(c.x - r * 0.5f, c.y), Offset(c.x + r * 0.5f, c.y), strokeWidth = line, cap = StrokeCap.Round)
+            if (glyph == Glyph.ZoomIn) {
+                drawLine(color, Offset(c.x, c.y - r * 0.5f), Offset(c.x, c.y + r * 0.5f), strokeWidth = line, cap = StrokeCap.Round)
+            }
+        }
+        Glyph.FitSong -> {
+            // The whole song: arrows out to its two ends.
+            val line = w * 0.08f
+            val head = w * 0.13f
+            val mid = h * 0.5f
+            for (x in listOf(w * 0.12f, w * 0.88f)) {
+                drawLine(color, Offset(x, h * 0.26f), Offset(x, h * 0.74f), strokeWidth = line, cap = StrokeCap.Round)
+            }
+            drawLine(color, Offset(w * 0.27f, mid), Offset(w * 0.73f, mid), strokeWidth = line, cap = StrokeCap.Round)
+            for ((tip, back) in listOf(w * 0.27f to 1f, w * 0.73f to -1f)) {
+                val p = Path().apply {
+                    moveTo(tip + head * back, mid - head)
+                    lineTo(tip, mid)
+                    lineTo(tip + head * back, mid + head)
+                }
+                drawPath(p, color, style = Stroke(line, cap = StrokeCap.Round, join = StrokeJoin.Round))
+            }
+        }
+        Glyph.TallerTracks, Glyph.ShorterTracks -> {
+            // The line between two tracks, with arrows pushing them apart or together.
+            val line = w * 0.08f
+            val head = w * 0.15f
+            val mid = h * 0.5f
+            val apart = glyph == Glyph.TallerTracks
+            drawLine(color, Offset(w * 0.14f, mid), Offset(w * 0.86f, mid), strokeWidth = line, cap = StrokeCap.Round)
+            for (dir in listOf(-1f, 1f)) {
+                val near = mid + dir * h * 0.15f
+                val far = mid + dir * h * 0.4f
+                drawLine(color, Offset(w * 0.5f, near), Offset(w * 0.5f, far), strokeWidth = line, cap = StrokeCap.Round)
+                val tip = if (apart) far else near
+                val back = if (apart) -dir else dir
+                val p = Path().apply {
+                    moveTo(w * 0.5f - head, tip + back * head)
+                    lineTo(w * 0.5f, tip)
+                    lineTo(w * 0.5f + head, tip + back * head)
+                }
+                drawPath(p, color, style = Stroke(line, cap = StrokeCap.Round, join = StrokeJoin.Round))
+            }
         }
         Glyph.Power -> {
             // A plug-in's on/off switch: a ring open at the top, and a bar through the gap.
