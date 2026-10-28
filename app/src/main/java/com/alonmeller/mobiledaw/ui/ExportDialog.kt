@@ -101,8 +101,9 @@ fun ExportDialog(vm: DawViewModel, actions: ExportActions) {
             // The kinds down the left, the choices for the selected one on the right,
             // so everything fits a phone held sideways.
             Row(Modifier.weight(1f)) {
+                val kinds = rememberScrollState()
                 Column(
-                    Modifier.width(230.dp).fillMaxHeight().verticalScroll(rememberScrollState()),
+                    Modifier.width(230.dp).fillMaxHeight().scrollHints(kinds, DawColors.Panel).verticalScroll(kinds),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Kinds.forEach { info ->
@@ -113,10 +114,7 @@ fun ExportDialog(vm: DawViewModel, actions: ExportActions) {
                 }
                 Spacer(Modifier.width(16.dp))
                 Column(Modifier.weight(1f).fillMaxHeight()) {
-                    Column(
-                        Modifier.weight(1f).verticalScroll(rememberScrollState()),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
+                    ScrollPanel(Modifier.weight(1f), DawColors.Panel, verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         ExportOptionsPanel(vm, options, enabled = progress == null)
                         Text(
                             hint(options.kind),

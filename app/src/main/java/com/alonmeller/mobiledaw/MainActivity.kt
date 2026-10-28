@@ -2,28 +2,51 @@ package com.alonmeller.mobiledaw
 
 import android.Manifest
 import android.content.ClipData
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.Color
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import com.alonmeller.mobiledaw.audio.MidiInput
 import com.alonmeller.mobiledaw.data.AudioDecoder
 import com.alonmeller.mobiledaw.data.ImportedAudio
+import com.alonmeller.mobiledaw.data.KeepScreenOn
+import com.alonmeller.mobiledaw.data.PreferencesStore
 import com.alonmeller.mobiledaw.ui.DawScreen
 import com.alonmeller.mobiledaw.ui.DawTheme
 import com.alonmeller.mobiledaw.ui.ExportActions
 import java.io.File
+import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -61,10 +84,43 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.CreateDocument(mime)) { uri -> saveExport(uri) }
     }
 
+    /** The interface size this activity started with (Preferences › Appearance). */
+    private var uiScale = 1f
+
+    /**
+     * Applies the interface size the way Android's own display size does: by
+     * scaling the screen's density, so every button, text, menu and dialog
+     * grows or shrinks together.
+     */
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(newBase)
+        uiScale = PreferencesStore(newBase.filesDir).load().uiScale
+        if (uiScale != 1f) {
+            val dpi = newBase.resources.configuration.densityDpi
+            applyOverrideConfiguration(Configuration().apply { densityDpi = (dpi * uiScale).roundToInt() })
+        }
+    }
+
+    /** MIDI keyboards plugged into the phone. */
+    private var midi: MidiInput? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Drawn behind the phone's bars, as Android 15 requires; the screen keeps clear of them itself.
+        enableEdgeToEdge(SystemBarStyle.dark(Color.TRANSPARENT), SystemBarStyle.dark(Color.TRANSPARENT))
         super.onCreate(savedInstanceState)
         pendingSave = savedInstanceState?.getString(PENDING_SAVE)?.let(::File)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        vm.sustainedSupported = getSystemService(PowerManager::class.java)?.isSustainedPerformanceModeSupported == true
+        midi = MidiInput(
+            this,
+            // Not while the app is away: the notes would wait and all sound at once on return.
+            listening = { name ->
+                lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) && vm.prefs.midiInput && name !in vm.prefs.midiOff
+            },
+            onDevices = { vm.midiDevices = it },
+            onNote = vm::midiNote,
+            onSustain = vm::midiSustain,
+        ).also { it.start() }
+        followPreferences()
         val exportActions = ExportActions(share = ::share, save = ::save)
         setContent {
             DawTheme {
@@ -139,6 +195,79 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Applies the preferences that are about the phone rather than the song, each time they change. */
+    private fun followPreferences() {
+        lifecycleScope.launch { snapshotFlow { vm.prefs.fullScreen }.collect { applyFullScreen() } }
+        lifecycleScope.launch {
+            snapshotFlow {
+                // A recording would stop if the screen went dark, so for one it stays on in any case.
+                val busy = vm.recording || vm.recordingMidi || vm.samplingPad != null
+                when (vm.prefs.keepScreenOn) {
+                    KeepScreenOn.Always -> true
+                    KeepScreenOn.WhilePlaying -> busy || vm.playing || vm.exportProgress != null
+                    KeepScreenOn.Never -> busy
+                }
+            }.collect { on ->
+                if (on) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+        lifecycleScope.launch {
+            snapshotFlow { vm.prefs.sustainedPerformance && vm.sustainedSupported }.collect { window.setSustainedPerformanceMode(it) }
+        }
+        lifecycleScope.launch {
+            // Holding the sound while the song runs pauses other players, and lets a call stop the song.
+            snapshotFlow { vm.prefs.pauseForCalls && (vm.playing || vm.recording || vm.recordingMidi) }.collect { holdAudioFocus(it) }
+        }
+        lifecycleScope.launch {
+            snapshotFlow { vm.prefs.uiScale }.drop(1).collectLatest { scale ->
+                // After the last of a few quick taps, the screen starts again at the new size.
+                delay(700)
+                if (scale != uiScale && vm.savePrefsNow()) recreate()
+            }
+        }
+    }
+
+    /** Full screen hides the status and navigation bars; a swipe from the edge shows them for a moment. */
+    private fun applyFullScreen() {
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        if (vm.prefs.fullScreen) controller.hide(WindowInsetsCompat.Type.systemBars())
+        else controller.show(WindowInsetsCompat.Type.systemBars())
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Some phones bring the bars back for a dialog.
+        if (hasFocus) applyFullScreen()
+    }
+
+    private val audioManager by lazy { getSystemService(AudioManager::class.java) }
+    private val focusRequest by lazy {
+        AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener({ change ->
+                // A call or another player takes the sound; a notification that only lowers it is let be.
+                if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                    vm.onAudioInterrupted()
+                }
+            }, Handler(Looper.getMainLooper()))
+            .build()
+    }
+    private var holdingFocus = false
+
+    private fun holdAudioFocus(hold: Boolean) {
+        val manager = audioManager ?: return
+        if (hold == holdingFocus) return
+        holdingFocus = hold
+        if (hold) manager.requestAudioFocus(focusRequest) else manager.abandonAudioFocusRequest(focusRequest)
+    }
+
     override fun onStart() {
         super.onStart()
         vm.onAppForeground()
@@ -146,7 +275,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
-        vm.onAppBackground()
+        // Starting again at a new interface size is not leaving the app.
+        if (!isChangingConfigurations) vm.onAppBackground()
+    }
+
+    override fun onDestroy() {
+        midi?.stop()
+        midi = null
+        if (holdingFocus) audioManager?.abandonAudioFocusRequest(focusRequest)
+        super.onDestroy()
     }
 
     private companion object {

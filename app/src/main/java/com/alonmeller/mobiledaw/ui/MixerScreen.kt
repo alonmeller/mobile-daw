@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -62,11 +61,13 @@ fun MixerView(vm: DawViewModel, modifier: Modifier = Modifier) {
         // On a short screen the FX and routing slots keep to one line, so the faders keep their travel.
         val compact = maxHeight < 320.dp
         Row(Modifier.fillMaxSize().padding(8.dp)) {
+            val strips = rememberScrollState()
             Row(
                 Modifier
                     .weight(1f)
                     .fillMaxHeight()
-                    .horizontalScroll(rememberScrollState()),
+                    .scrollHints(strips, DawColors.Background, horizontal = true)
+                    .horizontalScroll(strips),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 val tracks = vm.project.tracks
@@ -249,7 +250,7 @@ private fun AddTrackTile(enabled: Boolean, onAdd: (TrackKind) -> Unit) {
                 Text("Track", color = DawColors.TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             }
         }
-        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+        DawMenu(expanded = open, onDismissRequest = { open = false }) {
             val add = { kind: TrackKind ->
                 open = false
                 onAdd(kind)

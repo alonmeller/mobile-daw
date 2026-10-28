@@ -50,6 +50,9 @@ object DawColors {
     val MeterRed = Color(0xFFFF453A)
     /** The black bubble of an iOS edit menu, which the edit bar copies. */
     val Menu = Color(0xFF0E0E10)
+    /** Pop-up menus: iOS's dark gray, with lighter hairlines. */
+    val MenuSurface = Color(0xFF2C2C2E)
+    val MenuDivider = Color(0xFF3F3F43)
 
     /**
      * Region colors, close to GarageBand's: blue for recordings, green for

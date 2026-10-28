@@ -14,8 +14,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -74,12 +72,12 @@ fun RoutingDialog(vm: DawViewModel, trackId: Long) {
                 )
                 Box {
                     PillButton("+ Send to…", DawColors.Accent) { addOpen = true }
-                    DropdownMenu(expanded = addOpen, onDismissRequest = { addOpen = false }) {
+                    DawMenu(expanded = addOpen, onDismissRequest = { addOpen = false }) {
                         val close = { addOpen = false }
                         vm.sendTargets(trackId).forEach { target ->
                             MenuItem("→  ${target.name}") { close(); vm.addSend(trackId, target.id) }
                         }
-                        HorizontalDivider()
+                        MenuDivider()
                         MenuItem("🌊  New reverb bus") { close(); vm.sendToNewBus(trackId, TrackKind.ReverbBus) }
                         MenuItem("🔁  New delay bus") { close(); vm.sendToNewBus(trackId, TrackKind.DelayBus) }
                     }
@@ -99,10 +97,7 @@ fun RoutingDialog(vm: DawViewModel, trackId: Long) {
                 fontSize = 12.sp,
             )
             Spacer(Modifier.height(12.dp))
-            Column(
-                Modifier.weight(1f).verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
+            ScrollPanel(Modifier.weight(1f), DawColors.Panel, verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 SectionTitle("Sends")
                 if (track.sends.isEmpty()) {
                     Text(
