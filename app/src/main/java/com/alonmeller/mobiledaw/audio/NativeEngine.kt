@@ -10,6 +10,26 @@ object NativeEngine {
     external fun shutdown()
     external fun sampleRate(): Int
 
+    /**
+     * How the streams open, REAPER's audio device settings in Oboe's terms
+     * (see AudioConfig in AudioEngine.h); reopens them at once when they are
+     * open. False when the output could not open.
+     */
+    external fun configure(
+        api: Int,
+        performanceMode: Int,
+        exclusive: Boolean,
+        sampleRate: Int,
+        bufferBursts: Int,
+        outputDevice: Int,
+        inputDevice: Int,
+        inputPreset: Int,
+    ): Boolean
+    /** What the streams really got; see [AudioStatus.from]. */
+    external fun audioStatus(): DoubleArray
+    /** How long effects keep running after stopping, so reverb and delay tails ring out. */
+    external fun setFxTail(frames: Long)
+
     external fun setPlaying(playing: Boolean)
     /** Starts playing after [countIn] frames of metronome clicks, while the timeline waits. */
     external fun startPlaying(countIn: Long)
@@ -86,6 +106,8 @@ object NativeEngine {
     external fun liveNote(id: Long, pitch: Int, velocity: Float)
 
     external fun setMetronome(enabled: Boolean)
+    /** The click's loudness (1 is the usual) and whether each bar's first beat is higher. */
+    external fun setMetronomeSound(gain: Float, accent: Boolean)
     external fun setTempo(bpm: Double)
 
     /**

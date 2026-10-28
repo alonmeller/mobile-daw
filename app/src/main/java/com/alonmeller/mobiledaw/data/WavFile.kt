@@ -3,10 +3,44 @@ package com.alonmeller.mobiledaw.data
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.roundToInt
 
-/** Minimal mono WAV reader/writer (32-bit float out; float or 16-bit PCM in). */
+/** Minimal mono WAV reader/writer (32-bit float, 24-bit or 16-bit PCM). */
 object WavFile {
     data class Audio(val samples: FloatArray, val sampleRate: Int)
+
+    /**
+     * Writes mono [samples] as 32-bit float when [bits] is 32, else as 24- or
+     * 16-bit PCM, which take 3/4 and half the room but clip at full scale.
+     */
+    fun writeMono(file: File, samples: FloatArray, sampleRate: Int, bits: Int) {
+        if (bits != 16 && bits != 24) {
+            writeFloatMono(file, samples, sampleRate)
+            return
+        }
+        val bytes = bits / 8
+        val dataBytes = samples.size * bytes
+        val buf = ByteBuffer.allocate(44 + dataBytes).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put("RIFF".toByteArray()).putInt(36 + dataBytes).put("WAVE".toByteArray())
+        buf.put("fmt ".toByteArray()).putInt(16)
+            .putShort(1) // PCM
+            .putShort(1) // mono
+            .putInt(sampleRate)
+            .putInt(sampleRate * bytes)
+            .putShort(bytes.toShort())
+            .putShort(bits.toShort())
+        buf.put("data".toByteArray()).putInt(dataBytes)
+        for (s in samples) {
+            val c = if (s.isNaN()) 0f else s.coerceIn(-1f, 1f)
+            if (bits == 16) {
+                buf.putShort((c * 32767f).roundToInt().toShort())
+            } else {
+                val v = (c * 8388607f).roundToInt()
+                buf.put(v.toByte()).put((v shr 8).toByte()).put((v shr 16).toByte())
+            }
+        }
+        file.writeBytes(buf.array())
+    }
 
     fun writeFloatMono(file: File, samples: FloatArray, sampleRate: Int) {
         val dataBytes = samples.size * 4
@@ -60,6 +94,13 @@ object WavFile {
                             sum += when {
                                 format == 3 && bits == 32 -> buf.float
                                 bits == 16 -> buf.short / 32768f
+                                bits == 24 -> {
+                                    val lo = buf.get().toInt() and 0xFF
+                                    val mid = buf.get().toInt() and 0xFF
+                                    val hi = buf.get().toInt()
+                                    ((hi shl 16) or (mid shl 8) or lo) / 8388608f
+                                }
+                                format == 1 && bits == 32 -> buf.int / 2147483648f
                                 else -> return null
                             }
                         }

@@ -2,6 +2,7 @@
 
 #include <oboe/Oboe.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -25,8 +26,8 @@ struct LiveNote {
     float velocity = 0.0f;
 };
 
-// Hands live notes from the UI thread to the audio thread without locks:
-// one producer, one consumer.
+// Hands live notes from the UI and MIDI threads to the audio thread without
+// locks: one producer at a time (the engine locks pushes), one consumer.
 class LiveNoteQueue {
 public:
     bool push(const LiveNote &note) {
@@ -53,6 +54,39 @@ private:
     std::atomic<uint32_t> tail_{0};
 };
 
+// How the streams open, as REAPER's audio device settings, in Oboe's terms.
+struct AudioConfig {
+    int api = 0;              // 0 automatic, 1 AAudio, 2 OpenSL ES
+    int performanceMode = 0;  // 0 low latency, 1 normal, 2 power saving
+    bool exclusive = true;
+    int sampleRate = 0;       // 0: the device's own
+    int bufferBursts = 2;     // 0: automatic, from one burst up whenever the sound glitches
+    int outputDevice = 0;     // Android's device ids; 0 lets the system choose
+    int inputDevice = 0;
+    // 0 voice recognition, 1 unprocessed, 2 camcorder, 3 voice communication,
+    // 4 generic, 5 voice performance
+    int inputPreset = 0;
+};
+
+// What the streams really got, which can differ from what was asked.
+struct AudioStatus {
+    int api = 0;  // 0 closed, 1 AAudio, 2 OpenSL ES
+    int sampleRate = 0;
+    int framesPerBurst = 0;
+    int bufferSize = 0;
+    int bufferCapacity = 0;
+    bool exclusive = false;
+    int performanceMode = 0;  // as in AudioConfig
+    int deviceId = 0;
+    double latencyMs = 0.0;
+    int xruns = -1;  // glitches since the stream opened; -1 when the audio system cannot tell
+    float cpuLoad = 0.0f;  // share of each buffer's time the audio callback takes
+    bool inputOpen = false;
+    bool inputExclusive = false;
+    int inputDeviceId = 0;
+    double inputLatencyMs = 0.0;
+};
+
 // Real-time multitrack engine: stereo output mixes the arrangement plus a
 // metronome; a separate mono input stream records new takes into sources
 // and can be heard live through the track it records into.
@@ -65,6 +99,11 @@ public:
     bool start();
     void shutdown();
     int sampleRate() const { return sampleRate_; }
+    // Opens the streams the new way, at once when they are open. A sample
+    // rate of 0 takes the device's own; otherwise, once opened, the engine
+    // keeps its rate when a stream reopens (headphones plugged in, say).
+    bool configure(const AudioConfig &config);
+    AudioStatus status();
 
     // Transport
     void setPlaying(bool playing);
@@ -144,8 +183,15 @@ public:
 
     // Metronome
     void setMetronome(bool enabled) { metronomeOn_.store(enabled); }
+    // Its loudness (1 is the usual click) and whether each bar's first beat is higher.
+    void setMetronomeSound(float gain, bool accent) {
+        metronomeGain_.store(gain);
+        metronomeAccent_.store(accent);
+    }
     void setTempo(double bpm) { tempo_.store(bpm); }
     float masterPeak() { return masterPeak_.exchange(0.0f); }
+    // How long effects keep running after stopping, so reverb and delay tails ring out.
+    void setFxTail(int64_t frames) { fxTail_.store(std::max<int64_t>(0, frames)); }
 
     // Oboe callbacks
     oboe::DataCallbackResult onAudioReady(oboe::AudioStream *stream, void *audioData,
@@ -153,28 +199,45 @@ public:
     void onErrorAfterClose(oboe::AudioStream *stream, oboe::Result error) override;
 
 private:
-    class InputCallback : public oboe::AudioStreamDataCallback {
+    class InputCallback : public oboe::AudioStreamDataCallback,
+                          public oboe::AudioStreamErrorCallback {
     public:
         explicit InputCallback(AudioEngine &engine) : engine_(engine) {}
         oboe::DataCallbackResult onAudioReady(oboe::AudioStream *stream, void *audioData,
                                               int32_t numFrames) override;
+        void onErrorAfterClose(oboe::AudioStream *stream, oboe::Result error) override;
     private:
         AudioEngine &engine_;
     };
 
+    // Run with streamMutex_ held.
     bool openOutput();
+    void closeOutput();
     bool openInput();
     void closeInput();
+    void inputClosed(oboe::AudioStream *stream);
     void drainLoop();
     void drainOnce();
     void renderSegment(float *out, int32_t numFrames, int64_t pos, bool playing, bool monitoring);
     void renderMetronome(float *out, int32_t numFrames, int64_t pos);
     void applyLiveNotes();
 
+    // Guards opening and closing the streams, which the UI and Oboe's error
+    // thread (after a device change) both do.
+    std::recursive_mutex streamMutex_;
     std::shared_ptr<oboe::AudioStream> output_;
     std::shared_ptr<oboe::AudioStream> input_;
     InputCallback inputCallback_{*this};
-    int sampleRate_ = 48000;
+    AudioConfig config_;
+    // The rate the next output stream asks for: 0 for the device's own,
+    // then the rate the sources are at.
+    int requestedRate_ = 0;
+    // Set when the output opens; read everywhere.
+    std::atomic<int> sampleRate_{48000};
+    // Automatic buffer size: grows the buffer each time the sound glitches.
+    // Set and cleared only while the output is stopped; used on the audio thread.
+    std::unique_ptr<oboe::LatencyTuner> tuner_;
+    std::atomic<float> cpuLoad_{0.0f};
 
     std::mutex sourcesMutex_;
     std::unordered_map<int, std::shared_ptr<const Samples>> sources_;
@@ -186,6 +249,9 @@ private:
     std::mutex instrumentsMutex_;
     std::unordered_map<int64_t, std::shared_ptr<Instrument>> instruments_;
     std::unordered_map<int64_t, std::vector<PadConfig>> drumPads_;
+    // Notes come from the UI and from MIDI keyboards: the lock keeps the
+    // queue's one producer at a time; the audio thread never takes it.
+    std::mutex liveNotesMutex_;
     LiveNoteQueue liveNotes_;
 
     std::mutex arrangementMutex_;
@@ -208,7 +274,10 @@ private:
     std::atomic<bool> loopOn_{false};
 
     std::atomic<bool> metronomeOn_{false};
+    std::atomic<float> metronomeGain_{1.0f};
+    std::atomic<bool> metronomeAccent_{true};
     std::atomic<double> tempo_{120.0};
+    std::atomic<int64_t> fxTail_{48000 * 4};
     // Written by the UI to start a count-in, counted down by the audio thread.
     std::atomic<int64_t> countIn_{0};
 

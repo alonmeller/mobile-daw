@@ -120,6 +120,19 @@ class RoutingTest {
     }
 
     @Test
+    fun aNewSendTakesTheDefaultsItIsGiven() {
+        val p = project(track("Vocal"), track("Reverb"))
+        val plain = Routing.addSend(p, p.id("Vocal"), p.id("Reverb"))!!.tracks[0].sends.single()
+        assertEquals(Send(0, 0).gain, plain.gain, 0f)
+        assertFalse(plain.preFader)
+        // The preferences' default send volume and mode.
+        val pre = Routing.addSend(p, p.id("Vocal"), p.id("Reverb"), gain = 0.25f, preFader = true)!!.tracks[0].sends.single()
+        assertEquals(0.25f, pre.gain, 0f)
+        assertTrue(pre.preFader)
+        assertEquals(p.id("Reverb"), pre.target)
+    }
+
+    @Test
     fun aFolderCannotSendIntoItsOwnTracks() {
         val p = project(track("F"), track("x", 1))
         assertNull(Routing.addSend(p, p.id("F"), p.id("x")))

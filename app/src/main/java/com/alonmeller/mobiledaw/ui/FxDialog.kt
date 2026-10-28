@@ -18,8 +18,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -76,15 +74,12 @@ fun FxDialog(vm: DawViewModel, target: Long) {
                 )
                 Box {
                     PillButton("+ Add effect", DawColors.Accent) { addOpen = true }
-                    DropdownMenu(expanded = addOpen, onDismissRequest = { addOpen = false }) {
+                    DawMenu(expanded = addOpen, onDismissRequest = { addOpen = false }) {
                         EffectType.entries.forEach { type ->
-                            DropdownMenuItem(
-                                text = { Text(type.title) },
-                                onClick = {
-                                    addOpen = false
-                                    vm.addEffect(target, type)
-                                },
-                            )
+                            MenuItem(type.title) {
+                                addOpen = false
+                                vm.addEffect(target, type)
+                            }
                         }
                     }
                 }
@@ -101,10 +96,8 @@ fun FxDialog(vm: DawViewModel, target: Long) {
                     )
                 }
             } else {
-                Column(
-                    Modifier.weight(1f).verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
+                // The knobs take the drags, so the bar beside the chain scrolls it.
+                ScrollPanel(Modifier.weight(1f), DawColors.Panel, verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     chain.forEachIndexed { index, effect ->
                         EffectCard(vm, target, effect, index, chain.size)
                     }

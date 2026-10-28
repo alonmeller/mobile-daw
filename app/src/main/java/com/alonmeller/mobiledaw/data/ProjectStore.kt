@@ -34,6 +34,10 @@ data class ProjectSettings(
     val keepTakes: Boolean = true,
     /** Hears the microphone through the armed track, with headphones (REAPER's record monitoring). */
     val monitoring: Boolean = false,
+    /** REAPER's metronome settings: its volume in dB, a higher click on each bar's first beat, and a count-in before playing too. */
+    val metronomeDb: Float = 0f,
+    val metronomeAccent: Boolean = true,
+    val countInPlayback: Boolean = false,
 )
 
 data class LoadedProject(val project: Project, val settings: ProjectSettings)
@@ -51,6 +55,10 @@ class ProjectStore(val dir: File) {
     }
 
     fun audioFile(fileName: String) = File(dir, fileName)
+
+    /** True while the song has no tracks, like a new one: nothing saved yet, or saved empty. */
+    fun isEmpty(): Boolean = !projectFile.exists() ||
+        runCatching { (JSONObject(projectFile.readText()).optJSONArray("tracks")?.length() ?: 0) == 0 }.getOrDefault(false)
 
     /**
      * Reads project.json. [loadSource] turns a WAV file name into an engine
@@ -163,6 +171,9 @@ class ProjectStore(val dir: File) {
                 countInBars = json.optInt("countIn", 0).coerceIn(0, 2),
                 keepTakes = json.optBoolean("keepTakes", true),
                 monitoring = json.optBoolean("monitor", false),
+                metronomeDb = json.optDouble("metronomeDb", 0.0).toFloat().let { if (it.isNaN()) 0f else it.coerceIn(-40f, 12f) },
+                metronomeAccent = json.optBoolean("metronomeAccent", true),
+                countInPlayback = json.optBoolean("countInPlayback", false),
             )
             LoadedProject(project, settings)
         }.getOrNull()
@@ -244,6 +255,9 @@ class ProjectStore(val dir: File) {
             .put("countIn", settings.countInBars)
             .put("keepTakes", settings.keepTakes)
             .put("monitor", settings.monitoring)
+            .put("metronomeDb", settings.metronomeDb.toDouble())
+            .put("metronomeAccent", settings.metronomeAccent)
+            .put("countInPlayback", settings.countInPlayback)
             .put("loop", JSONObject().put("start", project.loopStart).put("end", project.loopEnd).put("on", project.loopOn))
             .put("markers", markers)
             .put("masterGain", project.masterGain.toDouble())

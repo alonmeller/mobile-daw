@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -23,7 +24,6 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -44,8 +44,11 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.hapticfeedback.HapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -143,7 +146,7 @@ private fun PlayHeader(vm: DawViewModel, track: Track) {
                     Text("  ▾", color = DawColors.TextSecondary, fontSize = 12.sp)
                 }
             }
-            DropdownMenu(expanded = picking, onDismissRequest = { picking = false }) {
+            DawMenu(expanded = picking, onDismissRequest = { picking = false }) {
                 vm.project.tracks.filter { it.instrument != null }.forEach { t ->
                     MenuItem(t.name) {
                         picking = false
@@ -195,6 +198,13 @@ private fun DrumPads(
     }
 }
 
+/** A tick under the finger for each pad or key played, when the preferences ask for one. */
+@Composable
+private fun padHaptics(vm: DawViewModel): HapticFeedback? {
+    val haptics = LocalHapticFeedback.current
+    return if (vm.prefs.haptics) haptics else null
+}
+
 /** The 4x4 pads. Every finger plays its own pad, the moment it lands. */
 @Composable
 private fun PadGrid(vm: DawViewModel, track: Track, selected: Int, onSelect: (Int) -> Unit, modifier: Modifier) {
@@ -202,6 +212,7 @@ private fun PadGrid(vm: DawViewModel, track: Track, selected: Int, onSelect: (In
     var pressed by remember { mutableStateOf(setOf<Int>()) }
     val latestVm by rememberUpdatedState(vm)
     val latestSelect by rememberUpdatedState(onSelect)
+    val haptics by rememberUpdatedState(padHaptics(vm))
     val trackId = track.id
     Canvas(
         modifier.pointerInput(trackId) {
@@ -220,6 +231,7 @@ private fun PadGrid(vm: DawViewModel, track: Track, selected: Int, onSelect: (In
                                 val pad = padAt(change.position) ?: continue
                                 down[change.id] = pad
                                 latestVm.noteOn(trackId, FIRST_PAD_NOTE + pad, 1f)
+                                haptics?.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 latestSelect(pad)
                                 pressed = pressed + pad
                                 change.consume()
@@ -316,13 +328,12 @@ private fun PadEditor(
     val pad = track.instrument?.pads?.getOrNull(index) ?: return
     val sampling = vm.samplingPad == (track.id to index)
     var soundMenu by remember { mutableStateOf(false) }
-    Column(
-        modifier
-            .clip(RoundedCornerShape(12.dp))
-            .background(DawColors.Panel)
-            .verticalScroll(rememberScrollState())
-            .padding(12.dp),
+    // The pad's knobs take the drags, so the bar beside them scrolls the panel.
+    ScrollPanel(
+        modifier.clip(RoundedCornerShape(12.dp)).background(DawColors.Panel),
+        DawColors.Panel,
         verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(start = 12.dp, top = 12.dp, bottom = 12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(
@@ -335,7 +346,7 @@ private fun PadEditor(
             )
             Box {
                 PillButton("Sound ▾", DawColors.PanelRaised) { soundMenu = true }
-                DropdownMenu(expanded = soundMenu, onDismissRequest = { soundMenu = false }) {
+                DawMenu(expanded = soundMenu, onDismissRequest = { soundMenu = false }) {
                     DrumKit.sounds.forEachIndexed { k, sound ->
                         MenuItem(sound.name) {
                             soundMenu = false
@@ -579,6 +590,7 @@ private fun Keyboard(vm: DawViewModel, track: Track, modifier: Modifier) {
     var held by remember { mutableStateOf(setOf<Int>()) }
     val latestVm by rememberUpdatedState(vm)
     val latestLowest by rememberUpdatedState(lowest)
+    val haptics by rememberUpdatedState(padHaptics(vm))
     val trackId = track.id
     val color = DawColors.track(track.colorIndex)
     Column(modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp, bottom = 8.dp)) {
@@ -622,6 +634,7 @@ private fun Keyboard(vm: DawViewModel, track: Track, modifier: Modifier) {
                                         }
                                         if (key != null) {
                                             latestVm.noteOn(trackId, key, 0.85f)
+                                            haptics?.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                             held = held + key
                                             down[change.id] = key
                                         } else {

@@ -66,6 +66,12 @@ class ProjectLibrary(root: File) {
         )
     }
 
+    /** Bytes the songs take on the phone. */
+    fun usedBytes(): Long = dir.walkBottomUp().filter { it.isFile }.sumOf { it.length() }
+
+    /** Bytes still free where the songs are kept. */
+    fun freeBytes(): Long = dir.usableSpace
+
     /** The song to open: the one open last time, else the newest, else a new one. */
     fun current(): String {
         val saved = runCatching { currentFile.readText().trim() }.getOrNull()

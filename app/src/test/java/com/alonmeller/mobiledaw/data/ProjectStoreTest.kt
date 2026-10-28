@@ -9,7 +9,9 @@ import com.alonmeller.mobiledaw.model.Send
 import com.alonmeller.mobiledaw.model.Take
 import com.alonmeller.mobiledaw.model.Takes
 import com.alonmeller.mobiledaw.model.Track
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -75,6 +77,28 @@ class ProjectStoreTest {
         // With one take left, it is a plain item.
         val one = store.load(48000) { if (it == "c.wav") ids[it] else null }!!.project.tracks.single().items.single()
         assertEquals(listOf(Take(13, 300)), Takes.all(one))
+    }
+
+    @Test
+    fun metronomeSettingsSurviveSaveAndLoad() {
+        val store = ProjectStore(tmp.newFolder("click"))
+        val settings = ProjectSettings(metronome = true, metronomeDb = -7.5f, metronomeAccent = false, countInPlayback = true)
+        store.save(Project(tracks = listOf(Track(Ids.next(), "Keys", 0))), settings, 48000) { null }
+        assertEquals(settings, store.load(48000) { null }!!.settings)
+        // A volume out of range is brought back within it.
+        val file = File(store.dir, "project.json")
+        file.writeText(JSONObject(file.readText()).put("metronomeDb", 80).toString())
+        assertEquals(12f, store.load(48000) { null }!!.settings.metronomeDb, 0f)
+    }
+
+    @Test
+    fun aSongIsEmptyUntilItHasATrack() {
+        val store = ProjectStore(tmp.newFolder("new"))
+        assertTrue(store.isEmpty())
+        store.save(Project(), ProjectSettings(), 48000) { null }
+        assertTrue(store.isEmpty())
+        store.save(Project(tracks = listOf(Track(Ids.next(), "Vocal", 0))), ProjectSettings(), 48000) { null }
+        assertFalse(store.isEmpty())
     }
 
     @Test

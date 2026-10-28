@@ -99,11 +99,13 @@ fun NoteEditor(vm: DawViewModel, itemId: Long) {
 
     Dialog(onDismissRequest = vm::closeNoteEditor, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Column(Modifier.fillMaxSize().background(DawColors.Background)) {
+            val tools = rememberScrollState()
             Row(
                 Modifier
                     .fillMaxWidth()
                     .background(DawColors.Panel)
-                    .horizontalScroll(rememberScrollState())
+                    .scrollHints(tools, DawColors.Panel, horizontal = true)
+                    .horizontalScroll(tools)
                     .padding(horizontal = 12.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -266,8 +268,8 @@ private fun NoteGrid(vm: DawViewModel, track: Track, item: Item, rows: Rows, div
                                 // A tap fills the grid cell it lands in.
                                 val start = (floor(frame / g.step) * g.step).roundToLong()
                                 val length = g.step.roundToLong().coerceAtMost(g.pattern - start)
-                                latestVm.setNotes(g.item.id, Midi.add(notes, Note(start, length, pitch)))
-                                latestVm.previewNote(trackId, pitch)
+                                latestVm.setNotes(g.item.id, Midi.add(notes, Note(start, length, pitch, latestVm.newNoteVelocity)))
+                                latestVm.previewEditedNote(trackId, pitch)
                             }
                         },
                         onLongPress = { pos ->
@@ -284,7 +286,7 @@ private fun NoteGrid(vm: DawViewModel, track: Track, item: Item, rows: Rows, div
                                 else -> 1f
                             }
                             latestVm.setNotes(g.item.id, notes - hit + hit.copy(velocity = velocity))
-                            latestVm.previewNote(trackId, hit.pitch, velocity)
+                            latestVm.previewEditedNote(trackId, hit.pitch, velocity)
                         },
                     )
                 }
@@ -335,7 +337,7 @@ private fun NoteGrid(vm: DawViewModel, track: Track, item: Item, rows: Rows, div
                             }
                             if (moved.pitch != lastPitch) {
                                 lastPitch = moved.pitch
-                                latestVm.previewNote(trackId, moved.pitch, moved.velocity)
+                                latestVm.previewEditedNote(trackId, moved.pitch, moved.velocity)
                             }
                             dragged = moved
                             // Notes it lands on make way, as when adding one.

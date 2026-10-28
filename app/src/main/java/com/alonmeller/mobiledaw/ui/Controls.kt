@@ -28,6 +28,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -54,6 +55,15 @@ import com.alonmeller.mobiledaw.model.Scales
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
+
+/**
+ * How knobs, sliders and faders answer a finger, from the Mouse preferences:
+ * [sensitivity] multiplies how far a drag turns them, and [doubleTapReset]
+ * lets a double tap put them back to their default.
+ */
+data class ControlFeel(val sensitivity: Float = 1f, val doubleTapReset: Boolean = true)
+
+val LocalControlFeel = staticCompositionLocalOf { ControlFeel() }
 
 /** Height of the fader cap; meters next to a fader are inset by half of it so their scales line up. */
 val FaderCap = 30.dp
@@ -87,13 +97,14 @@ fun MiniSlider(
     val latestOnChange by rememberUpdatedState(onChange)
     val latestOnEnd by rememberUpdatedState(onEnd)
     val latestOnReset by rememberUpdatedState(onReset)
+    val feel by rememberUpdatedState(LocalControlFeel.current)
     Canvas(
         modifier
             .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     val start = latestPosition
-                    val width = (size.width - 16.dp.toPx()).coerceAtLeast(1f)
+                    val width = (size.width - 16.dp.toPx()).coerceAtLeast(1f) / feel.sensitivity
                     val slop = awaitHorizontalTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
                         ?: return@awaitEachGesture
                     latestOnChange((start + (slop.position.x - down.position.x) / width).coerceIn(0f, 1f))
@@ -105,7 +116,7 @@ fun MiniSlider(
                 }
             }
             .pointerInput(Unit) {
-                detectTapGestures(onDoubleTap = { latestOnReset?.invoke() })
+                detectTapGestures(onDoubleTap = { if (feel.doubleTapReset) latestOnReset?.invoke() })
             }
     ) {
         val r = 8.dp.toPx()
@@ -147,13 +158,14 @@ fun VerticalFader(
     val latestOnChange by rememberUpdatedState(onChange)
     val latestOnEnd by rememberUpdatedState(onEnd)
     val latestOnReset by rememberUpdatedState(onReset)
+    val feel by rememberUpdatedState(LocalControlFeel.current)
     Canvas(
         modifier
             .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     val start = Scales.gainToPosition(latestGain)
-                    val travel = (size.height - FaderCap.toPx()).coerceAtLeast(1f)
+                    val travel = (size.height - FaderCap.toPx()).coerceAtLeast(1f) / feel.sensitivity
                     val slop = awaitVerticalTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
                         ?: return@awaitEachGesture
                     fun moveTo(y: Float) =
@@ -167,7 +179,7 @@ fun VerticalFader(
                 }
             }
             .pointerInput(Unit) {
-                detectTapGestures(onDoubleTap = { latestOnReset() })
+                detectTapGestures(onDoubleTap = { if (feel.doubleTapReset) latestOnReset() })
             }
     ) {
         val cap = FaderCap.toPx()
@@ -263,6 +275,7 @@ fun Knob(
     val latestOnChange by rememberUpdatedState(onChange)
     val latestOnEnd by rememberUpdatedState(onEnd)
     val latestOnReset by rememberUpdatedState(onReset)
+    val feel by rememberUpdatedState(LocalControlFeel.current)
     Canvas(
         modifier
             .pointerInput(Unit) {
@@ -270,7 +283,7 @@ fun Knob(
                     val down = awaitFirstDown(requireUnconsumed = false)
                     val start = latestPosition
                     // The whole range is a drag of about 160dp, whatever the knob's size.
-                    val range = 160.dp.toPx()
+                    val range = 160.dp.toPx() / feel.sensitivity
                     val slop = awaitTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
                         ?: return@awaitEachGesture
                     fun moveTo(p: Offset) {
@@ -286,7 +299,7 @@ fun Knob(
                 }
             }
             .pointerInput(Unit) {
-                detectTapGestures(onDoubleTap = { latestOnReset?.invoke() })
+                detectTapGestures(onDoubleTap = { if (feel.doubleTapReset) latestOnReset?.invoke() })
             }
     ) { drawKnob(position.coerceIn(0f, 1f), color, origin) }
 }

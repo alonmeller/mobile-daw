@@ -147,6 +147,15 @@ class TakesTest {
     }
 
     @Test
+    fun partialPassesStayWhenThePreferencesKeepThem() {
+        // As above, with REAPER's "discard incomplete takes" off: the last quarter pass is a take too, padded to a whole loop.
+        val r = Takes.layout(
+            frames = 500 + 3 * 20_000 + 5_000L, start = 10_000, lead = 500, loop = 10_000L to 30_000L, discardPartial = false,
+        )!!
+        assertEquals(listOf(10_000L, 20_000L, 0L, 15_000L) to listOf(500L, 20_500L, 40_500L, 60_500L), r.summary())
+    }
+
+    @Test
     fun aFirstPassStartedInsideTheLoopIsDroppedWhenAWholeOneFollows() {
         val r = Takes.layout(frames = 5_000 + 20_000 + 3_000L, start = 15_000, lead = 0, loop = 0L to 20_000L)!!
         assertEquals(listOf(0L, 20_000L, 0L, 0L) to listOf(5_000L), r.summary())

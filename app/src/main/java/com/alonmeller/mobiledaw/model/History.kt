@@ -1,9 +1,16 @@
 package com.alonmeller.mobiledaw.model
 
 /** Undo/redo stacks of whole project snapshots (cheap: audio lives in shared sources). */
-class History<T>(private val limit: Int = 200) {
+class History<T>(limit: Int = 200) {
     private val past = ArrayDeque<T>()
     private val future = ArrayDeque<T>()
+
+    /** Most undo steps kept (REAPER's undo settings); lowering it forgets the oldest at once. */
+    var limit: Int = limit
+        set(value) {
+            field = value.coerceAtLeast(1)
+            while (past.size > field) past.removeFirst()
+        }
 
     val canUndo get() = past.isNotEmpty()
     val canRedo get() = future.isNotEmpty()

@@ -13,6 +13,63 @@
 namespace {
 constexpr float kPi = 3.14159265358979f;
 constexpr double kClickSeconds = 0.035;
+
+oboe::AudioApi toApi(int api) {
+    switch (api) {
+        case 1: return oboe::AudioApi::AAudio;
+        case 2: return oboe::AudioApi::OpenSLES;
+        default: return oboe::AudioApi::Unspecified;
+    }
+}
+
+int fromApi(oboe::AudioApi api) {
+    switch (api) {
+        case oboe::AudioApi::AAudio: return 1;
+        case oboe::AudioApi::OpenSLES: return 2;
+        default: return 0;
+    }
+}
+
+oboe::PerformanceMode toPerformance(int mode) {
+    switch (mode) {
+        case 1: return oboe::PerformanceMode::None;
+        case 2: return oboe::PerformanceMode::PowerSaving;
+        default: return oboe::PerformanceMode::LowLatency;
+    }
+}
+
+int fromPerformance(oboe::PerformanceMode mode) {
+    switch (mode) {
+        case oboe::PerformanceMode::None: return 1;
+        case oboe::PerformanceMode::PowerSaving: return 2;
+        default: return 0;
+    }
+}
+
+oboe::InputPreset toPreset(int preset) {
+    switch (preset) {
+        case 1: return oboe::InputPreset::Unprocessed;
+        case 2: return oboe::InputPreset::Camcorder;
+        case 3: return oboe::InputPreset::VoiceCommunication;
+        case 4: return oboe::InputPreset::Generic;
+        case 5: return oboe::InputPreset::VoicePerformance;
+        default: return oboe::InputPreset::VoiceRecognition;
+    }
+}
+
+oboe::SharingMode toSharing(bool exclusive) {
+    return exclusive ? oboe::SharingMode::Exclusive : oboe::SharingMode::Shared;
+}
+
+// A stream tries the device and audio system chosen, then the system's own
+// choice, so a USB interface unplugged since, or an audio system the phone
+// lacks, never leaves the app silent.
+std::vector<std::pair<oboe::AudioApi, int32_t>> attempts(int api, int device) {
+    std::vector<std::pair<oboe::AudioApi, int32_t>> result{{toApi(api), device}};
+    if (device != oboe::kUnspecified) result.emplace_back(toApi(api), oboe::kUnspecified);
+    if (api != 0) result.emplace_back(oboe::AudioApi::Unspecified, oboe::kUnspecified);
+    return result;
+}
 }  // namespace
 
 AudioEngine::AudioEngine() = default;
@@ -20,66 +77,120 @@ AudioEngine::AudioEngine() = default;
 AudioEngine::~AudioEngine() { shutdown(); }
 
 bool AudioEngine::start() {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
     if (output_) return true;
     return openOutput();
 }
 
-bool AudioEngine::openOutput() {
-    oboe::AudioStreamBuilder builder;
-    builder.setDirection(oboe::Direction::Output)
-        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-        ->setSharingMode(oboe::SharingMode::Exclusive)
-        ->setFormat(oboe::AudioFormat::Float)
-        ->setChannelCount(oboe::ChannelCount::Stereo)
-        ->setUsage(oboe::Usage::Media)
-        ->setContentType(oboe::ContentType::Music)
-        ->setDataCallback(this)
-        ->setErrorCallback(this);
-
-    oboe::Result result = builder.openStream(output_);
-    if (result != oboe::Result::OK) {
-        LOGE("Failed to open output stream: %s", oboe::convertToText(result));
-        output_.reset();
-        return false;
-    }
-    sampleRate_ = output_->getSampleRate();
-    // Two bursts is a good balance between latency and glitch resistance.
-    output_->setBufferSizeInFrames(output_->getFramesPerBurst() * 2);
-    result = output_->requestStart();
-    if (result != oboe::Result::OK) {
-        LOGE("Failed to start output stream: %s", oboe::convertToText(result));
-        output_->close();
-        output_.reset();
-        return false;
-    }
-    LOGI("Output started: %d Hz, burst %d", sampleRate_, output_->getFramesPerBurst());
+bool AudioEngine::configure(const AudioConfig &config) {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
+    // A new rate is asked for afresh (0: the device's own); any other change
+    // keeps the rate the session runs at.
+    if (config.sampleRate != config_.sampleRate) requestedRate_ = std::max(0, config.sampleRate);
+    config_ = config;
+    if (!output_) return true;
+    const bool inputWasOpen = input_ != nullptr;
+    closeInput();
+    closeOutput();
+    if (!openOutput()) return false;
+    if (inputWasOpen) openInput();
     return true;
 }
 
-bool AudioEngine::openInput() {
-    if (input_) return true;
-    oboe::AudioStreamBuilder builder;
-    builder.setDirection(oboe::Direction::Input)
-        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-        ->setSharingMode(oboe::SharingMode::Exclusive)
-        ->setFormat(oboe::AudioFormat::Float)
-        ->setChannelCount(oboe::ChannelCount::Mono)
-        ->setSampleRate(sampleRate_)
-        ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
-        ->setInputPreset(oboe::InputPreset::VoiceRecognition)
-        ->setDataCallback(&inputCallback_);
-
-    oboe::Result result = builder.openStream(input_);
+bool AudioEngine::openOutput() {
+    if (output_) return true;
+    // No callback runs now that could still use the last stream's tuner.
+    tuner_.reset();
+    for (const auto &[api, device] : attempts(config_.api, config_.outputDevice)) {
+        oboe::AudioStreamBuilder builder;
+        builder.setDirection(oboe::Direction::Output)
+            ->setAudioApi(api)
+            ->setDeviceId(device)
+            ->setPerformanceMode(toPerformance(config_.performanceMode))
+            ->setSharingMode(toSharing(config_.exclusive))
+            ->setFormat(oboe::AudioFormat::Float)
+            ->setChannelCount(oboe::ChannelCount::Stereo)
+            ->setUsage(oboe::Usage::Media)
+            ->setContentType(oboe::ContentType::Music)
+            ->setDataCallback(this)
+            ->setErrorCallback(this);
+        if (requestedRate_ > 0) {
+            // Converted when the device runs at another rate.
+            builder.setSampleRate(requestedRate_)
+                ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium);
+        }
+        const oboe::Result result = builder.openStream(output_);
+        if (result == oboe::Result::OK) break;
+        LOGE("Failed to open output stream on device %d: %s", device, oboe::convertToText(result));
+        output_.reset();
+    }
+    if (!output_) return false;
+    sampleRate_ = output_->getSampleRate();
+    // From now on the output keeps this rate, whichever device it moves to:
+    // the sources, effects and instruments were all made at it.
+    requestedRate_ = sampleRate_;
+    const int32_t burst = output_->getFramesPerBurst();
+    if (config_.bufferBursts > 0) {
+        output_->setBufferSizeInFrames(burst * config_.bufferBursts);
+    } else {
+        // Automatic: one burst, the lowest latency, growing a burst each time the sound glitches.
+        tuner_ = std::make_unique<oboe::LatencyTuner>(*output_);
+        tuner_->setMinimumBufferSize(burst);
+        tuner_->requestReset();
+    }
+    cpuLoad_.store(0.0f);
+    const oboe::Result result = output_->requestStart();
     if (result != oboe::Result::OK) {
-        LOGE("Failed to open input stream: %s", oboe::convertToText(result));
-        input_.reset();
+        LOGE("Failed to start output stream: %s", oboe::convertToText(result));
+        closeOutput();
         return false;
     }
-    result = input_->requestStart();
+    LOGI("Output started: %d Hz, burst %d, buffer %d", sampleRate_.load(), burst, output_->getBufferSizeInFrames());
+    return true;
+}
+
+void AudioEngine::closeOutput() {
+    if (output_) {
+        output_->stop();
+        output_->close();
+        output_.reset();
+    }
+    tuner_.reset();
+}
+
+bool AudioEngine::openInput() {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
+    if (input_) return true;
+    // The microphone mode chosen, then voice recognition, which every phone has.
+    std::vector<oboe::InputPreset> presets{toPreset(config_.inputPreset)};
+    if (presets[0] != oboe::InputPreset::VoiceRecognition) presets.push_back(oboe::InputPreset::VoiceRecognition);
+    for (const auto &[api, device] : attempts(config_.api, config_.inputDevice)) {
+        for (const auto preset : presets) {
+            oboe::AudioStreamBuilder builder;
+            builder.setDirection(oboe::Direction::Input)
+                ->setAudioApi(api)
+                ->setDeviceId(device)
+                ->setPerformanceMode(toPerformance(config_.performanceMode))
+                ->setSharingMode(toSharing(config_.exclusive))
+                ->setFormat(oboe::AudioFormat::Float)
+                ->setChannelCount(oboe::ChannelCount::Mono)
+                ->setSampleRate(sampleRate_)
+                ->setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Medium)
+                ->setInputPreset(preset)
+                ->setDataCallback(&inputCallback_)
+                ->setErrorCallback(&inputCallback_);
+            const oboe::Result result = builder.openStream(input_);
+            if (result == oboe::Result::OK) break;
+            LOGE("Failed to open input stream on device %d: %s", device, oboe::convertToText(result));
+            input_.reset();
+        }
+        if (input_) break;
+    }
+    if (!input_) return false;
+    const oboe::Result result = input_->requestStart();
     if (result != oboe::Result::OK) {
         LOGE("Failed to start input stream: %s", oboe::convertToText(result));
-        input_->close();
-        input_.reset();
+        closeInput();
         return false;
     }
     // Two bursts: the input can arrive a burst early or late against the output's callbacks.
@@ -88,6 +199,7 @@ bool AudioEngine::openInput() {
 }
 
 void AudioEngine::closeInput() {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
     if (input_) {
         input_->stop();
         input_->close();
@@ -96,15 +208,50 @@ void AudioEngine::closeInput() {
     inputPeak_.store(0.0f);
 }
 
+// Oboe's thread, once the input has gone (a headset and its microphone
+// unplugged, say): opens it again, on whichever microphone is left, while
+// recording or monitoring still need it.
+void AudioEngine::inputClosed(oboe::AudioStream *stream) {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
+    if (!input_ || stream != input_.get()) return;
+    input_.reset();
+    if (recording_.load() || monitorOn_.load()) openInput();
+}
+
 void AudioEngine::shutdown() {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
     monitorOn_.store(false);
     if (recording_.load()) stopRecording();
     closeInput();
+    closeOutput();
+}
+
+AudioStatus AudioEngine::status() {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
+    AudioStatus s;
+    s.cpuLoad = cpuLoad_.load();
     if (output_) {
-        output_->stop();
-        output_->close();
-        output_.reset();
+        s.api = fromApi(output_->getAudioApi());
+        s.sampleRate = output_->getSampleRate();
+        s.framesPerBurst = output_->getFramesPerBurst();
+        s.bufferSize = output_->getBufferSizeInFrames();
+        s.bufferCapacity = output_->getBufferCapacityInFrames();
+        s.exclusive = output_->getSharingMode() == oboe::SharingMode::Exclusive;
+        s.performanceMode = fromPerformance(output_->getPerformanceMode());
+        s.deviceId = output_->getDeviceId();
+        const auto latency = output_->calculateLatencyMillis();
+        s.latencyMs = latency ? latency.value() : 0.0;
+        const auto xruns = output_->getXRunCount();
+        s.xruns = xruns ? xruns.value() : -1;
     }
+    if (input_) {
+        s.inputOpen = true;
+        s.inputExclusive = input_->getSharingMode() == oboe::SharingMode::Exclusive;
+        s.inputDeviceId = input_->getDeviceId();
+        const auto latency = input_->calculateLatencyMillis();
+        s.inputLatencyMs = latency ? latency.value() : 0.0;
+    }
+    return s;
 }
 
 void AudioEngine::setPlaying(bool playing) {
@@ -121,6 +268,7 @@ void AudioEngine::startPlaying(int64_t countInFrames) {
 }
 
 bool AudioEngine::setMonitor(bool enabled, int trackIndex) {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
     monitorTrack_.store(trackIndex);
     if (!enabled) {
         monitorOn_.store(false);
@@ -144,6 +292,7 @@ void AudioEngine::setLoop(int64_t start, int64_t end, bool enabled) {
 }
 
 bool AudioEngine::startRecording(bool withTransport, int64_t countInFrames) {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
     if (recording_.load()) return true;
     if (!openInput()) return false;
 
@@ -164,12 +313,14 @@ bool AudioEngine::startRecording(bool withTransport, int64_t countInFrames) {
 }
 
 int64_t AudioEngine::outputLatencyFrames() {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
     if (!output_) return 0;
     auto latency = output_->calculateLatencyMillis();
     return latency ? static_cast<int64_t>(latency.value() * sampleRate_ / 1000.0) : 0;
 }
 
 int AudioEngine::stopRecording() {
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
     if (!recording_.load()) return -1;
     recording_.store(false);
     countIn_.store(0);
@@ -195,7 +346,7 @@ int AudioEngine::stopRecording() {
     auto take = std::make_shared<Samples>(std::move(recordBuffer_));
     recordBuffer_ = std::vector<float>();
 
-    std::lock_guard<std::mutex> lock(sourcesMutex_);
+    std::lock_guard<std::mutex> sourcesLock(sourcesMutex_);
     const int id = nextSourceId_++;
     sources_[id] = std::move(take);
     return id;
@@ -226,6 +377,11 @@ oboe::DataCallbackResult AudioEngine::InputCallback::onAudioReady(oboe::AudioStr
     if (engine_.recording_.load()) engine_.ring_.write(in, static_cast<size_t>(numFrames));
     if (engine_.monitorOn_.load()) engine_.monitor_.push(in, static_cast<size_t>(numFrames));
     return oboe::DataCallbackResult::Continue;
+}
+
+void AudioEngine::InputCallback::onErrorAfterClose(oboe::AudioStream *stream, oboe::Result error) {
+    LOGE("Input stream closed with error: %s", oboe::convertToText(error));
+    engine_.inputClosed(stream);
 }
 
 int AudioEngine::createSource(const float *data, int64_t numFrames) {
@@ -322,16 +478,20 @@ void AudioEngine::clearSession() {
 }
 
 void AudioEngine::renderMetronome(float *out, int32_t numFrames, int64_t pos) {
-    const double framesPerBeat = sampleRate_ * 60.0 / std::max(20.0, tempo_.load());
-    const double clickFrames = kClickSeconds * sampleRate_;
+    const double rate = sampleRate_.load();
+    const double framesPerBeat = rate * 60.0 / std::max(20.0, tempo_.load());
+    const double clickFrames = kClickSeconds * rate;
+    const float gain = 0.35f * metronomeGain_.load();
+    const bool accent = metronomeAccent_.load();
     for (int32_t i = 0; i < numFrames; ++i) {
         const double f = static_cast<double>(pos + i);
         const auto beat = static_cast<int64_t>(std::floor(f / framesPerBeat));
         const double intoBeat = f - static_cast<double>(beat) * framesPerBeat;
         if (intoBeat >= clickFrames) continue;
-        const float t = static_cast<float>(intoBeat / sampleRate_);
-        const float freq = (beat % 4 == 0) ? 1760.0f : 1320.0f;
-        const float v = std::sin(2.0f * kPi * freq * t) * std::exp(-t * 110.0f) * 0.35f;
+        const float t = static_cast<float>(intoBeat / rate);
+        // A higher click on each bar's first beat, unless every beat is to sound the same.
+        const float freq = (accent && beat % 4 == 0) ? 1760.0f : 1320.0f;
+        const float v = std::sin(2.0f * kPi * freq * t) * std::exp(-t * 110.0f) * gain;
         out[2 * i] += v;
         out[2 * i + 1] += v;
     }
@@ -395,6 +555,7 @@ std::vector<PadConfig> AudioEngine::drumPads(int64_t id) {
 }
 
 void AudioEngine::liveNote(int64_t instrumentId, int pitch, float velocity) {
+    std::lock_guard<std::mutex> lock(liveNotesMutex_);
     liveNotes_.push({instrumentId, pitch, velocity});
 }
 
@@ -439,6 +600,8 @@ void AudioEngine::renderSegment(float *out, int32_t numFrames, int64_t pos, bool
 }
 
 oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *audioData, int32_t numFrames) {
+    const auto began = std::chrono::steady_clock::now();
+    if (tuner_) tuner_->tune();
     auto *out = static_cast<float *>(audioData);
     std::fill(out, out + numFrames * 2, 0.0f);
 
@@ -452,7 +615,7 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
     if (monitoring) monitor_.begin(static_cast<size_t>(numFrames), static_cast<size_t>(monitorTarget_.load()));
 
     if (playing_.load()) {
-        tailFrames_ = static_cast<int64_t>(sampleRate_) * 4;
+        tailFrames_ = fxTail_.load();
         int32_t done = 0;
         // A count-in: the metronome counts the bars in while the timeline
         // waits, its clicks on the beats before the start.
@@ -504,12 +667,19 @@ oboe::DataCallbackResult AudioEngine::onAudioReady(oboe::AudioStream *, void *au
         master = std::max(master, std::fabs(out[i]));
     }
     masterPeak_.store(std::max(masterPeak_.load(), master));
+
+    // How much of the buffer's time the mix took, smoothed so the readout holds still.
+    const double took = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    const float load = static_cast<float>(took * sampleRate_ / std::max<int32_t>(1, numFrames));
+    cpuLoad_.store(cpuLoad_.load() * 0.95f + load * 0.05f);
     return oboe::DataCallbackResult::Continue;
 }
 
 void AudioEngine::onErrorAfterClose(oboe::AudioStream *stream, oboe::Result error) {
     LOGE("Stream closed with error: %s", oboe::convertToText(error));
-    // Typically a device change (headphones plugged in): reopen the output.
+    std::lock_guard<std::recursive_mutex> lock(streamMutex_);
+    // Typically a device change (headphones plugged in): reopen the output,
+    // at the same rate, on the new device.
     if (output_ && stream == output_.get()) {
         output_.reset();
         openOutput();

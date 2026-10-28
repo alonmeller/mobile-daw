@@ -94,11 +94,12 @@ object Takes {
      * One that did becomes an item over the loop with a take per pass, the
      * newest last. As in REAPER, a pass that does not cover the whole loop
      * (the first, when recording started inside the loop, or the last, cut
-     * short by stopping) is dropped when at least one pass is whole.
-     * Otherwise those passes stay, silent where nothing was recorded, which
-     * the source then needs some silence for. Null when nothing was recorded.
+     * short by stopping) is dropped when at least one pass is whole, unless
+     * [discardPartial] is false. Otherwise those passes stay, silent where
+     * nothing was recorded, which the source then needs some silence for.
+     * Null when nothing was recorded.
      */
-    fun layout(frames: Long, start: Long, lead: Long, loop: Pair<Long, Long>?): Recorded? {
+    fun layout(frames: Long, start: Long, lead: Long, loop: Pair<Long, Long>?, discardPartial: Boolean = true): Recorded? {
         // Timeline frames the performer played over, counted from the start.
         val heard = frames - lead
         if (heard < Edits.MIN_LENGTH) return null
@@ -120,7 +121,7 @@ object Takes {
             if (whole || heard - passStart >= Edits.MIN_LENGTH) passes += (lead + passStart) to whole
             passStart += length
         }
-        val kept = (if (passes.any { it.second }) passes.filter { it.second } else passes).map { it.first }
+        val kept = (if (discardPartial && passes.any { it.second }) passes.filter { it.second } else passes).map { it.first }
         if (kept.isEmpty()) return null
         val padBefore = maxOf(0L, -kept.min())
         val padAfter = maxOf(0L, kept.max() + length - frames)

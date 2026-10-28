@@ -53,6 +53,41 @@ JNIEXPORT void JNICALL JNI_FN(shutdown)(JNIEnv *, jobject) {
 
 JNIEXPORT jint JNICALL JNI_FN(sampleRate)(JNIEnv *, jobject) { return engine().sampleRate(); }
 
+JNIEXPORT jboolean JNICALL JNI_FN(configure)(JNIEnv *, jobject, jint api, jint performanceMode, jboolean exclusive,
+                                             jint sampleRate, jint bufferBursts, jint outputDevice,
+                                             jint inputDevice, jint inputPreset) {
+    AudioConfig config;
+    config.api = api;
+    config.performanceMode = performanceMode;
+    config.exclusive = exclusive;
+    config.sampleRate = sampleRate;
+    config.bufferBursts = bufferBursts;
+    config.outputDevice = outputDevice;
+    config.inputDevice = inputDevice;
+    config.inputPreset = inputPreset;
+    return engine().configure(config);
+}
+
+// [api, sample rate, frames per burst, buffer size, buffer capacity, exclusive,
+//  performance mode, device id, latency ms, xruns, CPU load, input open,
+//  input exclusive, input device id, input latency ms]
+JNIEXPORT jdoubleArray JNICALL JNI_FN(audioStatus)(JNIEnv *env, jobject) {
+    const AudioStatus s = engine().status();
+    const double values[] = {
+        static_cast<double>(s.api), static_cast<double>(s.sampleRate), static_cast<double>(s.framesPerBurst),
+        static_cast<double>(s.bufferSize), static_cast<double>(s.bufferCapacity), s.exclusive ? 1.0 : 0.0,
+        static_cast<double>(s.performanceMode), static_cast<double>(s.deviceId), s.latencyMs,
+        static_cast<double>(s.xruns), static_cast<double>(s.cpuLoad), s.inputOpen ? 1.0 : 0.0,
+        s.inputExclusive ? 1.0 : 0.0, static_cast<double>(s.inputDeviceId), s.inputLatencyMs,
+    };
+    const auto n = static_cast<jsize>(sizeof(values) / sizeof(values[0]));
+    jdoubleArray result = env->NewDoubleArray(n);
+    env->SetDoubleArrayRegion(result, 0, n, values);
+    return result;
+}
+
+JNIEXPORT void JNICALL JNI_FN(setFxTail)(JNIEnv *, jobject, jlong frames) { engine().setFxTail(frames); }
+
 JNIEXPORT void JNICALL JNI_FN(setPlaying)(JNIEnv *, jobject, jboolean playing) {
     engine().setPlaying(playing);
 }
@@ -309,6 +344,10 @@ JNIEXPORT void JNICALL JNI_FN(setMetronome)(JNIEnv *, jobject, jboolean enabled)
 }
 
 JNIEXPORT void JNICALL JNI_FN(setTempo)(JNIEnv *, jobject, jdouble bpm) { engine().setTempo(bpm); }
+
+JNIEXPORT void JNICALL JNI_FN(setMetronomeSound)(JNIEnv *, jobject, jfloat gain, jboolean accent) {
+    engine().setMetronomeSound(gain, accent);
+}
 
 // Renders the arrangement being played now into 32-bit float WAV files: the
 // stereo mix (unless mixPath is empty), a stereo stem for each track with a

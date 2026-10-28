@@ -15,15 +15,20 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.compose.ui.graphics.toArgb
+import com.alonmeller.mobiledaw.audio.AudioStatus
 import com.alonmeller.mobiledaw.audio.NativeEngine
 import com.alonmeller.mobiledaw.data.AacEncoder
 import com.alonmeller.mobiledaw.data.AudioExport
 import com.alonmeller.mobiledaw.data.ImportedAudio
+import com.alonmeller.mobiledaw.data.Preferences
+import com.alonmeller.mobiledaw.data.PreferencesStore
 import com.alonmeller.mobiledaw.data.ProjectInfo
 import com.alonmeller.mobiledaw.data.ProjectLibrary
 import com.alonmeller.mobiledaw.data.ProjectMeta
 import com.alonmeller.mobiledaw.data.ProjectSettings
 import com.alonmeller.mobiledaw.data.ProjectStore
+import com.alonmeller.mobiledaw.data.StartupProject
+import com.alonmeller.mobiledaw.data.ZoomAnchor
 import com.alonmeller.mobiledaw.data.WavFile
 import com.alonmeller.mobiledaw.model.DrumKit
 import com.alonmeller.mobiledaw.model.Edits
@@ -45,6 +50,7 @@ import com.alonmeller.mobiledaw.model.MidiFile
 import com.alonmeller.mobiledaw.model.Note
 import com.alonmeller.mobiledaw.model.PAD_COUNT
 import com.alonmeller.mobiledaw.model.Pad
+import com.alonmeller.mobiledaw.model.PeakTrail
 import com.alonmeller.mobiledaw.model.Project
 import com.alonmeller.mobiledaw.model.ReaperProject
 import com.alonmeller.mobiledaw.model.Routing
@@ -87,9 +93,6 @@ enum class MainView { Arrange, Mixer, Play }
 /** Kinds of track that "+ Track" adds; a bus is an empty track with an effect that other tracks send to. */
 enum class TrackKind { Audio, Synth, Drums, ReverbBus, DelayBus }
 
-/** How fast meters fall back after a peak. */
-private const val METER_FALL_DB_PER_SECOND = 24f
-
 /** What "Export" makes, as in REAPER's Render to File and GarageBand's Share. */
 enum class ExportKind { Song, Stems, Midi, Reaper }
 
@@ -123,13 +126,82 @@ private val HEADPHONE_TYPES = setOf(
     AudioDeviceInfo.TYPE_USB_DEVICE,
 )
 
+/** Outputs only the listener hears, whose unplugging would send the song out of the speaker. */
+private val PRIVATE_OUTPUTS = HEADPHONE_TYPES + setOf(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_BLE_HEADSET)
+
+/** Outputs and inputs worth offering in the device settings: no earpiece, telephony or virtual devices. */
+private val OUTPUT_CHOICES = PRIVATE_OUTPUTS + setOf(
+    AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
+    AudioDeviceInfo.TYPE_USB_ACCESSORY,
+    AudioDeviceInfo.TYPE_HDMI,
+    AudioDeviceInfo.TYPE_LINE_ANALOG,
+    AudioDeviceInfo.TYPE_LINE_DIGITAL,
+    AudioDeviceInfo.TYPE_AUX_LINE,
+)
+private val INPUT_CHOICES = setOf(
+    AudioDeviceInfo.TYPE_BUILTIN_MIC,
+    AudioDeviceInfo.TYPE_WIRED_HEADSET,
+    AudioDeviceInfo.TYPE_USB_HEADSET,
+    AudioDeviceInfo.TYPE_USB_DEVICE,
+    AudioDeviceInfo.TYPE_USB_ACCESSORY,
+    AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+    AudioDeviceInfo.TYPE_BLE_HEADSET,
+    AudioDeviceInfo.TYPE_LINE_ANALOG,
+    AudioDeviceInfo.TYPE_LINE_DIGITAL,
+)
+
+/** An audio device the phone offers, for the device settings: Android's id for it and a name to show. */
+data class AudioDeviceChoice(val id: Int, val name: String)
+
+/** What a device is, in words, with its maker's name when it has one of its own. */
+private fun deviceLabel(d: AudioDeviceInfo): String {
+    val kind = when (d.type) {
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Phone speaker"
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Phone microphone"
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "Wired headphones"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired headset"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "USB headset"
+        AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_ACCESSORY -> "USB audio"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth headset (call quality)"
+        AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetooth LE headset"
+        AudioDeviceInfo.TYPE_HDMI -> "HDMI"
+        else -> "Line"
+    }
+    val product = d.productName?.toString().orEmpty().trim()
+    // The built-in devices carry the phone's model name, which says nothing.
+    val builtIn = d.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER || d.type == AudioDeviceInfo.TYPE_BUILTIN_MIC
+    return if (product.isEmpty() || builtIn) kind else "$kind: $product"
+}
+
+/** Choices for [devices], numbered where two would read the same (a phone's several microphones). */
+private fun deviceChoices(devices: List<AudioDeviceInfo>): List<AudioDeviceChoice> {
+    val labels = devices.map(::deviceLabel)
+    val seen = HashMap<String, Int>()
+    return devices.mapIndexed { i, d ->
+        val label = labels[i]
+        val n = (seen[label] ?: 0) + 1
+        seen[label] = n
+        AudioDeviceChoice(d.id, if (labels.count { it == label } > 1) "$label $n" else label)
+    }
+}
+
+/** Linear gain of [db] decibels. */
+private fun dbToGain(db: Float): Float = 10f.pow(db / 20f)
+
 class DawViewModel(app: Application) : AndroidViewModel(app) {
     private val library = ProjectLibrary(app.filesDir)
     /** Folder name of the open song, and its store. */
     private var songId = library.current()
     private var store = ProjectStore(library.folder(songId))
-    private val engineStarted = NativeEngine.start()
-    val sampleRate: Int = NativeEngine.sampleRate()
+    private val prefsStore = PreferencesStore(app.filesDir)
+    /** The app's preferences, REAPER's Preferences window: one set for every song. */
+    var prefs by mutableStateOf(prefsStore.load())
+        private set
+    private val engineStarted = configureEngine(prefs) && NativeEngine.start()
+    /** The rate the song plays at; only the audio device settings change it. */
+    var sampleRate by mutableIntStateOf(NativeEngine.sampleRate())
+        private set
 
     // ------------------------------------------------------------ state
 
@@ -216,7 +288,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     var scrollPx by mutableFloatStateOf(0f)
     var laneWidthPx by mutableFloatStateOf(0f)
 
-    private val history = History<Project>()
+    private val history = History<Project>(prefs.undoSteps)
     private var gestureBase: Project? = null
     private var saveJob: Job? = null
     /** True once [project] holds the open song, so a save can never write an empty project over it. */
@@ -224,13 +296,28 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     private var nextTrackNumber = 1
 
     init {
-        viewModelScope.launch { loadProject() }
+        applyEnginePrefs()
+        viewModelScope.launch {
+            // REAPER's "open on startup": the last song, a new one (unless the last is still empty), or the song list.
+            if (prefs.startup == StartupProject.NewProject) {
+                val fresh = withContext(Dispatchers.IO) {
+                    if (store.isEmpty()) null else library.create(ProjectLibrary.DEFAULT_NAME).also { library.setCurrent(it) }
+                }
+                if (fresh != null) {
+                    songId = fresh
+                    store = ProjectStore(library.folder(fresh))
+                }
+            }
+            loadProject()
+            if (prefs.startup == StartupProject.ShowSongs) openSongs()
+        }
     }
 
     // ------------------------------------------------------------ load / save / sync
 
     private suspend fun loadProject() {
         val target = store
+        val sampleRate = sampleRate
         val loaded = withContext(Dispatchers.IO) {
             val newSources = mutableMapOf<Int, SourceInfo>()
             target.sourceLengthOf = { id -> NativeEngine.sourceLength(id) }
@@ -247,12 +334,18 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val (result, newSources, name) = loaded
         sources = newSources
         songName = name
-        settings = result?.settings ?: ProjectSettings()
+        // A new song starts at the tempo and with the metronome the preferences give.
+        settings = result?.settings ?: ProjectSettings(metronome = prefs.newSongMetronome)
         NativeEngine.setMetronome(settings.metronome)
-        applyProject(result?.project ?: Project())
+        pushMetronomeSound()
+        applyProject(result?.project ?: Project(tempo = prefs.newSongTempo.toDouble()))
         nextTrackNumber = (result?.project?.tracks?.size ?: 0) + 1
         songLoaded = true
         loading = false
+        if (rateCheckPending) {
+            rateCheckPending = false
+            checkSampleRate()
+        }
     }
 
     /** Effects the engine already has, with the settings it was last given. */
@@ -455,10 +548,14 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         withContext(Dispatchers.IO) { runCatching { target.save(p, s, sampleRate) { files[it] } } }
     }
 
-    /** Writes a new source's WAV file into the open song's folder, off the main thread. */
-    private fun writeSource(fileName: String, samples: FloatArray) {
+    /**
+     * Writes a new source's WAV file into the open song's folder, off the
+     * main thread: [bits] 32 is float, else 24- or 16-bit PCM.
+     */
+    private fun writeSource(fileName: String, samples: FloatArray, bits: Int = 32) {
         val file = store.audioFile(fileName)
-        viewModelScope.launch(Dispatchers.IO) { runCatching { WavFile.writeFloatMono(file, samples, sampleRate) } }
+        val rate = sampleRate
+        viewModelScope.launch(Dispatchers.IO) { runCatching { WavFile.writeMono(file, samples, rate, bits) } }
     }
 
     fun undo() {
@@ -487,7 +584,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val seconds = if (lastTickNanos == 0L) 0f else ((now - lastTickNanos) / 1e9f).coerceAtMost(0.25f)
         lastTickNanos = now
         // Meters jump up to each new peak and fall back at a steady rate, like a mixing desk.
-        val fall = 10f.pow(-METER_FALL_DB_PER_SECOND * seconds / 20f)
+        val fall = 10f.pow(-prefs.meterDecayDb * seconds / 20f)
         fun meter(shown: Float, peak: Float) = max(peak, shown * fall).let { if (it < 1e-4f) 0f else it }
 
         position = NativeEngine.position()
@@ -499,15 +596,22 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             val peak = NativeEngine.inputLevel()
             inputLevel = meter(inputLevel, peak)
             if (capturing) recordedFrames = NativeEngine.recordedFrames()
-            if (capturing && peak >= CLIP_LEVEL && !clipWarned) {
+            if (capturing && peak >= CLIP_LEVEL && !clipWarned && prefs.clipWarning) {
                 clipWarned = true
                 message = "Clipping! Sing softer or move the phone away"
             }
+            if (recording && countInBeats == 0 && prefs.recordingPreview) previewPeak(position, peak)
         }
         if (recording || recordingMidi) {
             seePosition(position)
             val countIn = NativeEngine.countInRemaining()
             countInBeats = if (countIn > 0) ceil(countIn / framesPerBeat).toInt() else 0
+        }
+        // REAPER's "stop playback at end of project", unless something records or the loop goes round.
+        if (playing && prefs.stopAtEnd && !recording && !recordingMidi && !auditioning && !project.loopOn &&
+            project.endFrame > 0 && position >= project.endFrame
+        ) {
+            stop()
         }
         val levels = HashMap<Long, Float>()
         project.tracks.forEachIndexed { i, t ->
@@ -515,7 +619,33 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             if (v > 0f) levels[t.id] = v
         }
         if (levels.isNotEmpty() || trackLevels.isNotEmpty()) trackLevels = levels
-        if (playing) followPlayhead()
+        if (playing && prefs.autoScroll) followPlayhead()
+    }
+
+    /**
+     * True while the screen has something moving to show: the transport,
+     * meters, a recording or an export. Otherwise the screen polls the
+     * engine only now and then, which saves the battery.
+     */
+    val animating: Boolean
+        get() = playing || recording || recordingMidi || samplingPad != null || monitoringLive || auditioning ||
+            exportProgress != null || masterLevel > 0f || inputLevel > 0f || trackLevels.isNotEmpty()
+
+    /**
+     * The take being recorded as it comes in, REAPER's recording preview:
+     * the timeline frame each screen update reached, and the loudest input
+     * since the one before.
+     */
+    val recordPreview = PeakTrail()
+    private var previewPass = 0
+
+    private fun previewPeak(frame: Long, peak: Float) {
+        // A new pass round the loop starts a new take.
+        if (recordPasses != previewPass) {
+            previewPass = recordPasses
+            recordPreview.clear()
+        }
+        recordPreview.add(frame, peak)
     }
 
     // ------------------------------------------------------------ timeline geometry
@@ -546,11 +676,21 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         scrollPx = (scrollPx + deltaPx).coerceAtLeast(0f)
     }
 
+    /**
+     * Zooms the timeline. What stays put on screen is REAPER's "horizontal
+     * zoom center": the playhead while it is in view, or the middle of the view.
+     */
     fun zoom(factor: Float) {
-        // Keep the playhead in the same place on screen while zooming.
-        val anchorScreen = screenX(position)
+        val head = screenX(position)
+        val anchor = if (prefs.zoomAnchor == ZoomAnchor.Playhead && head in 0f..laneWidthPx) head else laneWidthPx / 2
+        zoomAround(factor, anchor)
+    }
+
+    /** Zooms keeping the time at screen [x] where it is, as a pinch does around the fingers. */
+    fun zoomAround(factor: Float, x: Float) {
+        val frame = pxToFrames(x + scrollPx)
         zoomDp = (zoomDp * factor).coerceIn(5f, 600f)
-        scrollPx = (framesToPx(position) - anchorScreen).coerceAtLeast(0f)
+        scrollPx = (framesToPx(frame) - x).coerceAtLeast(0f)
     }
 
     // ------------------------------------------------------------ transport
@@ -569,21 +709,41 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         playing = !playing
-        NativeEngine.setPlaying(playing)
+        if (playing) {
+            playStart = position
+            // REAPER's count-in before playback: as long as the recording one, or a bar when that is off.
+            val countIn = if (settings.countInPlayback) (framesPerBeat * 4 * maxOf(1, settings.countInBars)).roundToLong() else 0L
+            NativeEngine.startPlaying(countIn)
+        } else {
+            NativeEngine.setPlaying(false)
+        }
     }
 
-    /** Stop button: first press stops, a second press returns to the start. */
+    /** Where playback last started, for REAPER's return to start on stop. */
+    private var playStart = 0L
+
+    /**
+     * Stop button: first press stops (and, with the preference, goes back to
+     * where playback started, as REAPER does), a second press returns to the start.
+     */
     fun stop() {
         // Stopping a recording during its count-in stops the transport too: still a first press.
         val wasPlaying = playing
+        val wasRecording = recording || recordingMidi
         if (recording) stopRecording()
         if (recordingMidi) stopMidiRecording()
-        if (!wasPlaying) {
-            seekFrames(0)
-            scrollPx = 0f
-        }
         playing = false
         NativeEngine.setPlaying(false)
+        when {
+            !wasPlaying -> {
+                seekFrames(0)
+                scrollPx = 0f
+            }
+            prefs.returnOnStop && !wasRecording -> {
+                seekFrames(playStart)
+                if (prefs.autoScroll) followPlayhead()
+            }
+        }
     }
 
     fun rewind() {
@@ -605,6 +765,28 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         NativeEngine.setMetronome(settings.metronome)
         scheduleSave()
     }
+
+    /** REAPER's metronome volume, in dB. */
+    fun setMetronomeDb(db: Float) {
+        settings = settings.copy(metronomeDb = db.coerceIn(-40f, 12f))
+        pushMetronomeSound()
+        scheduleSave()
+    }
+
+    /** A higher click on each bar's first beat, or every beat the same. */
+    fun setMetronomeAccent(on: Boolean) {
+        settings = settings.copy(metronomeAccent = on)
+        pushMetronomeSound()
+        scheduleSave()
+    }
+
+    /** REAPER's "count-in before playback". */
+    fun setCountInPlayback(on: Boolean) {
+        settings = settings.copy(countInPlayback = on)
+        scheduleSave()
+    }
+
+    private fun pushMetronomeSound() = NativeEngine.setMetronomeSound(dbToGain(settings.metronomeDb), settings.metronomeAccent)
 
     /**
      * Sets the tempo. MIDI items and the loop keep their place in bars, as
@@ -655,7 +837,12 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     fun cycleGrid() {
         val i = GRID_DIVISIONS.indexOf(settings.gridDivision)
-        settings = settings.copy(gridDivision = GRID_DIVISIONS[(i + 1) % GRID_DIVISIONS.size])
+        setGridDivision(GRID_DIVISIONS[(i + 1) % GRID_DIVISIONS.size])
+    }
+
+    fun setGridDivision(division: Int) {
+        if (division !in GRID_DIVISIONS) return
+        settings = settings.copy(gridDivision = division)
         scheduleSave()
     }
 
@@ -756,6 +943,8 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         wrapped = false
         recordPasses = 1
         countInBeats = 0
+        recordPreview.clear()
+        previewPass = 1
     }
 
     fun toggleRecord() {
@@ -803,9 +992,12 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         }
         updateMonitoring()
         if (captured < 0) return
-        // What was played while hearing the timeline start comes this far into the capture.
-        val lead = recordCountIn + NativeEngine.recordLatency()
-        val layout = Takes.layout(NativeEngine.sourceLength(captured), recordStart, lead, recordLoop)
+        // What was played while hearing the timeline start comes this far into the capture: the
+        // count-in, the latency the audio system reports (REAPER's "use audio driver reported
+        // latency") and the manual offset, which moves takes earlier.
+        val reported = if (prefs.useReportedLatency) NativeEngine.recordLatency() else 0L
+        val lead = (recordCountIn + reported + prefs.latencyOffsetMs * sampleRate / 1000L).coerceAtLeast(0L)
+        val layout = Takes.layout(NativeEngine.sourceLength(captured), recordStart, lead, recordLoop, prefs.discardPartialTakes)
         if (layout == null) {
             NativeEngine.releaseSource(captured)
             if (!countingIn) message = "The take was too short to keep"
@@ -823,11 +1015,15 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         }
         val info = SourceInfo("take_${UUID.randomUUID()}.wav", samples.size.toLong(), NativeEngine.sourcePeaks(sourceId, PEAK_BUCKET))
         sources = sources + (sourceId to info)
-        writeSource(info.fileName, samples)
+        writeSource(info.fileName, samples, prefs.recordFormat.bits)
 
         // One take per pass round the loop, the newest playing.
         val takes = layout.offsets.map { Take(sourceId, it) }
-        val item = Takes.withTakes(Item(Ids.next(), sourceId, layout.position, 0, layout.length), takes, takes.lastIndex)
+        val fade = autoFade(layout.length)
+        val item = Takes.withTakes(
+            Item(Ids.next(), sourceId, layout.position, 0, layout.length, fadeIn = fade, fadeOut = fade),
+            takes, takes.lastIndex,
+        )
         var p = project
         var trackId = armedTrackId
         if (p.tracks.none { it.id == trackId }) {
@@ -842,7 +1038,31 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         selectedItems = holding
         updateMonitoring()
         val most = items.filter { it.id in holding }.maxOfOrNull { Takes.count(it) } ?: 1
-        if (most > 1) message = "Take $most of $most: ◀ ▶ above picks another"
+        if (most > 1) tip("Take $most of $most: ◀ ▶ above picks another")
+        // REAPER's prompt after recording: keep the new take, or throw it away.
+        if (prefs.askAfterRecording) takePrompt = true
+    }
+
+    /** True while asking whether to keep the take just recorded. */
+    var takePrompt by mutableStateOf(false)
+        private set
+
+    fun keepTake() {
+        takePrompt = false
+    }
+
+    /** Throws the take just recorded away, as undo would. */
+    fun discardTake() {
+        takePrompt = false
+        undo()
+    }
+
+    /** REAPER's automatic fades on new items, at most a quarter of the item. */
+    private fun autoFade(length: Long): Long = minOf(prefs.autoFadeMs * sampleRate / 1000L, length / 4)
+
+    /** A word of help on the screen, unless the preferences turn tips off. */
+    private fun tip(text: String) {
+        if (prefs.showHints) message = text
     }
 
     /** True while a take is being recorded into this track. */
@@ -880,6 +1100,15 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     private var monitorIndex: Int? = null
     private var foreground = true
 
+    /** The phone's outputs and inputs, for the device settings. */
+    var outputDevices by mutableStateOf(listOf<AudioDeviceChoice>())
+        private set
+    var inputDevices by mutableStateOf(listOf<AudioDeviceChoice>())
+        private set
+    /** True while headphones of any kind (wired, USB or Bluetooth) are connected. */
+    private var privateOutput = false
+
+    // After the state it fills, which Kotlin sets up in the order it is written.
     init {
         audioManager?.registerAudioDeviceCallback(deviceCallback, Handler(Looper.getMainLooper()))
         refreshHeadphones()
@@ -891,6 +1120,16 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun refreshHeadphones() {
         val outputs = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS) ?: emptyArray()
+        val inputs = audioManager?.getDevices(AudioManager.GET_DEVICES_INPUTS) ?: emptyArray()
+        outputDevices = deviceChoices(outputs.filter { it.type in OUTPUT_CHOICES })
+        inputDevices = deviceChoices(inputs.filter { it.type in INPUT_CHOICES })
+        val private = outputs.any { it.type in PRIVATE_OUTPUTS }
+        if (privateOutput && !private && prefs.stopOnUnplug && (playing || recording || recordingMidi)) {
+            // Unplugged mid-song: the phone's speaker would play it out loud.
+            stopAll()
+            message = "Stopped: the headphones were unplugged"
+        }
+        privateOutput = private
         val wired = outputs.any { it.type in HEADPHONE_TYPES }
         bluetoothOnly = !wired && outputs.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP }
         if (wired != headphones) {
@@ -977,18 +1216,68 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     fun releaseLiveNotes() {
         for ((id, pitches) in liveHeld) for (pitch in pitches) NativeEngine.liveNote(id, pitch, 0f)
         liveHeld.clear()
+        midiHeld.clear()
+        sustained.clear()
+    }
+
+    // ------------------------------------------------------------ MIDI keyboards (REAPER's MIDI inputs)
+
+    /** Names of the MIDI keyboards and controllers connected, for the MIDI Devices page. */
+    var midiDevices by mutableStateOf(listOf<String>())
+
+    /** Each note a MIDI keyboard holds, and the track it plays. */
+    private val midiHeld = HashMap<Int, Long>()
+    /** Notes let go while the sustain pedal is down, which sound on until it comes up. */
+    private val sustained = HashMap<Int, Long>()
+    private var sustainDown = false
+
+    /**
+     * The track a MIDI keyboard plays, as REAPER sends MIDI to the armed
+     * track: the armed instrument track, else the one the pads and keys
+     * show, else the selected one, else the first.
+     */
+    private val midiTrack: Track?
+        get() {
+            val instruments = project.tracks.filter { it.instrument != null }
+            return instruments.firstOrNull { it.id == armedTrackId }
+                ?: instruments.firstOrNull { it.id == playTrackId }
+                ?: instruments.firstOrNull { it.id == selectedTrackId }
+                ?: instruments.firstOrNull()
+        }
+
+    /** A note from a MIDI keyboard: [velocity] 1..127, or 0 when it is let go. */
+    fun midiNote(pitch: Int, velocity: Int) {
+        if (velocity > 0) {
+            val track = midiTrack ?: return
+            // Struck again: the old note gives way to the new one.
+            sustained.remove(pitch)?.let { noteOff(it, pitch) }
+            midiHeld.remove(pitch)?.let { noteOff(it, pitch) }
+            midiHeld[pitch] = track.id
+            noteOn(track.id, pitch, velocity / 127f)
+        } else {
+            val trackId = midiHeld.remove(pitch) ?: return
+            if (sustainDown) sustained[pitch] = trackId else noteOff(trackId, pitch)
+        }
+    }
+
+    /** The sustain pedal (controller 64). */
+    fun midiSustain(down: Boolean) {
+        sustainDown = down
+        if (down) return
+        for ((pitch, trackId) in sustained) noteOff(trackId, pitch)
+        sustained.clear()
     }
 
     private fun startMidiRecording() {
         if (auditioning) toggleAudition()
         heldNotes.clear()
         takeItemId = -1L
-        outputLatency = NativeEngine.outputLatency()
+        outputLatency = if (prefs.useReportedLatency) NativeEngine.outputLatency() else 0L
         val countIn = countInFrames()
         startTakeTracking(position, countIn)
         recordingMidi = true
         if (view != MainView.Play) {
-            project.tracks.firstOrNull { it.id == armedTrackId }?.let { message = "Recording notes into ${it.name}: play its pads or keys" }
+            project.tracks.firstOrNull { it.id == armedTrackId }?.let { tip("Recording notes into ${it.name}: play its pads or keys") }
         }
         if (!playing) {
             playing = true
@@ -1093,8 +1382,11 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     /** A new audio track: blue, as GarageBand colors recordings. */
     private fun newTrack(): Track {
         val number = nextTrackNumber++
-        return Track(Ids.next(), "Audio $number", DawColors.AUDIO_COLOR)
+        return Track(Ids.next(), "Audio $number", DawColors.AUDIO_COLOR, gain = newTrackGain)
     }
+
+    /** REAPER's default volume for new tracks. */
+    private val newTrackGain: Float get() = dbToGain(prefs.newTrackDb)
 
     /**
      * Adds an empty track and arms it, so the next recording lands there.
@@ -1106,28 +1398,33 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
             val bus = newBus(kind)
             commit(project.copy(tracks = project.tracks + bus))
             selectedTrackId = bus.id
-            message = "Send tracks to ${bus.name} from their mixer strip: tap ROUTE"
+            tip("Send tracks to ${bus.name} from their mixer strip: tap ROUTE")
             return
         }
         val t = when (kind) {
             TrackKind.Audio -> newTrack()
             TrackKind.Synth -> {
                 val number = nextTrackNumber++
-                Track(Ids.next(), "Synth $number", DawColors.INSTRUMENT_COLOR, instrument = Instrument(Ids.next(), InstrumentType.SYNTH))
+                Track(
+                    Ids.next(), "Synth $number", DawColors.INSTRUMENT_COLOR, gain = newTrackGain,
+                    instrument = Instrument(Ids.next(), InstrumentType.SYNTH),
+                )
             }
             TrackKind.Drums -> {
                 val number = nextTrackNumber++
-                val (start, end) = Midi.barAround(position, framesPerBeat * 4)
+                val bar = framesPerBeat * 4
+                val start = Midi.barAround(position, bar).first
                 Track(
-                    Ids.next(), "Drums $number", DawColors.DRUMS_COLOR,
-                    items = listOf(Midi.newItem(start, end - start)),
+                    Ids.next(), "Drums $number", DawColors.DRUMS_COLOR, gain = newTrackGain,
+                    items = listOf(Midi.newItem(start, (bar * patternBarsFor(InstrumentType.DRUMS)).roundToLong())),
                     instrument = Instrument(Ids.next(), InstrumentType.DRUMS, pads = List(PAD_COUNT) { kitPad(it) }),
                 )
             }
             TrackKind.ReverbBus, TrackKind.DelayBus -> error("buses are added above")
         }
         commit(project.copy(tracks = project.tracks + t))
-        armedTrackId = t.id
+        // REAPER's "record arm new tracks".
+        if (prefs.armNewTracks) armedTrackId = t.id
         selectedTrackId = t.id
         selectedItems = t.items.map { it.id }.toSet()
         playTrackId = if (t.instrument != null) t.id else playTrackId
@@ -1154,7 +1451,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val name = if (reverb) "Reverb bus" else "Delay bus"
         val taken = project.tracks.map { it.name }.toSet()
         val unique = if (name !in taken) name else (2..99).map { "$name $it" }.firstOrNull { it !in taken } ?: name
-        return Track(Ids.next(), unique, DawColors.BUS_COLOR, fx = listOf(Effect(Ids.next(), type, values)))
+        return Track(Ids.next(), unique, DawColors.BUS_COLOR, gain = newTrackGain, fx = listOf(Effect(Ids.next(), type, values)))
     }
 
     /** Deletes a track; the tracks in its folder stay, one level up. */
@@ -1260,15 +1557,18 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     /** Tracks that [trackId] can send to without its sound coming back to it. */
     fun sendTargets(trackId: Long): List<Track> = Routing.sendTargets(project, trackId)
 
+    /** REAPER's default send level and mode. */
+    private val newSendGain: Float get() = dbToGain(prefs.sendDb)
+
     fun addSend(from: Long, to: Long) {
-        val next = Routing.addSend(project, from, to)
+        val next = Routing.addSend(project, from, to, newSendGain, prefs.sendPreFader)
         if (next == null) message = "That would send the track's sound back into itself" else commit(next)
     }
 
     /** Makes a new reverb or delay bus and sends [from] to it. */
     fun sendToNewBus(from: Long, kind: TrackKind) {
         val bus = newBus(kind)
-        Routing.addSend(project.copy(tracks = project.tracks + bus), from, bus.id)?.let { commit(it) }
+        Routing.addSend(project.copy(tracks = project.tracks + bus), from, bus.id, newSendGain, prefs.sendPreFader)?.let { commit(it) }
     }
 
     /** Live send level change; [endGesture] makes it one undo step. */
@@ -1276,7 +1576,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         preview(Routing.updateSend(project, trackId, sendId) { it.copy(gain = gain) })
 
     fun resetSendGain(trackId: Long, sendId: Long) =
-        commit(Routing.updateSend(project, trackId, sendId) { it.copy(gain = Send(0, 0).gain) })
+        commit(Routing.updateSend(project, trackId, sendId) { it.copy(gain = newSendGain) })
 
     fun toggleSendPreFader(trackId: Long, sendId: Long) =
         commit(Routing.updateSend(project, trackId, sendId) { it.copy(preFader = !it.preFader) })
@@ -1557,6 +1857,8 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val item = clip.copy(id = Ids.next(), position = position)
         commit(project.updateTrack(trackId) { it.copy(items = (it.items + item).sortedBy { i -> i.position }) })
         selectedItems = setOf(item.id)
+        // REAPER moves the edit cursor past what was pasted, so pasting again carries on from there.
+        if (prefs.playheadAfterPaste) seekFrames(item.end)
     }
 
     fun toggleMuteSelected() {
@@ -1567,17 +1869,18 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     fun normalizeSelected() {
         var p = project
-        selectedItems.forEach { id ->
-            p = p.updateItem(id) { item ->
-                val peaks = sources[item.sourceId]?.peaks ?: return@updateItem item
-                val from = (item.offset / PEAK_BUCKET).toInt().coerceIn(0, peaks.size)
-                val to = ((item.offset + item.length) / PEAK_BUCKET + 1).toInt().coerceIn(from, peaks.size)
-                var peak = 0f
-                for (b in from until to) peak = max(peak, peaks[b])
-                Takes.withGain(item, Edits.normalizeGain(peak))
-            }
-        }
+        selectedItems.forEach { id -> p = p.updateItem(id, ::normalized) }
         commit(p)
+    }
+
+    /** [item] with its gain bringing its loudest peak to -1 dB. */
+    private fun normalized(item: Item): Item {
+        val peaks = sources[item.sourceId]?.peaks ?: return item
+        val from = (item.offset / PEAK_BUCKET).toInt().coerceIn(0, peaks.size)
+        val to = ((item.offset + item.length) / PEAK_BUCKET + 1).toInt().coerceIn(from, peaks.size)
+        var peak = 0f
+        for (b in from until to) peak = max(peak, peaks[b])
+        return Takes.withGain(item, Edits.normalizeGain(peak))
     }
 
     // ------------------------------------------------------------ takes (REAPER's takes)
@@ -1768,7 +2071,10 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val id = importSource(audio, "import") ?: return@launch
             val t = newTrack().copy(name = audio.name.take(24).ifEmpty { "Import" }, colorIndex = DawColors.IMPORT_COLOR)
-            val item = Item(Ids.next(), id, position, 0, sources[id]?.length ?: 0L)
+            val length = sources[id]?.length ?: 0L
+            val fade = autoFade(length)
+            val plain = Item(Ids.next(), id, position, 0, length, fadeIn = fade, fadeOut = fade)
+            val item = if (prefs.normalizeImports) normalized(plain) else plain
             commit(project.copy(tracks = project.tracks + t.copy(items = listOf(item))))
             selectedTrackId = t.id
             selectedItems = setOf(item.id)
@@ -1798,10 +2104,24 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         }
         val bar = framesPerBeat * 4
         val start = Midi.barAround(position, bar).first
-        val bars = if (track.instrument?.type == InstrumentType.DRUMS) 1 else 4
-        val item = Midi.newItem(start, (bar * bars).roundToLong())
+        val item = Midi.newItem(start, (bar * patternBarsFor(track.instrument?.type)).roundToLong())
         commit(project.updateTrack(track.id) { it.copy(items = (it.items + item).sortedBy { i -> i.position }) })
         selectedItems = setOf(item.id)
+    }
+
+    /** Bars in a new pattern: the preference, or else one for drums and four for a synth. */
+    private fun patternBarsFor(type: InstrumentType?): Int = when {
+        prefs.patternBars > 0 -> prefs.patternBars
+        type == InstrumentType.DRUMS -> 1
+        else -> 4
+    }
+
+    /** Velocity of notes drawn in the piano roll (REAPER's default new note velocity), 0..1. */
+    val newNoteVelocity: Float get() = prefs.noteVelocity / 127f
+
+    /** Plays a note just added or moved in the piano roll, unless the preferences say not to. */
+    fun previewEditedNote(trackId: Long, pitch: Int, velocity: Float = newNoteVelocity) {
+        if (prefs.previewNotes) previewNote(trackId, pitch, velocity)
     }
 
     fun openNoteEditor(itemId: Long) {
@@ -1874,6 +2194,9 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** True while the audio device is closed because the app is in the background. */
+    private var engineClosed = false
+
     fun onAppBackground() {
         stopAll()
         // The microphone is never left open behind the user's back.
@@ -1881,11 +2204,178 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         updateMonitoring()
         saveJob?.cancel()
         saveNow()
+        flushPrefs()
+        // REAPER's "close audio device when inactive": it frees the audio hardware for other
+        // apps, and a stream left open runs its callback even in silence, using the battery.
+        if (prefs.closeInBackground) {
+            NativeEngine.shutdown()
+            engineClosed = true
+        }
     }
 
     fun onAppForeground() {
         foreground = true
+        if (engineClosed) {
+            engineClosed = false
+            if (!NativeEngine.start()) message = "Audio engine failed to start"
+            checkSampleRate()
+        }
         updateMonitoring()
+    }
+
+    /** Another app took the sound, or a call came in: stop, as REAPER stops when its device goes away. */
+    fun onAudioInterrupted() {
+        if (!playing && !recording && !recordingMidi && samplingPad == null) return
+        stopAll()
+        message = "Stopped for another app's sound or a call"
+    }
+
+    // ------------------------------------------------------------ preferences (REAPER's Preferences window)
+
+    var showPrefs by mutableStateOf(false)
+        private set
+    /** The page the Preferences window shows, kept while the app runs, as REAPER reopens the last one. */
+    var prefsPage by mutableStateOf("General")
+    /** Set by the activity: whether the phone can hold its CPU at a steady speed. */
+    var sustainedSupported by mutableStateOf(false)
+
+    /** Where the songs are kept and how much room they take, for the Paths page. */
+    class StorageInfo(val folder: String, val songs: Int, val usedBytes: Long, val freeBytes: Long)
+
+    var storage by mutableStateOf<StorageInfo?>(null)
+        private set
+
+    fun refreshStorage() {
+        viewModelScope.launch {
+            storage = withContext(Dispatchers.IO) {
+                runCatching { StorageInfo(library.dir.path, library.list().size, library.usedBytes(), library.freeBytes()) }.getOrNull()
+            }
+        }
+    }
+
+    fun openPrefs() {
+        if (busyRecording() || samplingPad != null) return
+        showPrefs = true
+        refreshAudioStatus()
+    }
+
+    fun closePrefs() {
+        showPrefs = false
+        flushPrefs()
+    }
+
+    private var prefsSaveJob: Job? = null
+
+    /** Changes the preferences, applies what changed and saves them. */
+    fun updatePrefs(change: (Preferences) -> Preferences) {
+        val old = prefs
+        val new = change(old)
+        if (new == old) return
+        prefs = new
+        history.limit = new.undoSteps
+        canUndo = history.canUndo
+        applyEnginePrefs()
+        if (new.exportFormat != old.exportFormat || new.exportNormalize != old.exportNormalize) {
+            exportOptions = exportOptions.copy(format = new.exportFormat, normalize = new.exportNormalize)
+        }
+        if (deviceChanged(old, new)) restartAudio()
+        prefsSaveJob?.cancel()
+        prefsSaveJob = viewModelScope.launch {
+            delay(300)
+            withContext(Dispatchers.IO) { runCatching { prefsStore.save(new) } }
+        }
+    }
+
+    /** Puts every preference back as it came, REAPER's "reset to defaults". */
+    fun resetPrefs() = updatePrefs { Preferences() }
+
+    private fun flushPrefs() {
+        if (prefsSaveJob?.isActive != true) return
+        prefsSaveJob?.cancel()
+        val p = prefs
+        viewModelScope.launch(Dispatchers.IO) { runCatching { prefsStore.save(p) } }
+    }
+
+    /** Saves the preferences at once, for the activity to read them as it starts again; false when that failed. */
+    fun savePrefsNow(): Boolean {
+        prefsSaveJob?.cancel()
+        return runCatching { prefsStore.save(prefs) }.isSuccess
+    }
+
+    private fun deviceChanged(a: Preferences, b: Preferences) =
+        a.audioApi != b.audioApi || a.outputDevice != b.outputDevice || a.inputDevice != b.inputDevice ||
+            a.sampleRate != b.sampleRate || a.bufferBursts != b.bufferBursts || a.performance != b.performance ||
+            a.exclusive != b.exclusive || a.micPreset != b.micPreset
+
+    /** Hands the device settings to the engine, which reopens the streams when they are open. */
+    private fun configureEngine(p: Preferences): Boolean = NativeEngine.configure(
+        api = p.audioApi.ordinal,
+        performanceMode = p.performance.ordinal,
+        exclusive = p.exclusive,
+        sampleRate = p.sampleRate,
+        bufferBursts = p.bufferBursts,
+        outputDevice = p.outputDevice,
+        inputDevice = p.inputDevice,
+        inputPreset = p.micPreset.ordinal,
+    )
+
+    /** What the engine takes at once, without reopening the device. */
+    private fun applyEnginePrefs() {
+        NativeEngine.setFxTail(prefs.fxTailMs * sampleRate / 1000L)
+    }
+
+    /** What the audio streams really got, shown in the device settings. */
+    var audioStatus by mutableStateOf(AudioStatus())
+        private set
+    /** True while the audio device reopens with new settings. */
+    var audioRestarting by mutableStateOf(false)
+        private set
+
+    fun refreshAudioStatus() {
+        audioStatus = AudioStatus.from(NativeEngine.audioStatus())
+    }
+
+    /** Reopens the audio device with the device settings, off the main thread. */
+    private fun restartAudio() {
+        stopAll()
+        val p = prefs
+        audioRestarting = true
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) { configureEngine(p) }
+            audioRestarting = false
+            if (!ok) message = "Could not open the audio device with these settings"
+            checkSampleRate()
+            refreshAudioStatus()
+        }
+    }
+
+    private var rateCheckPending = false
+
+    /**
+     * Reloads the song when the engine now runs at another rate, as after
+     * choosing another sample rate: its audio is resampled to the new rate
+     * as it loads, as REAPER resamples a project's media.
+     */
+    private fun checkSampleRate() {
+        val rate = NativeEngine.sampleRate()
+        if (rate == sampleRate || rate <= 0) return
+        if (loading || exportProgress != null) {
+            rateCheckPending = true
+            return
+        }
+        loading = true
+        stopAll()
+        viewModelScope.launch {
+            // Saved at the old rate, which the song file records with its frames.
+            saveAndWait()
+            val pos = position * rate / sampleRate
+            resetSession()
+            sampleRate = rate
+            applyEnginePrefs()
+            loadProject()
+            seekFrames(pos)
+            message = "The song now plays at $rate Hz"
+        }
     }
 
     // ------------------------------------------------------------ songs (GarageBand's "My Songs")
@@ -2010,7 +2500,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
 
     var exportOpen by mutableStateOf(false)
         private set
-    var exportOptions by mutableStateOf(ExportOptions())
+    var exportOptions by mutableStateOf(ExportOptions(format = prefs.exportFormat, normalize = prefs.exportNormalize))
         private set
     /** 0..1 while an export renders, null otherwise. */
     var exportProgress by mutableStateOf<Float?>(null)
@@ -2074,6 +2564,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
                 })
             },
             colors = p.tracks.associate { it.id to (DawColors.track(it.colorIndex).toArgb() and 0xFFFFFF) },
+            tail = prefs.renderTailMs * sampleRate / 1000L,
         )
         exportResult = null
         exportProgress = 0f
@@ -2110,24 +2601,28 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         val songDir: File,
         val drumNotes: Map<Long, IntArray>,
         val colors: Map<Long, Int>,
+        /** Longest tail to render after the end, REAPER's render tail. */
+        val tail: Long,
     )
 
     private class RenderStats(val frames: Long, val peak: Float, val loudness: Double)
 
     /**
-     * Runs the engine's offline render into float WAV files; null when cancelled.
-     * With [ignoreSolo] it renders as if nothing were soloed, so every stem is whole.
+     * Runs the engine's offline render into float WAV files, with up to
+     * [tail] frames after the end for effects and notes to ring out; null
+     * when cancelled. With [ignoreSolo] it renders as if nothing were
+     * soloed, so every stem is whole.
      */
     private fun render(
         start: Long,
         end: Long,
-        tails: Boolean,
+        tail: Long,
         mixPath: String = "",
         stemPaths: Array<String> = emptyArray(),
         dryPaths: Array<String> = emptyArray(),
         ignoreSolo: Boolean = false,
     ): RenderStats? {
-        val r = NativeEngine.render(start, end, if (tails) sampleRate * 10L else 0L, mixPath, stemPaths, dryPaths, ignoreSolo)
+        val r = NativeEngine.render(start, end, tail, mixPath, stemPaths, dryPaths, ignoreSolo)
         if (r[1] > 0.5) return null
         check(r[0] > 0.5) { "could not write the audio (is the phone full?)" }
         return RenderStats(r[2].toLong(), r[3].toFloat(), r[4])
@@ -2141,7 +2636,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
     private fun exportSong(job: ExportJob, dir: File): ExportResult? {
         val o = job.options
         val raw = File(dir, "mix.raw.wav")
-        val stats = render(job.start, job.end, o.tails, mixPath = raw.path) ?: return null
+        val stats = render(job.start, job.end, if (o.tails) job.tail else 0L, mixPath = raw.path) ?: return null
         val gain = if (o.normalize && stats.peak > 1e-4f) NORMALIZE_PEAK / stats.peak else 1f
         val name = AudioExport.safeFileName(job.title, "Song")
         val out: File
@@ -2177,7 +2672,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         check(tracks.isNotEmpty()) { "no unmuted track has anything to play" }
         val raw = Array(p.tracks.size) { "" }
         tracks.forEach { (i, _) -> raw[i] = File(dir, "stem$i.raw.wav").path }
-        val stats = render(job.start, job.end, job.options.tails, stemPaths = raw, ignoreSolo = true) ?: return null
+        val stats = render(job.start, job.end, if (job.options.tails) job.tail else 0L, stemPaths = raw, ignoreSolo = true) ?: return null
         val bits = if (job.options.format == ExportFormat.Wav16) 16 else 24
         val folder = AudioExport.safeFileName("${job.title} stems", "Stems")
         val taken = mutableSetOf<String>()
@@ -2249,7 +2744,7 @@ class DawViewModel(app: Application) : AndroidViewModel(app) {
         if (instrumentTracks.isNotEmpty()) {
             val dry = Array(p.tracks.size) { "" }
             instrumentTracks.forEach { (i, _) -> dry[i] = File(dir, "dry$i.wav").path }
-            val stats = render(0, p.endFrame, true, dryPaths = dry, ignoreSolo = true) ?: return null
+            val stats = render(0, p.endFrame, job.tail, dryPaths = dry, ignoreSolo = true) ?: return null
             instrumentTracks.forEachIndexed { n, (i, t) ->
                 val name = AudioExport.unique(AudioExport.asciiFileName(t.name, "Instrument ${n + 1}") + " (instrument)", taken, ".wav")
                 val file = File(dir, name)

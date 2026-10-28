@@ -92,10 +92,10 @@ object Routing {
     fun receives(project: Project, trackId: Long): List<Pair<Track, Send>> =
         project.tracks.flatMap { t -> t.sends.filter { it.target == trackId }.map { t to it } }
 
-    /** Adds a send from [from] to [to] at the default level; null when it would loop. */
-    fun addSend(project: Project, from: Long, to: Long): Project? {
+    /** Adds a send from [from] to [to] at [gain], post-fader unless [preFader]; null when it would loop. */
+    fun addSend(project: Project, from: Long, to: Long, gain: Float = Send(0, 0).gain, preFader: Boolean = false): Project? {
         if (from == to || project.tracks.none { it.id == to } || reaches(project, to, from)) return null
-        return project.updateTrack(from) { it.copy(sends = it.sends + Send(Ids.next(), to)) }
+        return project.updateTrack(from) { it.copy(sends = it.sends + Send(Ids.next(), to, gain, preFader)) }
     }
 
     fun updateSend(project: Project, trackId: Long, sendId: Long, change: (Send) -> Send): Project =
